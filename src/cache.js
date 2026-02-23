@@ -24,33 +24,90 @@ function getPlatformCacheDir() {
 const CACHE_DIR = getPlatformCacheDir();
 
 const IGNORE_PATTERNS = [
-  // Dependencies & generated
+  // ── JS / Node ──────────────────────────────────────────
   '**/node_modules/**',
-  '**/dist/**',
-  '**/build/**',
-  '**/coverage/**',
-  '**/vendor/**',
+  '**/.npm/**',
+  '**/.yarn/**',
+  '**/.pnp.*',
+  '**/bower_components/**',
   '**/*.min.js',
   '**/*.bundle.js',
   '**/*.map',
 
-  // VCS & tool caches
+  // ── Python ─────────────────────────────────────────────
+  '**/__pycache__/**',
+  '**/.venv/**',
+  '**/venv/**',
+  '**/env/**',
+  '**/.env/**',
+  '**/.virtualenvs/**',
+  '**/site-packages/**',
+  '**/*.egg-info/**',
+  '**/.eggs/**',
+  '**/.tox/**',
+  '**/.mypy_cache/**',
+  '**/.pytest_cache/**',
+  '**/.ruff_cache/**',
+
+  // ── Rust ───────────────────────────────────────────────
+  '**/target/debug/**',
+  '**/target/release/**',
+
+  // ── Java / JVM ─────────────────────────────────────────
+  '**/.gradle/**',
+  '**/.m2/**',
+
+  // ── Ruby ───────────────────────────────────────────────
+  '**/.bundle/**',
+
+  // ── C / C++ ────────────────────────────────────────────
+  '**/cmake-build-*/**',
+  '**/CMakeFiles/**',
+
+  // ── Go ─────────────────────────────────────────────────
+  '**/vendor/**',
+
+  // ── Build output & generated ───────────────────────────
+  '**/dist/**',
+  '**/build/**',
+  '**/out/**',
+  '**/coverage/**',
+
+  // ── Frameworks ─────────────────────────────────────────
+  '**/.next/**',
+  '**/.nuxt/**',
+  '**/.output/**',
+  '**/.svelte-kit/**',
+  '**/.angular/**',
+  '**/.turbo/**',
+  '**/.parcel-cache/**',
+  '**/.cache/**',
+
+  // ── iOS / mobile ───────────────────────────────────────
+  '**/Pods/**',
+  '**/*.xcframework/**',
+
+  // ── Infrastructure / deploy ────────────────────────────
+  '**/.terraform/**',
+  '**/.serverless/**',
+  '**/cdk.out/**',
+  '**/.vercel/**',
+  '**/.netlify/**',
+
+  // ── VCS & tool caches ──────────────────────────────────
   '**/.git/**',
   '**/.code-index/**',
   '**/.claude/**',
   '**/.cursor/**',
+  '**/.nx/**',
 
-  // Language-specific caches
-  '**/__pycache__/**',
-  '**/.venv/**',
-  '**/.next/**',
-  '**/.nuxt/**',
+  // ── UI component libraries ─────────────────────────────
+  // shadcn, etc. — high fan-in but rarely investigation targets.
+  // To re-include, add "!**/components/ui/**" in .code-index/config.json ignore list,
+  // or pass --ignore '!**/components/ui/**' on the CLI.
+  '**/components/ui/**',
 
-  // iOS / mobile vendor
-  '**/Pods/**',
-  '**/*.xcframework/**',
-
-  // Scratch / temp
+  // ── Scratch / temp ─────────────────────────────────────
   'tmp/**',
 ];
 

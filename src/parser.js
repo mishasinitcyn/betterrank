@@ -3,24 +3,36 @@ const require = createRequire(import.meta.url);
 
 const Parser = require('tree-sitter');
 
-// Load native grammars eagerly — no WASM, no async init needed
+function tryRequire(mod) {
+  try { return require(mod); } catch { return null; }
+}
+
+// Core grammars (always installed)
 const tsGrammars = require('tree-sitter-typescript');
-const phpModule = require('tree-sitter-php');
 
 const GRAMMARS = {
   javascript: require('tree-sitter-javascript'),
   typescript: tsGrammars.typescript,
   tsx: tsGrammars.tsx,
   python: require('tree-sitter-python'),
-  rust: require('tree-sitter-rust'),
-  go: require('tree-sitter-go'),
-  ruby: require('tree-sitter-ruby'),
-  java: require('tree-sitter-java'),
-  c: require('tree-sitter-c'),
-  cpp: require('tree-sitter-cpp'),
-  c_sharp: require('tree-sitter-c-sharp'),
-  php: phpModule.php || phpModule,
 };
+
+// Optional grammars (install individually if needed)
+const optGrammars = [
+  ['rust', 'tree-sitter-rust'],
+  ['go', 'tree-sitter-go'],
+  ['ruby', 'tree-sitter-ruby'],
+  ['java', 'tree-sitter-java'],
+  ['c', 'tree-sitter-c'],
+  ['cpp', 'tree-sitter-cpp'],
+  ['c_sharp', 'tree-sitter-c-sharp'],
+];
+for (const [name, mod] of optGrammars) {
+  const g = tryRequire(mod);
+  if (g) GRAMMARS[name] = g;
+}
+const phpModule = tryRequire('tree-sitter-php');
+if (phpModule) GRAMMARS.php = phpModule.php || phpModule;
 
 const LANG_MAP = {
   '.js': 'javascript',
@@ -43,7 +55,11 @@ const LANG_MAP = {
   '.php': 'php',
 };
 
-const SUPPORTED_EXTENSIONS = Object.keys(LANG_MAP);
+// Only include extensions for grammars that are actually installed
+const SUPPORTED_EXTENSIONS = Object.keys(LANG_MAP).filter(ext => {
+  const lang = LANG_MAP[ext];
+  return GRAMMARS[lang] != null;
+});
 
 function getLanguage(ext) {
   const langName = LANG_MAP[ext];

@@ -78,13 +78,13 @@ class CodeIndex {
    * @param {boolean} [opts.count] - If true, return only { total }
    * @returns {{content, shownFiles, shownSymbols, totalFiles, totalSymbols}|{total: number}}
    */
-  async map({ focusFiles = [], offset, limit, count = false } = {}) {
+  async map({ focusFiles = [], offset, limit, count = false, structured = false } = {}) {
     await this._ensureReady();
     const graph = this.cache.getGraph();
     if (!graph || graph.order === 0) {
-      return count
-        ? { total: 0 }
-        : { content: '(empty index)', shownFiles: 0, shownSymbols: 0, totalFiles: 0, totalSymbols: 0 };
+      if (count) return { total: 0 };
+      if (structured) return { files: [], shownFiles: 0, shownSymbols: 0, totalFiles: 0, totalSymbols: 0 };
+      return { content: '(empty index)', shownFiles: 0, shownSymbols: 0, totalFiles: 0, totalSymbols: 0 };
     }
 
     // Count totals from the graph
@@ -97,7 +97,7 @@ class CodeIndex {
 
     const ranked = this._getRanked(focusFiles);
 
-    // Collect all symbol entries ranked by PageRank
+    // Collect all symbol entries ranked by PageRank (rich data for both formats)
     const allEntries = [];
     for (const [symbolKey, _score] of ranked) {
       let attrs;
@@ -108,18 +108,48 @@ class CodeIndex {
       }
       if (attrs.type !== 'symbol') continue;
 
-      const line = `  ${String(attrs.lineStart).padStart(4)}│ ${attrs.signature}`;
-      allEntries.push({ file: attrs.file, line });
+      allEntries.push({
+        file: attrs.file,
+        name: attrs.name,
+        kind: attrs.kind,
+        lineStart: attrs.lineStart,
+        lineEnd: attrs.lineEnd,
+        signature: attrs.signature,
+      });
     }
 
     if (count) return { total: allEntries.length };
 
     const { items } = paginate(allEntries, { offset, limit });
 
+    // Structured format: return file objects with nested symbol arrays
+    if (structured) {
+      const fileGroups = new Map();
+      for (const entry of items) {
+        if (!fileGroups.has(entry.file)) fileGroups.set(entry.file, []);
+        fileGroups.get(entry.file).push({
+          name: entry.name,
+          kind: entry.kind,
+          lineStart: entry.lineStart,
+          lineEnd: entry.lineEnd,
+          signature: entry.signature,
+        });
+      }
+      return {
+        files: [...fileGroups.entries()].map(([path, symbols]) => ({ path, symbols })),
+        shownFiles: fileGroups.size,
+        shownSymbols: items.length,
+        totalFiles,
+        totalSymbols,
+      };
+    }
+
+    // Text format (CLI output)
     const fileGroups = new Map();
     for (const entry of items) {
       if (!fileGroups.has(entry.file)) fileGroups.set(entry.file, []);
-      fileGroups.get(entry.file).push(entry.line);
+      const line = `  ${String(entry.lineStart).padStart(4)}│ ${entry.signature}`;
+      fileGroups.get(entry.file).push(line);
     }
 
     const lines = [];

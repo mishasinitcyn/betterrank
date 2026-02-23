@@ -1,6 +1,6 @@
 {
   "name": "@mishasinitcyn/betterrank",
-  "version": "0.1.0",
+  "version": "0.1.7",
   "description": "Structural code index with PageRank-ranked repo maps, symbol search, call-graph queries, and dependency analysis. Built on tree-sitter and graphology.",
   "type": "module",
   "main": "src/index.js",
@@ -31,21 +31,26 @@
     "node": ">=18"
   },
   "dependencies": {
-    "tree-sitter": "^0.22.4",
-    "tree-sitter-javascript": "^0.23.1",
-    "tree-sitter-typescript": "^0.23.2",
-    "tree-sitter-python": "^0.23.6",
-    "tree-sitter-rust": "^0.23.2",
-    "tree-sitter-go": "^0.23.4",
-    "tree-sitter-ruby": "^0.23.1",
-    "tree-sitter-java": "^0.23.5",
-    "tree-sitter-c": "^0.23.4",
-    "tree-sitter-cpp": "^0.23.4",
-    "tree-sitter-c-sharp": "^0.23.1",
-    "tree-sitter-php": "^0.23.11",
+    "tree-sitter": "0.22.4",
+    "tree-sitter-javascript": "0.23.1",
+    "tree-sitter-typescript": "0.23.2",
+    "tree-sitter-python": "0.23.6",
     "graphology": "^0.25.4",
     "graphology-metrics": "^2.4.0",
     "graphology-types": "^0.24.7",
     "glob": "^11.0.1"
+  },
+  "optionalDependencies": {
+    "tree-sitter-rust": "0.23.2",
+    "tree-sitter-go": "0.23.4",
+    "tree-sitter-ruby": "0.23.1",
+    "tree-sitter-java": "0.23.5",
+    "tree-sitter-c": "0.23.4",
+    "tree-sitter-cpp": "0.23.4",
+    "tree-sitter-c-sharp": "0.23.1",
+    "tree-sitter-php": "0.23.11"
+  },
+  "overrides": {
+    "tree-sitter": "0.22.4"
   }
 }

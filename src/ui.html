@@ -1,0 +1,1449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>betterrank</title>
+<style>
+  :root {
+    --bg: #0c0c0c;
+    --bg-raised: #161616;
+    --bg-hover: #1e1e1e;
+    --border: #2a2a2a;
+    --text: #e0e0e0;
+    --text-dim: #888;
+    --text-faint: #555;
+    --accent: #60a5fa;
+    --accent-dim: #2563eb;
+    --green: #4ade80;
+    --yellow: #facc15;
+    --purple: #c084fc;
+    --orange: #fb923c;
+    --red: #f87171;
+    --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    --radius: 8px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  /* Layout */
+  .app { max-width: 900px; margin: 0 auto; padding: 24px 20px; }
+
+  /* Header */
+  .header { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
+  .logo {
+    font-family: var(--mono);
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: -0.5px;
+    white-space: nowrap;
+  }
+  .repo-input-wrap {
+    display: flex;
+    flex: 1;
+    gap: 8px;
+  }
+  .repo-input {
+    flex: 1;
+    padding: 8px 14px;
+    font-family: var(--mono);
+    font-size: 13px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .repo-input:focus { border-color: var(--accent-dim); }
+  .repo-input::placeholder { color: var(--text-faint); }
+  .btn-index {
+    padding: 8px 18px;
+    font-size: 13px;
+    font-weight: 600;
+    font-family: var(--sans);
+    background: var(--accent-dim);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s;
+  }
+  .btn-index:hover { background: var(--accent); color: #000; }
+  .btn-index:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Stats bar */
+  .stats-bar {
+    display: flex;
+    gap: 20px;
+    padding: 8px 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+  .stats-bar .stat-val { color: var(--text); font-weight: 600; }
+  .stats-bar .ide-pick {
+    margin-left: auto;
+    padding: 2px 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-dim);
+    cursor: pointer;
+    outline: none;
+  }
+  .stats-bar .ide-pick:focus { border-color: var(--accent-dim); }
+  .stats-bar .elapsed { color: var(--text-faint); }
+
+  /* Tabs */
+  .tabs {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 16px;
+    background: var(--bg-raised);
+    border-radius: var(--radius);
+    padding: 3px;
+  }
+  .tab {
+    padding: 7px 16px;
+    font-size: 13px;
+    font-family: var(--sans);
+    font-weight: 500;
+    background: transparent;
+    color: var(--text-dim);
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { background: var(--bg); color: var(--accent); }
+
+  /* Search area */
+  .search-area { margin-bottom: 20px; }
+  .search-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .search-input {
+    flex: 1;
+    padding: 10px 16px;
+    font-family: var(--mono);
+    font-size: 14px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .search-input:focus { border-color: var(--accent-dim); }
+  .search-input::placeholder { color: var(--text-faint); }
+  .filter-row { display: flex; gap: 8px; }
+  .filter-select {
+    padding: 6px 10px;
+    font-size: 12px;
+    font-family: var(--mono);
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    outline: none;
+    cursor: pointer;
+  }
+  .filter-select:focus { border-color: var(--accent-dim); }
+  .result-count {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-left: auto;
+    align-self: center;
+    font-family: var(--mono);
+  }
+
+  /* Results */
+  .results { min-height: 200px; }
+  .result-card {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    transition: background 0.1s;
+  }
+  .result-card:hover { background: var(--bg-raised); }
+  .result-file {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .result-file:hover { text-decoration: underline; }
+  .result-line {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+    margin-left: 4px;
+  }
+  .result-sig {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+    margin-top: 4px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .result-kind {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .kind-function { background: #1e3a5f; color: var(--accent); }
+  .kind-class { background: #3b1f5e; color: var(--purple); }
+  .kind-type { background: #3b3a1a; color: var(--yellow); }
+  .kind-variable { background: #1a3b2a; color: var(--green); }
+  .kind-import { background: #2a2a2a; color: var(--text-dim); }
+  .kind-namespace { background: #3b2a1a; color: var(--orange); }
+
+  /* Pre-formatted results (map, structure) */
+  .result-pre {
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding: 16px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow-x: auto;
+  }
+
+  /* Neighborhood */
+  .nb-section { margin-bottom: 16px; }
+  .nb-section-title {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+  .nb-file {
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 4px 0;
+    color: var(--accent);
+  }
+  .nb-edge {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 2px 0;
+    color: var(--text-dim);
+  }
+  .nb-edge .arrow { color: var(--text-faint); }
+
+  /* File list results (callers, dependents, deps) */
+  .file-result {
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 8px 16px;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .file-result:hover { background: var(--bg-raised); }
+
+  /* Picker items */
+  .picker-hint {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+    padding: 8px 16px 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .result-card[data-pick] { cursor: pointer; }
+  .result-card[data-pick]:hover { background: var(--bg-hover); }
+
+  /* Pagination */
+  .pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+  }
+  .page-btn {
+    padding: 6px 14px;
+    font-size: 12px;
+    font-family: var(--mono);
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .page-btn:hover { border-color: var(--accent-dim); color: var(--accent); }
+  .page-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .page-info {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  /* Empty / loading states */
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-faint);
+  }
+  .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+  .empty-state p { font-size: 14px; line-height: 1.6; }
+  .loading {
+    text-align: center;
+    padding: 40px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  .error-msg {
+    padding: 12px 16px;
+    background: #2a1515;
+    border: 1px solid #5a2020;
+    border-radius: var(--radius);
+    color: var(--red);
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+
+  /* Kbd hint */
+  kbd {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 6px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-dim);
+  }
+
+  /* Browse button */
+  .btn-browse {
+    padding: 8px 12px;
+    font-size: 13px;
+    font-family: var(--sans);
+    background: var(--bg-raised);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-browse:hover { border-color: var(--accent-dim); color: var(--text); }
+  .btn-browse:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-browse svg { width: 16px; height: 16px; }
+
+  /* Recent repos */
+  .recent-repos {
+    margin-bottom: 16px;
+  }
+  .recent-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .recent-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .recent-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--accent);
+    cursor: pointer;
+    transition: all 0.15s;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  .recent-item:hover { border-color: var(--accent-dim); background: var(--bg-hover); }
+  .recent-item .path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+  }
+  .recent-item .remove {
+    color: var(--text-faint);
+    font-size: 14px;
+    line-height: 1;
+    padding: 0 2px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: color 0.15s;
+  }
+  .recent-item .remove:hover { color: var(--red); }
+  .recent-clear {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 5px 6px;
+    transition: color 0.15s;
+  }
+  .recent-clear:hover { color: var(--red); }
+
+  /* Drop overlay */
+  .drop-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: rgba(12, 12, 12, 0.85);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(4px);
+  }
+  .drop-overlay.active { display: flex; }
+  .drop-box {
+    border: 2px dashed var(--accent-dim);
+    border-radius: 16px;
+    padding: 60px 80px;
+    text-align: center;
+    transition: border-color 0.2s, background 0.2s;
+    background: rgba(37, 99, 235, 0.05);
+  }
+  .drop-overlay.active .drop-box {
+    animation: dropPulse 1.5s ease-in-out infinite;
+  }
+  @keyframes dropPulse {
+    0%, 100% { border-color: var(--accent-dim); background: rgba(37, 99, 235, 0.05); }
+    50% { border-color: var(--accent); background: rgba(37, 99, 235, 0.1); }
+  }
+  .drop-box .drop-icon { font-size: 48px; margin-bottom: 12px; }
+  .drop-box .drop-text {
+    font-family: var(--sans);
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .drop-box .drop-hint {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 8px;
+  }
+
+  /* Repo input drag-over state */
+  .repo-input.drag-over {
+    border-color: var(--accent);
+    background: rgba(37, 99, 235, 0.08);
+  }
+
+  /* Expandable map cards */
+  .map-card {
+    border-bottom: 1px solid var(--border);
+  }
+  .map-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 16px 4px;
+    cursor: pointer;
+    border-radius: 6px 6px 0 0;
+    transition: background 0.1s;
+  }
+  .map-card-header:hover { background: var(--bg-raised); }
+  .map-chevron {
+    font-size: 10px;
+    color: var(--text-faint);
+    transition: transform 0.2s ease;
+    flex-shrink: 0;
+    width: 14px;
+    text-align: center;
+    user-select: none;
+  }
+  .map-card.expanded .map-chevron { transform: rotate(90deg); }
+  .map-symbols {
+    padding: 2px 16px 10px 38px;
+  }
+  .map-expand {
+    display: none;
+    padding: 10px 16px 14px 38px;
+    background: var(--bg-raised);
+    margin: 0 8px 8px;
+    border-radius: 6px;
+  }
+  .map-card.expanded .map-expand { display: block; }
+  .map-expand-section {
+    margin-bottom: 10px;
+  }
+  .map-expand-section:last-child { margin-bottom: 0; }
+  .map-expand-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+  .map-expand-title .arrow { margin-right: 2px; }
+  .map-dep-item {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 2px 0;
+    color: var(--accent);
+    cursor: pointer;
+    transition: color 0.1s;
+  }
+  .map-dep-item:hover { text-decoration: underline; }
+  .map-expand-empty {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+    font-style: italic;
+    padding: 2px 0;
+  }
+  .map-expand-loading {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    padding: 4px 0;
+  }
+  .map-sym-item {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 2px 0;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: color 0.1s;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+  .map-sym-item:hover { color: var(--text); }
+  .map-sym-item .result-kind {
+    opacity: 0.55;
+    font-size: 9px;
+    flex-shrink: 0;
+  }
+  .map-sym-item .sym-line {
+    color: var(--text-faint);
+    min-width: 32px;
+    text-align: right;
+    flex-shrink: 0;
+  }
+</style>
+</head>
+<body>
+
+<!-- Drop overlay -->
+<div class="drop-overlay" id="dropOverlay">
+  <div class="drop-box">
+    <div class="drop-icon">&#x1F4C2;</div>
+    <div class="drop-text">Drop folder here</div>
+    <div class="drop-hint">Release to set repo path</div>
+  </div>
+</div>
+
+<div class="app">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">betterrank</div>
+    <div class="repo-input-wrap">
+      <input class="repo-input" id="repoPath" type="text"
+             placeholder="Drop a folder, browse, or type a path..." spellcheck="false">
+      <button class="btn-browse" id="btnBrowse" title="Browse for folder (&#8984;O)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      </button>
+      <button class="btn-index" id="btnIndex">Index</button>
+    </div>
+  </div>
+
+  <!-- Recent repos -->
+  <div class="recent-repos" id="recentRepos" style="display:none">
+    <div class="recent-label">Recent</div>
+    <div class="recent-list" id="recentList"></div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats-bar" id="statsBar" style="display:none">
+    <span><span class="stat-val" id="statFiles">0</span> files</span>
+    <span><span class="stat-val" id="statSymbols">0</span> symbols</span>
+    <span><span class="stat-val" id="statEdges">0</span> edges</span>
+    <select class="ide-pick" id="idePick" title="IDE for opening files">
+      <option value="cursor">Cursor</option>
+      <option value="vscode">VS Code</option>
+      <option value="vscode-insiders">VS Code Insiders</option>
+    </select>
+    <span class="elapsed" id="statElapsed"></span>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-tool="search">Search</button>
+    <button class="tab" data-tool="map">Map</button>
+    <button class="tab" data-tool="symbols">Symbols</button>
+    <button class="tab" data-tool="callers">Callers</button>
+    <button class="tab" data-tool="dependents">Dependents</button>
+    <button class="tab" data-tool="neighborhood">Neighborhood</button>
+    <button class="tab" data-tool="structure">Structure</button>
+  </div>
+
+  <!-- Search area -->
+  <div class="search-area" id="searchArea">
+    <div class="search-row">
+      <input class="search-input" id="queryInput" type="text"
+             placeholder="Search symbols..." spellcheck="false" autocomplete="off">
+    </div>
+    <div class="filter-row">
+      <select class="filter-select" id="kindFilter">
+        <option value="">All kinds</option>
+        <option value="function">Functions</option>
+        <option value="class">Classes</option>
+        <option value="type">Types</option>
+        <option value="variable">Variables</option>
+        <option value="import">Imports</option>
+      </select>
+      <select class="filter-select" id="limitSelect">
+        <option value="20">20 per page</option>
+        <option value="50">50 per page</option>
+        <option value="100">100 per page</option>
+      </select>
+      <span class="result-count" id="resultCount"></span>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div class="results" id="results">
+    <div class="empty-state">
+      <div class="icon">&#x1F4C2;</div>
+      <p>Drop a folder here, click <strong>Browse</strong>, or type a path above.<br>
+      Then search symbols, explore the map, or trace callers.<br><br>
+      <kbd>&#8984;O</kbd> browse &nbsp; <kbd>&#8984;K</kbd> focus search</p>
+    </div>
+  </div>
+
+  <!-- Pagination -->
+  <div class="pagination" id="pagination" style="display:none">
+    <button class="page-btn" id="prevPage">&larr; Prev</button>
+    <span class="page-info" id="pageInfo">Page 1</span>
+    <button class="page-btn" id="nextPage">Next &rarr;</button>
+  </div>
+
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+const API = '';
+
+// State
+let currentTool = 'search';
+let currentPage = 0;
+let pageSize = 20;
+let totalResults = 0;
+let indexed = false;
+let loading = false;
+const expandCache = new Map(); // file -> { dependents, deps } for map expansion
+
+// Elements
+const repoInput = $('#repoPath');
+const btnIndex = $('#btnIndex');
+const btnBrowse = $('#btnBrowse');
+const queryInput = $('#queryInput');
+const kindFilter = $('#kindFilter');
+const limitSelect = $('#limitSelect');
+const resultsEl = $('#results');
+const pagination = $('#pagination');
+const pageInfo = $('#pageInfo');
+const prevBtn = $('#prevPage');
+const nextBtn = $('#nextPage');
+const resultCount = $('#resultCount');
+const statsBar = $('#statsBar');
+const dropOverlay = $('#dropOverlay');
+const recentReposEl = $('#recentRepos');
+const recentListEl = $('#recentList');
+
+// --- Recent repos ---
+const RECENT_KEY = 'betterrank_recent';
+
+function getRecentRepos() {
+  try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); }
+  catch { return []; }
+}
+
+function addRecentRepo(path) {
+  let recent = getRecentRepos().filter(r => r !== path);
+  recent.unshift(path);
+  if (recent.length > 8) recent = recent.slice(0, 8);
+  localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
+  renderRecentRepos();
+}
+
+function removeRecentRepo(path) {
+  const recent = getRecentRepos().filter(r => r !== path);
+  localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
+  renderRecentRepos();
+}
+
+function clearRecentRepos() {
+  localStorage.removeItem(RECENT_KEY);
+  renderRecentRepos();
+}
+
+function renderRecentRepos() {
+  const recent = getRecentRepos();
+  if (recent.length === 0) {
+    recentReposEl.style.display = 'none';
+    return;
+  }
+  recentReposEl.style.display = 'block';
+  recentListEl.innerHTML = recent.map(r => {
+    // Show just the last 2 path segments for readability
+    const short = r.split('/').filter(Boolean).slice(-2).join('/');
+    return `<div class="recent-item" data-path="${esc(r)}" title="${esc(r)}">
+      <span class="path">${esc(short)}</span>
+      <span class="remove" data-remove="${esc(r)}" title="Remove">&times;</span>
+    </div>`;
+  }).join('') + '<button class="recent-clear" id="clearRecent">Clear all</button>';
+
+  // Click handlers
+  recentListEl.querySelectorAll('.recent-item').forEach(el => {
+    el.onclick = (e) => {
+      if (e.target.classList.contains('remove')) {
+        e.stopPropagation();
+        removeRecentRepo(e.target.dataset.remove);
+        return;
+      }
+      repoInput.value = el.dataset.path;
+      btnIndex.click();
+    };
+  });
+  const clearBtn = recentListEl.querySelector('#clearRecent');
+  if (clearBtn) clearBtn.onclick = clearRecentRepos;
+}
+
+// Restore last path from recent repos
+const recentReposList = getRecentRepos();
+if (recentReposList.length > 0) repoInput.value = recentReposList[0];
+renderRecentRepos();
+
+// --- Browse (native folder picker) ---
+btnBrowse.onclick = async () => {
+  btnBrowse.disabled = true;
+  try {
+    const res = await fetch(`${API}/api/browse`, { method: 'POST' });
+    const data = await res.json();
+    if (data.error) return; // cancelled
+    repoInput.value = data.path;
+    repoInput.focus();
+    // Auto-index after browse
+    btnIndex.click();
+  } catch {
+    // Cancelled or error - do nothing
+  } finally {
+    btnBrowse.disabled = false;
+  }
+};
+
+// --- Drag and drop ---
+let dragCounter = 0;
+
+document.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  dragCounter++;
+  if (dragCounter === 1) dropOverlay.classList.add('active');
+});
+
+document.addEventListener('dragleave', (e) => {
+  e.preventDefault();
+  dragCounter--;
+  if (dragCounter === 0) dropOverlay.classList.remove('active');
+});
+
+document.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragCounter = 0;
+  dropOverlay.classList.remove('active');
+
+  // Try text/uri-list first (macOS Finder sometimes provides file:// URLs)
+  const uriList = e.dataTransfer.getData('text/uri-list');
+  if (uriList) {
+    const match = uriList.match(/^file:\/\/(.+)/m);
+    if (match) {
+      repoInput.value = decodeURIComponent(match[1]).replace(/\/$/, '');
+      btnIndex.click();
+      return;
+    }
+  }
+
+  // Try plain text (e.g. dragging path text from Terminal)
+  const text = e.dataTransfer.getData('text/plain');
+  if (text && (text.startsWith('/') || text.match(/^[A-Z]:\\/))) {
+    repoInput.value = text.trim().replace(/\/$/, '');
+    btnIndex.click();
+    return;
+  }
+
+  // File/folder drop - try to extract path from File objects
+  // Browsers don't expose full paths, but some give us useful info
+  if (e.dataTransfer.files.length > 0) {
+    const file = e.dataTransfer.files[0];
+    // Electron-like environments expose .path
+    if (file.path) {
+      repoInput.value = file.path.replace(/\/$/, '');
+      btnIndex.click();
+      return;
+    }
+  }
+
+  // If we couldn't get a path, flash the browse button as a hint
+  btnBrowse.style.borderColor = 'var(--accent)';
+  btnBrowse.style.color = 'var(--accent)';
+  setTimeout(() => {
+    btnBrowse.style.borderColor = '';
+    btnBrowse.style.color = '';
+  }, 1500);
+});
+
+// Also support dropping directly on the input
+repoInput.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  repoInput.classList.add('drag-over');
+});
+repoInput.addEventListener('dragleave', () => {
+  repoInput.classList.remove('drag-over');
+});
+repoInput.addEventListener('drop', (e) => {
+  repoInput.classList.remove('drag-over');
+  // The document-level handler will process the drop
+});
+
+// --- Index ---
+btnIndex.onclick = async () => {
+  const root = repoInput.value.trim();
+  if (!root) return;
+  btnIndex.disabled = true;
+  btnIndex.textContent = 'Indexing...';
+  resultsEl.innerHTML = '<div class="loading">Indexing repository...</div>';
+
+  try {
+    const res = await fetch(`${API}/api/index`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    addRecentRepo(root);
+    indexed = true;
+    expandCache.clear();
+    showStats(data.stats, data.elapsed);
+    await loadPickerData();
+    // Auto-switch to Map tab to show the ranked overview
+    document.querySelector('[data-tool="map"]').click();
+  } catch (e) {
+    resultsEl.innerHTML = `<div class="error-msg">${esc(e.message)}</div>`;
+  } finally {
+    btnIndex.disabled = false;
+    btnIndex.textContent = 'Index';
+  }
+};
+
+function showStats(stats, elapsed) {
+  statsBar.style.display = 'flex';
+  $('#statFiles').textContent = stats.files;
+  $('#statSymbols').textContent = stats.symbols;
+  $('#statEdges').textContent = stats.edges;
+  $('#statElapsed').textContent = elapsed ? `${elapsed}ms` : '';
+}
+
+// --- Picker data ---
+let cachedFiles = [];
+let cachedSymbols = [];
+
+async function loadPickerData() {
+  if (!indexed) return;
+  try {
+    const [symRes, mapRes] = await Promise.all([
+      fetch(`${API}/api/symbols?limit=500`).then(r => r.json()),
+      fetch(`${API}/api/map?limit=1000`).then(r => r.json()),
+    ]);
+    cachedSymbols = symRes.results || [];
+    // Extract file paths from map content (lines that end with ":")
+    if (mapRes.content) {
+      cachedFiles = mapRes.content.split('\n')
+        .filter(l => l.match(/^\S/) && l.endsWith(':'))
+        .map(l => l.slice(0, -1));
+    }
+  } catch (e) {
+    console.error('Failed to load picker data:', e);
+  }
+}
+
+function showFilePicker(filter) {
+  let files = cachedFiles;
+  if (filter) {
+    const lower = filter.toLowerCase();
+    files = files.filter(f => f.toLowerCase().includes(lower));
+  }
+  const total = files.length;
+  files = files.slice(0, 60);
+
+  resultCount.textContent = filter
+    ? `${total} matching file${total !== 1 ? 's' : ''}`
+    : `${cachedFiles.length} indexed files`;
+  pagination.style.display = 'none';
+
+  if (files.length === 0) {
+    resultsEl.innerHTML = filter
+      ? '<div class="empty-state"><p>No matching files. Keep typing...</p></div>'
+      : '<div class="empty-state"><p>No files indexed.</p></div>';
+    return;
+  }
+
+  const hint = filter ? '' : `<div class="picker-hint">Click a file to query, or start typing to filter</div>`;
+  resultsEl.innerHTML = hint + files.map(f =>
+    `<div class="file-result" onclick="pickItem(this)" data-value="${esc(f)}">${esc(f)}</div>`
+  ).join('');
+}
+
+function showSymbolPicker(filter) {
+  let syms = cachedSymbols.filter(s => s.kind !== 'import');
+  if (filter) {
+    const lower = filter.toLowerCase();
+    syms = syms.filter(s =>
+      (s.signature || '').toLowerCase().includes(lower) ||
+      s.file.toLowerCase().includes(lower)
+    );
+  }
+  const total = syms.length;
+  syms = syms.slice(0, 60);
+
+  resultCount.textContent = filter
+    ? `${total} matching symbol${total !== 1 ? 's' : ''}`
+    : `${cachedSymbols.filter(s => s.kind !== 'import').length} indexed symbols`;
+  pagination.style.display = 'none';
+
+  if (syms.length === 0) {
+    resultsEl.innerHTML = filter
+      ? '<div class="empty-state"><p>No matching symbols. Keep typing...</p></div>'
+      : '<div class="empty-state"><p>No symbols indexed.</p></div>';
+    return;
+  }
+
+  const hint = filter ? '' : `<div class="picker-hint">Click a symbol to query, or start typing to filter</div>`;
+  resultsEl.innerHTML = hint + syms.map(s => {
+    const name = extractSymbolName(s);
+    return `<div class="result-card" data-pick data-value="${esc(name)}" onclick="pickItem(this)">
+      <div>
+        <span class="result-kind kind-${s.kind || 'variable'}">${s.kind || '?'}</span>
+        <a class="result-file" href="#" onclick="openFile('${s.file}', ${s.lineStart}); event.stopPropagation(); return false">${esc(s.file)}</a>
+        <span class="result-line">:${s.lineStart}</span>
+      </div>
+      <div class="result-sig">${highlightSig(s.signature || '')}</div>
+    </div>`;
+  }).join('');
+}
+
+function extractSymbolName(sym) {
+  const sig = sym.signature || '';
+  // Match: "function foo(", "class Bar", "def baz(", "fn qux(", "const x =", etc.
+  const match = sig.match(/(?:function|async\s+function|class|def|fn|const|let|var|type|interface|struct|enum|pub\s+fn|pub\s+struct)\s+(\w+)/);
+  if (match) return match[1];
+  // Fallback: last word before "(" or end
+  const fallback = sig.split('(')[0].split(' ').pop().trim();
+  return fallback || sig.slice(0, 30);
+}
+
+function pickItem(el) {
+  queryInput.value = el.dataset.value;
+  clearTimeout(debounceTimer);
+  runQuery();
+}
+
+// --- Tabs ---
+$$('.tab').forEach(tab => {
+  tab.onclick = () => {
+    $$('.tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    currentTool = tab.dataset.tool;
+    currentPage = 0;
+    updateSearchUI();
+    // Auto-run: map/structure run server query, others show pickers or run
+    if (['map', 'structure', 'symbols'].includes(currentTool)) {
+      runQuery();
+    } else {
+      queryInput.value = '';
+      queryInput.focus();
+      runQuery(); // will show picker for empty input
+    }
+  };
+});
+
+function updateSearchUI() {
+  const needsQuery = ['search', 'symbols', 'callers', 'dependents', 'neighborhood'].includes(currentTool);
+  const needsKind = ['search', 'symbols'].includes(currentTool);
+
+  $('#searchArea').style.display = needsQuery ? 'block' : 'none';
+  kindFilter.style.display = needsKind ? 'inline-block' : 'none';
+
+  const placeholders = {
+    search: 'Search symbols (e.g. "auth", "handler", "parse")...',
+    symbols: 'Filter by file path (optional)...',
+    callers: 'Symbol name (e.g. "authenticateUser")...',
+    dependents: 'File path (e.g. "src/auth/handlers.ts")...',
+    neighborhood: 'File path (e.g. "src/auth/handlers.ts")...',
+  };
+  queryInput.placeholder = placeholders[currentTool] || 'Query...';
+}
+
+// --- Query execution ---
+let debounceTimer = null;
+queryInput.oninput = () => {
+  clearTimeout(debounceTimer);
+  currentPage = 0;
+  debounceTimer = setTimeout(runQuery, 250);
+};
+queryInput.onkeydown = (e) => {
+  if (e.key === 'Enter') { clearTimeout(debounceTimer); runQuery(); }
+};
+kindFilter.onchange = () => { currentPage = 0; runQuery(); };
+limitSelect.onchange = () => {
+  pageSize = parseInt(limitSelect.value);
+  currentPage = 0;
+  runQuery();
+};
+prevBtn.onclick = () => { if (currentPage > 0) { currentPage--; runQuery(); } };
+nextBtn.onclick = () => {
+  if ((currentPage + 1) * pageSize < totalResults) { currentPage++; runQuery(); }
+};
+
+async function runQuery() {
+  if (!indexed) return;
+  if (loading) return;
+
+  const query = queryInput.value.trim();
+  const offset = currentPage * pageSize;
+
+  // Empty input: show pickers so the user can discover files/symbols
+  if (!query) {
+    if (currentTool === 'callers') { showSymbolPicker(''); return; }
+    if (currentTool === 'dependents') { showFilePicker(''); return; }
+    if (currentTool === 'neighborhood') { showFilePicker(''); return; }
+    if (currentTool === 'search') { showSymbolPicker(''); return; }
+  }
+
+  loading = true;
+  try {
+    let url;
+    switch (currentTool) {
+      case 'search':
+        url = `${API}/api/search?q=${enc(query)}&offset=${offset}&limit=${pageSize}`;
+        if (kindFilter.value) url += `&kind=${kindFilter.value}`;
+        break;
+      case 'map':
+        url = `${API}/api/map?offset=${offset}&limit=${pageSize}&format=structured`;
+        if (query) url += `&focus=${enc(query)}`;
+        break;
+      case 'symbols':
+        url = `${API}/api/symbols?offset=${offset}&limit=${pageSize}`;
+        if (query) url += `&file=${enc(query)}`;
+        if (kindFilter.value) url += `&kind=${kindFilter.value}`;
+        break;
+      case 'callers':
+        url = `${API}/api/callers?symbol=${enc(query)}&offset=${offset}&limit=${pageSize}`;
+        break;
+      case 'dependents':
+        if (!query) { showFilePicker(''); return; }
+        // Show filtered file picker until exact match
+        if (cachedFiles.length > 0 && !cachedFiles.includes(query)) {
+          showFilePicker(query);
+          return;
+        }
+        url = `${API}/api/dependents?file=${enc(query)}&offset=${offset}&limit=${pageSize}`;
+        break;
+      case 'neighborhood':
+        if (!query) { showFilePicker(''); return; }
+        if (cachedFiles.length > 0 && !cachedFiles.includes(query)) {
+          showFilePicker(query);
+          return;
+        }
+        url = `${API}/api/neighborhood?file=${enc(query)}`;
+        break;
+      case 'structure':
+        url = `${API}/api/structure?depth=4`;
+        break;
+    }
+
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    render(data);
+  } catch (e) {
+    resultsEl.innerHTML = `<div class="error-msg">${esc(e.message)}</div>`;
+    pagination.style.display = 'none';
+    resultCount.textContent = '';
+  } finally {
+    loading = false;
+  }
+}
+
+// --- Rendering ---
+function render(data) {
+  switch (currentTool) {
+    case 'search': return renderSymbolList(data.results, data.total);
+    case 'symbols': return renderSymbolList(data.results, data.total);
+    case 'map': return renderMap(data);
+    case 'callers': return renderFileList(data.results, data.total);
+    case 'dependents': return renderFileList(data.results, data.total);
+    case 'neighborhood': return renderNeighborhood(data);
+    case 'structure': return renderPre(data.content);
+  }
+}
+
+function renderSymbolList(results, total) {
+  totalResults = total;
+  if (!results || results.length === 0) {
+    resultsEl.innerHTML = '<div class="empty-state"><p>No results found.</p></div>';
+    pagination.style.display = 'none';
+    resultCount.textContent = '';
+    return;
+  }
+
+  resultCount.textContent = `${total} result${total !== 1 ? 's' : ''}`;
+  resultsEl.innerHTML = results.map(s => `
+    <div class="result-card">
+      <div>
+        <span class="result-kind kind-${s.kind || 'variable'}">${s.kind || '?'}</span>
+        <a class="result-file" href="#" onclick="openFile('${s.file}', ${s.lineStart}); return false" title="Open in editor">${esc(s.file)}</a>
+        <span class="result-line">:${s.lineStart}</span>
+      </div>
+      <div class="result-sig">${highlightSig(s.signature || s.name)}</div>
+    </div>
+  `).join('');
+
+  updatePagination();
+}
+
+function renderFileList(results, total) {
+  totalResults = total;
+  if (!results || results.length === 0) {
+    resultsEl.innerHTML = '<div class="empty-state"><p>No results found.</p></div>';
+    pagination.style.display = 'none';
+    resultCount.textContent = '';
+    return;
+  }
+
+  resultCount.textContent = `${total} result${total !== 1 ? 's' : ''}`;
+  // Handle both string arrays and object arrays
+  resultsEl.innerHTML = results.map(r => {
+    const file = typeof r === 'string' ? r : r.file;
+    return `<div class="file-result"><a class="result-file" href="#" onclick="openFile('${file}'); return false" title="Open in editor">${esc(file)}</a></div>`;
+  }).join('');
+
+  updatePagination();
+}
+
+function renderMap(data) {
+  totalResults = data.totalSymbols || 0;
+  resultCount.textContent = `${data.shownSymbols} of ${data.totalSymbols} symbols across ${data.shownFiles} of ${data.totalFiles} files`;
+
+  if (!data.files || data.files.length === 0) {
+    resultsEl.innerHTML = '<div class="empty-state"><p>Empty index.</p></div>';
+    pagination.style.display = 'none';
+    return;
+  }
+
+  resultsEl.innerHTML = data.files.map(f => {
+    const symsHtml = f.symbols.map(s =>
+      `<div class="result-sig" style="font-size:12px">` +
+        `<span class="result-kind kind-${s.kind || 'variable'}" style="font-size:9px">${s.kind || '?'}</span>` +
+        `<span class="result-line">${s.lineStart}</span> ${highlightSig(s.signature || s.name)}` +
+      `</div>`
+    ).join('');
+
+    return `<div class="map-card" data-file="${esc(f.path)}">` +
+      `<div class="map-card-header">` +
+        `<span class="map-chevron">&#x25B8;</span>` +
+        `<a class="result-file" href="#" onclick="openFile('${escJs(f.path)}'); event.stopPropagation(); return false" title="Open in editor">${esc(f.path)}</a>` +
+      `</div>` +
+      `<div class="map-symbols">${symsHtml}</div>` +
+      `<div class="map-expand"></div>` +
+    `</div>`;
+  }).join('');
+
+  // Attach expand/collapse handlers via delegation
+  resultsEl.querySelectorAll('.map-card-header').forEach(header => {
+    header.onclick = (e) => {
+      if (e.target.closest('.result-file')) return;
+      const card = header.closest('.map-card');
+      toggleMapExpand(card);
+    };
+  });
+
+  updatePagination();
+}
+
+async function toggleMapExpand(card) {
+  const file = card.dataset.file;
+  const expandEl = card.querySelector('.map-expand');
+  const isExpanded = card.classList.contains('expanded');
+
+  if (isExpanded) {
+    card.classList.remove('expanded');
+    return;
+  }
+
+  card.classList.add('expanded');
+
+  // Check cache
+  if (expandCache.has(file)) {
+    renderExpandContent(expandEl, expandCache.get(file));
+    return;
+  }
+
+  expandEl.innerHTML = '<div class="map-expand-loading">Loading dependencies...</div>';
+
+  try {
+    const [depsRes, dependentsRes, symbolsRes] = await Promise.all([
+      fetch(`${API}/api/deps?file=${enc(file)}&limit=15`).then(r => r.json()),
+      fetch(`${API}/api/dependents?file=${enc(file)}&limit=15`).then(r => r.json()),
+      fetch(`${API}/api/symbols?file=${enc(file)}&limit=500`).then(r => r.json()),
+    ]);
+
+    const data = {
+      dependents: dependentsRes.results || [],
+      dependentsTotal: dependentsRes.total || 0,
+      deps: depsRes.results || [],
+      depsTotal: depsRes.total || 0,
+      symbols: (symbolsRes.results || []).sort((a, b) => a.lineStart - b.lineStart),
+    };
+    expandCache.set(file, data);
+    renderExpandContent(expandEl, data);
+  } catch (e) {
+    expandEl.innerHTML = `<div class="error-msg">${esc(e.message)}</div>`;
+  }
+}
+
+function renderExpandContent(el, data) {
+  let html = '';
+
+  // Imported by (dependents)
+  html += '<div class="map-expand-section">';
+  html += `<div class="map-expand-title"><span class="arrow">&larr;</span> Imported by (${data.dependentsTotal})</div>`;
+  if (data.dependents.length === 0) {
+    html += '<div class="map-expand-empty">No dependents</div>';
+  } else {
+    for (const f of data.dependents) {
+      const fp = typeof f === 'string' ? f : f.file;
+      html += `<div class="map-dep-item" onclick="openFile('${escJs(fp)}')">${esc(fp)}</div>`;
+    }
+    if (data.dependentsTotal > data.dependents.length) {
+      html += `<div class="map-expand-empty">...and ${data.dependentsTotal - data.dependents.length} more</div>`;
+    }
+  }
+  html += '</div>';
+
+  // Depends on (deps)
+  html += '<div class="map-expand-section">';
+  html += `<div class="map-expand-title"><span class="arrow">&rarr;</span> Depends on (${data.depsTotal})</div>`;
+  if (data.deps.length === 0) {
+    html += '<div class="map-expand-empty">No dependencies</div>';
+  } else {
+    for (const f of data.deps) {
+      const fp = typeof f === 'string' ? f : f.file;
+      html += `<div class="map-dep-item" onclick="openFile('${escJs(fp)}')">${esc(fp)}</div>`;
+    }
+    if (data.depsTotal > data.deps.length) {
+      html += `<div class="map-expand-empty">...and ${data.depsTotal - data.deps.length} more</div>`;
+    }
+  }
+  html += '</div>';
+
+  // All symbols in source order
+  if (data.symbols && data.symbols.length > 0) {
+    html += '<div class="map-expand-section">';
+    html += `<div class="map-expand-title">All symbols (${data.symbols.length})</div>`;
+    for (const s of data.symbols) {
+      html += `<div class="map-sym-item" onclick="openFile('${escJs(s.file)}', ${s.lineStart})">` +
+        `<span class="result-kind kind-${s.kind || 'variable'}">${s.kind || '?'}</span>` +
+        `<span class="sym-line">${s.lineStart}</span> ${esc(s.signature || s.name)}` +
+      `</div>`;
+    }
+    html += '</div>';
+  }
+
+  el.innerHTML = html;
+}
+
+// Escape for use in JS string literals (single-quoted onclick handlers)
+function escJs(s) {
+  if (!s) return '';
+  return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function renderNeighborhood(data) {
+  totalResults = 0;
+  pagination.style.display = 'none';
+  resultCount.textContent = `${data.files?.length || 0} files, ${data.symbols?.length || 0} symbols, ${data.edges?.length || 0} edges`;
+
+  if (!data.files || data.files.length === 0) {
+    resultsEl.innerHTML = '<div class="empty-state"><p>File not found in index.</p></div>';
+    return;
+  }
+
+  let html = '';
+
+  // Files
+  html += '<div class="nb-section"><div class="nb-section-title">Files</div>';
+  for (const f of data.files) {
+    html += `<div class="nb-file"><a class="result-file" href="#" onclick="openFile('${f}'); return false">${esc(f)}</a></div>`;
+  }
+  html += '</div>';
+
+  // Edges
+  if (data.edges && data.edges.length > 0) {
+    html += '<div class="nb-section"><div class="nb-section-title">Imports</div>';
+    for (const e of data.edges) {
+      html += `<div class="nb-edge">${esc(e.source)} <span class="arrow">&rarr;</span> ${esc(e.target)}</div>`;
+    }
+    html += '</div>';
+  }
+
+  // Symbols grouped by file
+  if (data.symbols && data.symbols.length > 0) {
+    const byFile = new Map();
+    for (const s of data.symbols) {
+      if (!byFile.has(s.file)) byFile.set(s.file, []);
+      byFile.get(s.file).push(s);
+    }
+    html += '<div class="nb-section"><div class="nb-section-title">Symbols</div>';
+    for (const [file, syms] of byFile) {
+      html += `<div class="result-card"><a class="result-file" href="#" onclick="openFile('${file}'); return false">${esc(file)}</a>`;
+      for (const s of syms) {
+        html += `<div class="result-sig" style="margin-left:12px;font-size:12px"><span class="result-kind kind-${s.kind}">${s.kind}</span> ${highlightSig(s.signature || s.name)}</div>`;
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  resultsEl.innerHTML = html;
+}
+
+function renderPre(content) {
+  totalResults = 0;
+  pagination.style.display = 'none';
+  resultCount.textContent = '';
+  resultsEl.innerHTML = `<pre class="result-pre">${esc(content)}</pre>`;
+}
+
+function updatePagination() {
+  const totalPages = Math.ceil(totalResults / pageSize);
+  if (totalPages <= 1) {
+    pagination.style.display = 'none';
+    return;
+  }
+  pagination.style.display = 'flex';
+  pageInfo.textContent = `Page ${currentPage + 1} of ${totalPages}`;
+  prevBtn.disabled = currentPage === 0;
+  nextBtn.disabled = currentPage >= totalPages - 1;
+}
+
+// --- IDE file opener ---
+const idePick = $('#idePick');
+let currentIDE = localStorage.getItem('betterrank_ide') || 'cursor';
+idePick.value = currentIDE;
+idePick.onchange = () => {
+  currentIDE = idePick.value;
+  localStorage.setItem('betterrank_ide', currentIDE);
+};
+
+function openFile(file, line) {
+  const params = `file=${enc(file)}&ide=${enc(currentIDE)}${line ? '&line=' + line : ''}`;
+  fetch(`${API}/api/open?${params}`);
+}
+
+// --- Helpers ---
+function esc(s) {
+  if (!s) return '';
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function enc(s) { return encodeURIComponent(s); }
+
+function highlightSig(sig) {
+  if (!sig) return '';
+  // Keyword highlighting
+  return esc(sig)
+    .replace(/\b(function|async|class|interface|type|const|let|var|def|fn|pub|impl|struct|enum|trait|export|import|from|extends|implements)\b/g,
+      '<span style="color:var(--purple)">$1</span>')
+    .replace(/\b(string|number|boolean|void|any|null|undefined|int|float|bool|str|Vec|Option|Result|Promise|Optional|Dict|List)\b/g,
+      '<span style="color:var(--yellow)">$1</span>');
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+    e.preventDefault();
+    queryInput.focus();
+    queryInput.select();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'o') {
+    e.preventDefault();
+    btnBrowse.click();
+  }
+});
+
+// Enter on repo input triggers index
+repoInput.onkeydown = (e) => {
+  if (e.key === 'Enter') btnIndex.click();
+};
+</script>
+</body>
+</html>

@@ -7,9 +7,10 @@ const DEFAULT_LIMIT = 50;
 const DEFAULT_DEPTH = 3;
 
 const USAGE = `
-code-index <command> [options]
+betterrank <command> [options]
 
 Commands:
+  ui          [--port N]                            Launch web UI (default port: 3333)
   map         [--focus file1,file2]                 Repo map (ranked by PageRank)
   search      <query> [--kind type]                 Substring search on symbol names + signatures (ranked by PageRank)
   structure   [--depth N]                           File tree with symbol counts (default depth: ${DEFAULT_DEPTH})
@@ -37,6 +38,19 @@ async function main() {
 
   const command = args[0];
   const flags = parseFlags(args.slice(1));
+
+  // UI command doesn't need --root or a CodeIndex instance
+  if (command === 'ui') {
+    const { startServer } = await import('./server.js');
+    const port = parseInt(flags.port || '3333', 10);
+    startServer(port);
+    // Open browser
+    const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+    const { exec } = await import('child_process');
+    exec(`${opener} http://localhost:${port}`);
+    return; // Keep process alive (server is listening)
+  }
+
   const projectRoot = resolve(flags.root || process.cwd());
   if (!flags.root) {
     process.stderr.write(`⚠ No --root specified, using cwd: ${projectRoot}\n`);
@@ -78,7 +92,7 @@ async function main() {
 
     case 'search': {
       const query = flags._positional[0];
-      if (!query) { console.error('Usage: code-index search <query> [--kind type]'); process.exit(1); }
+      if (!query) { console.error('Usage: betterrank search <query> [--kind type]'); process.exit(1); }
       const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
       const result = await idx.search({ query, kind: flags.kind, count: countMode, offset, limit: effectiveLimit });
       if (countMode) {
@@ -126,7 +140,7 @@ async function main() {
 
     case 'callers': {
       const symbol = flags._positional[0];
-      if (!symbol) { console.error('Usage: code-index callers <symbol> [--file path]'); process.exit(1); }
+      if (!symbol) { console.error('Usage: betterrank callers <symbol> [--file path]'); process.exit(1); }
       const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
       const result = await idx.callers({ symbol, file: normalizeFilePath(flags.file), count: countMode, offset, limit: effectiveLimit });
       if (countMode) {
@@ -146,7 +160,7 @@ async function main() {
 
     case 'deps': {
       const file = normalizeFilePath(flags._positional[0]);
-      if (!file) { console.error('Usage: code-index deps <file>'); process.exit(1); }
+      if (!file) { console.error('Usage: betterrank deps <file>'); process.exit(1); }
       const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
       const result = await idx.dependencies({ file, count: countMode, offset, limit: effectiveLimit });
       if (countMode) {
@@ -164,7 +178,7 @@ async function main() {
 
     case 'dependents': {
       const file = normalizeFilePath(flags._positional[0]);
-      if (!file) { console.error('Usage: code-index dependents <file>'); process.exit(1); }
+      if (!file) { console.error('Usage: betterrank dependents <file>'); process.exit(1); }
       const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
       const result = await idx.dependents({ file, count: countMode, offset, limit: effectiveLimit });
       if (countMode) {
@@ -182,7 +196,7 @@ async function main() {
 
     case 'neighborhood': {
       const file = normalizeFilePath(flags._positional[0]);
-      if (!file) { console.error('Usage: code-index neighborhood <file> [--hops N] [--max-files N]'); process.exit(1); }
+      if (!file) { console.error('Usage: betterrank neighborhood <file> [--hops N] [--max-files N]'); process.exit(1); }
       const hops = parseInt(flags.hops || '2', 10);
       const maxFilesFlag = flags['max-files'] ? parseInt(flags['max-files'], 10) : 15;
 
