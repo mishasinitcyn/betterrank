@@ -150,7 +150,7 @@ class CodeIndexCache {
       this.initialized = true;
     }
 
-    const { changed, deleted } = await this._getChangedFiles();
+    const { changed, deleted, totalScanned } = await this._getChangedFiles();
 
     if (changed.length === 0 && deleted.length === 0) {
       if (!this.graph) {
@@ -159,9 +159,15 @@ class CodeIndexCache {
         const MDG = graphology.default?.MultiDirectedGraph || graphology.MultiDirectedGraph;
         this.graph = new MDG({ allowSelfLoops: false });
       }
-      return { changed: 0, deleted: 0 };
+      return { changed: 0, deleted: 0, totalScanned };
     }
 
+    const isColdStart = !this.graph;
+    if (isColdStart) {
+      process.stderr.write(`Indexing ${this.projectRoot}... ${changed.length} files found, parsing...\n`);
+    }
+
+    const t0 = Date.now();
     const newSymbols = await this._parseFiles(changed);
 
     if (!this.graph) {
@@ -175,7 +181,14 @@ class CodeIndexCache {
 
     await saveGraph(this.graph, this.mtimes, this.cachePath);
 
-    return { changed: changed.length, deleted: deleted.length };
+    if (isColdStart) {
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      let symbols = 0;
+      this.graph.forEachNode((_n, attrs) => { if (attrs.type === 'symbol') symbols++; });
+      process.stderr.write(`Indexed ${changed.length} files (${symbols} symbols, ${this.graph.size} edges) in ${elapsed}s\n`);
+    }
+
+    return { changed: changed.length, deleted: deleted.length, totalScanned };
   }
 
   /**
@@ -256,7 +269,7 @@ class CodeIndexCache {
       }
     }
 
-    return { changed, deleted };
+    return { changed, deleted, totalScanned: files.length };
   }
 
   /**

@@ -27,7 +27,151 @@ Global flags:
   --count           Return counts only (no content)
   --offset N        Skip first N results
   --limit N         Max results to return (default: ${DEFAULT_LIMIT} for list commands)
+  --help            Show help for a command (e.g. betterrank search --help)
 `.trim();
+
+const COMMAND_HELP = {
+  map: `betterrank map [--focus file1,file2] [--root <path>]
+
+Aider-style repo map: the most structurally important definitions ranked by PageRank.
+
+Options:
+  --focus <files>   Comma-separated files to bias ranking toward
+  --count           Return total symbol count only
+  --offset N        Skip first N symbols
+  --limit N         Max symbols to return (default: ${DEFAULT_LIMIT})
+
+Examples:
+  betterrank map --root ./backend
+  betterrank map --root ./frontend --limit 100
+  betterrank map --root ./backend --focus src/auth/handlers.ts,src/api/login.ts`,
+
+  search: `betterrank search <query> [--kind type] [--root <path>]
+
+Substring search on symbol names + full signatures (param names, types, defaults).
+Results ranked by PageRank (most structurally important first).
+
+Options:
+  --kind <type>    Filter: function, class, type, variable, namespace, import
+  --count          Return match count only
+  --offset N       Skip first N results
+  --limit N        Max results (default: ${DEFAULT_LIMIT})
+
+Tips:
+  Use short substrings (3-5 chars) — PageRank ranking handles noise.
+  "imp" finds encrypt_imp_payload, increment_impression, etc.
+  Searches match against both symbol names AND full signatures (param names, types).
+
+Examples:
+  betterrank search resolve --root ./backend
+  betterrank search auth --kind function --limit 10
+  betterrank search max_age --root . --count`,
+
+  structure: `betterrank structure [--depth N] [--root <path>]
+
+File tree with symbol counts per file.
+
+Options:
+  --depth N     Max directory depth (default: ${DEFAULT_DEPTH})
+
+Examples:
+  betterrank structure --root ./backend --depth 2`,
+
+  symbols: `betterrank symbols [--file path] [--kind type] [--root <path>]
+
+List symbol definitions, optionally filtered by file or kind.
+Results ranked by PageRank (most structurally important first).
+
+Options:
+  --file <path>    Filter to a specific file (relative to --root)
+  --kind <type>    Filter: function, class, type, variable, namespace, import
+  --count          Return count only
+  --offset N       Skip first N results
+  --limit N        Max results (default: ${DEFAULT_LIMIT})
+
+Examples:
+  betterrank symbols --file src/auth/handlers.ts --root ./backend
+  betterrank symbols --kind class --root . --limit 20`,
+
+  callers: `betterrank callers <symbol> [--file path] [--root <path>]
+
+Find all files that reference a symbol. Ranked by file-level PageRank.
+
+Options:
+  --file <path>    Disambiguate when multiple symbols share a name
+  --count          Return count only
+  --offset N       Skip first N results
+  --limit N        Max results (default: ${DEFAULT_LIMIT})
+
+Examples:
+  betterrank callers authenticateUser --root ./backend
+  betterrank callers resolve --file src/utils.ts --root .`,
+
+  deps: `betterrank deps <file> [--root <path>]
+
+What this file imports / depends on. Ranked by PageRank.
+
+Options:
+  --count          Return count only
+  --offset N       Skip first N results
+  --limit N        Max results (default: ${DEFAULT_LIMIT})
+
+Examples:
+  betterrank deps src/auth/handlers.ts --root ./backend`,
+
+  dependents: `betterrank dependents <file> [--root <path>]
+
+What files import this file. Ranked by PageRank.
+
+Options:
+  --count          Return count only
+  --offset N       Skip first N results
+  --limit N        Max results (default: ${DEFAULT_LIMIT})
+
+Examples:
+  betterrank dependents src/auth/handlers.ts --root ./backend`,
+
+  neighborhood: `betterrank neighborhood <file> [--hops N] [--max-files N] [--root <path>]
+
+Local subgraph around a file: its imports, importers, and their symbols.
+
+Options:
+  --hops N          BFS depth for outgoing imports (default: 2)
+  --max-files N     Max files to include (default: 15, direct neighbors always included)
+  --count           Return counts only
+  --offset N        Skip first N files
+  --limit N         Max files to return
+
+Examples:
+  betterrank neighborhood src/auth/handlers.ts --root ./backend
+  betterrank neighborhood src/api/bid.js --hops 3 --max-files 20 --root .`,
+
+  reindex: `betterrank reindex [--root <path>]
+
+Force a full rebuild of the index. Use after branch switches, large merges,
+or if results seem stale.
+
+Examples:
+  betterrank reindex --root ./backend`,
+
+  stats: `betterrank stats [--root <path>]
+
+Show index statistics: file count, symbol count, edge count.
+
+Examples:
+  betterrank stats --root .`,
+
+  ui: `betterrank ui [--port N]
+
+Launch the interactive web UI for exploring the index.
+
+Options:
+  --port N    Port to listen on (default: 3333)
+
+Examples:
+  betterrank ui
+  betterrank ui --port 8080`,
+};
 
 async function main() {
   const args = process.argv.slice(2);
@@ -38,6 +182,16 @@ async function main() {
 
   const command = args[0];
   const flags = parseFlags(args.slice(1));
+
+  // Per-command --help
+  if (flags.help === true || flags.h === true) {
+    if (COMMAND_HELP[command]) {
+      console.log(COMMAND_HELP[command]);
+    } else {
+      console.log(USAGE);
+    }
+    process.exit(0);
+  }
 
   // UI command doesn't need --root or a CodeIndex instance
   if (command === 'ui') {
@@ -73,6 +227,35 @@ async function main() {
     return rel;
   }
 
+  /** Print file-not-found diagnostics and exit. Returns true if handled. */
+  function handleFileNotFound(result, filePath) {
+    if (!result || !result.fileNotFound) return false;
+    console.error(`File "${filePath}" not found in index.`);
+    if (result.suggestions && result.suggestions.length > 0) {
+      console.error(`Did you mean:`);
+      for (const s of result.suggestions) console.error(`  ${s}`);
+    }
+    console.error(`Tip: File paths are relative to --root. Use \`betterrank structure\` to see indexed files.`);
+    return true;
+  }
+
+  /** Suggest shorter query alternatives by splitting on _ and camelCase boundaries. */
+  function suggestShorterQueries(query) {
+    const parts = new Set();
+    // Split on underscores
+    for (const p of query.split('_')) {
+      if (p.length >= 3) parts.add(p.toLowerCase());
+    }
+    // Split on camelCase boundaries
+    const camelParts = query.replace(/([a-z])([A-Z])/g, '$1_$2').split('_');
+    for (const p of camelParts) {
+      if (p.length >= 3) parts.add(p.toLowerCase());
+    }
+    // Remove the original query itself
+    parts.delete(query.toLowerCase());
+    return [...parts].slice(0, 4);
+  }
+
   switch (command) {
     case 'map': {
       const focusFiles = flags.focus ? flags.focus.split(',') : [];
@@ -85,6 +268,17 @@ async function main() {
         if (result.shownSymbols < result.totalSymbols) {
           console.log(`\nShowing ${result.shownFiles} of ${result.totalFiles} files, ${result.shownSymbols} of ${result.totalSymbols} symbols (ranked by PageRank)`);
           console.log(`Use --limit N to show more, or --count for totals`);
+        }
+      }
+      // Diagnostics on empty index
+      if (result.diagnostics) {
+        const d = result.diagnostics;
+        console.log(`\nDiagnostics:`);
+        console.log(`  Root:        ${d.root}`);
+        console.log(`  Files found: ${d.filesScanned}`);
+        console.log(`  Extensions:  ${d.extensions}`);
+        if (d.filesScanned === 0) {
+          console.log(`  Tip:         No supported files found. Try a broader --root.`);
         }
       }
       break;
@@ -102,7 +296,17 @@ async function main() {
           console.log(`${s.file}:${s.lineStart}  [${s.kind}] ${s.signature}`);
         }
         if (result.length === 0) {
-          console.log('(no matches)');
+          const st = await idx.stats();
+          console.log(`(no matches for "${query}")`);
+          if (st.symbols > 0) {
+            console.log(`Index has ${st.symbols.toLocaleString()} symbols across ${st.files.toLocaleString()} files.`);
+            const suggestions = suggestShorterQueries(query);
+            if (suggestions.length > 0) {
+              console.log(`Tip: Use shorter substrings. Try: ${suggestions.map(s => `"${s}"`).join(', ')}`);
+            }
+          } else {
+            console.log(`Index is empty. Check --root or run: betterrank map --root <path>`);
+          }
         } else if (result.length === effectiveLimit && userLimit === undefined) {
           console.log(`\n(showing top ${effectiveLimit} by relevance — use --limit N or --count for total)`);
         }
@@ -163,13 +367,15 @@ async function main() {
       if (!file) { console.error('Usage: betterrank deps <file>'); process.exit(1); }
       const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
       const result = await idx.dependencies({ file, count: countMode, offset, limit: effectiveLimit });
+      if (handleFileNotFound(result, file)) break;
       if (countMode) {
         console.log(`total: ${result.total}`);
       } else {
-        for (const d of result) console.log(d);
-        if (result.length === 0) {
+        const items = result.items || result;
+        for (const d of items) console.log(d);
+        if (items.length === 0) {
           console.log('(no dependencies)');
-        } else if (result.length === effectiveLimit && userLimit === undefined) {
+        } else if (items.length === effectiveLimit && userLimit === undefined) {
           console.log(`\n(showing top ${effectiveLimit} by relevance — use --limit N or --count for total)`);
         }
       }
@@ -181,13 +387,15 @@ async function main() {
       if (!file) { console.error('Usage: betterrank dependents <file>'); process.exit(1); }
       const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
       const result = await idx.dependents({ file, count: countMode, offset, limit: effectiveLimit });
+      if (handleFileNotFound(result, file)) break;
       if (countMode) {
         console.log(`total: ${result.total}`);
       } else {
-        for (const d of result) console.log(d);
-        if (result.length === 0) {
+        const items = result.items || result;
+        for (const d of items) console.log(d);
+        if (items.length === 0) {
           console.log('(no dependents)');
-        } else if (result.length === effectiveLimit && userLimit === undefined) {
+        } else if (items.length === effectiveLimit && userLimit === undefined) {
           console.log(`\n(showing top ${effectiveLimit} by relevance — use --limit N or --count for total)`);
         }
       }
@@ -208,6 +416,7 @@ async function main() {
         const preview = await idx.neighborhood({
           file, hops, maxFiles: maxFilesFlag, count: true,
         });
+        if (handleFileNotFound(preview, file)) break;
         console.log(`files: ${preview.totalFiles} (${preview.totalVisited} visited, ${preview.totalFiles} after ranking)`);
         console.log(`symbols: ${preview.totalSymbols}`);
         console.log(`edges: ${preview.totalEdges}`);
@@ -219,6 +428,7 @@ async function main() {
         file, hops, maxFiles: maxFilesFlag,
         count: countMode, offset, limit: userLimit,
       });
+      if (handleFileNotFound(result, file)) break;
 
       if (countMode) {
         console.log(`files: ${result.totalFiles} (${result.totalVisited} visited, ${result.totalFiles} after ranking)`);
@@ -284,7 +494,10 @@ function parseFlags(args) {
   const flags = { _positional: [] };
   let i = 0;
   while (i < args.length) {
-    if (args[i].startsWith('--')) {
+    if (args[i] === '-h') {
+      flags.help = true;
+      i++;
+    } else if (args[i].startsWith('--')) {
       const key = args[i].substring(2);
       if (i + 1 < args.length && !args[i + 1].startsWith('--')) {
         flags[key] = args[i + 1];

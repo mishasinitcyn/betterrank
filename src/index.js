@@ -1,7 +1,31 @@
 import { readFile } from 'fs/promises';
-import { join, dirname, relative, sep } from 'path';
+import { join, dirname, relative, sep, basename } from 'path';
 import { CodeIndexCache } from './cache.js';
 import { rankedSymbols } from './graph.js';
+
+/**
+ * Find file nodes in the graph that look similar to the given path.
+ * Uses basename matching and substring matching on the full path.
+ */
+function findSimilarFiles(graph, filePath, maxSuggestions = 5) {
+  if (!graph) return [];
+  const base = basename(filePath);
+  const baseLower = base.toLowerCase();
+  const pathLower = filePath.toLowerCase();
+  const suggestions = [];
+
+  graph.forEachNode((node, attrs) => {
+    if (attrs.type !== 'file') return;
+    const nodeLower = node.toLowerCase();
+    const nodeBase = basename(node).toLowerCase();
+    // Exact basename match or basename contains query
+    if (nodeBase === baseLower || nodeBase.includes(baseLower) || nodeLower.includes(pathLower)) {
+      suggestions.push(node);
+    }
+  });
+
+  return suggestions.slice(0, maxSuggestions);
+}
 
 /**
  * Apply offset/limit pagination to an array.
@@ -79,12 +103,17 @@ class CodeIndex {
    * @returns {{content, shownFiles, shownSymbols, totalFiles, totalSymbols}|{total: number}}
    */
   async map({ focusFiles = [], offset, limit, count = false, structured = false } = {}) {
-    await this._ensureReady();
+    const ensureResult = await this._ensureReady();
     const graph = this.cache.getGraph();
     if (!graph || graph.order === 0) {
-      if (count) return { total: 0 };
-      if (structured) return { files: [], shownFiles: 0, shownSymbols: 0, totalFiles: 0, totalSymbols: 0 };
-      return { content: '(empty index)', shownFiles: 0, shownSymbols: 0, totalFiles: 0, totalSymbols: 0 };
+      const diagnostics = {
+        root: this.projectRoot,
+        filesScanned: ensureResult.totalScanned || 0,
+        extensions: this.cache.extensions.join(', '),
+      };
+      if (count) return { total: 0, diagnostics };
+      if (structured) return { files: [], shownFiles: 0, shownSymbols: 0, totalFiles: 0, totalSymbols: 0, diagnostics };
+      return { content: '(empty index)', shownFiles: 0, shownSymbols: 0, totalFiles: 0, totalSymbols: 0, diagnostics };
     }
 
     // Count totals from the graph
@@ -362,7 +391,11 @@ class CodeIndex {
   async dependencies({ file, offset, limit, count = false }) {
     await this._ensureReady();
     const graph = this.cache.getGraph();
-    if (!graph || !graph.hasNode(file)) return count ? { total: 0 } : [];
+    if (!graph || !graph.hasNode(file)) {
+      const suggestions = findSimilarFiles(graph, file);
+      if (count) return { total: 0, fileNotFound: true, suggestions };
+      return { items: [], fileNotFound: true, suggestions };
+    }
 
     const fileScores = this._getFileScores();
 
@@ -396,7 +429,11 @@ class CodeIndex {
   async dependents({ file, offset, limit, count = false }) {
     await this._ensureReady();
     const graph = this.cache.getGraph();
-    if (!graph || !graph.hasNode(file)) return count ? { total: 0 } : [];
+    if (!graph || !graph.hasNode(file)) {
+      const suggestions = findSimilarFiles(graph, file);
+      if (count) return { total: 0, fileNotFound: true, suggestions };
+      return { items: [], fileNotFound: true, suggestions };
+    }
 
     const fileScores = this._getFileScores();
 
@@ -450,9 +487,10 @@ class CodeIndex {
     await this._ensureReady();
     const graph = this.cache.getGraph();
     if (!graph || !graph.hasNode(file)) {
+      const suggestions = findSimilarFiles(graph, file);
       return count
-        ? { totalFiles: 0, totalSymbols: 0, totalEdges: 0 }
-        : { files: [], symbols: [], edges: [] };
+        ? { totalFiles: 0, totalSymbols: 0, totalEdges: 0, fileNotFound: true, suggestions }
+        : { files: [], symbols: [], edges: [], fileNotFound: true, suggestions };
     }
 
     // BFS over file nodes, following outgoing IMPORTS edges (dependencies)
