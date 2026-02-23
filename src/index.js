@@ -636,6 +636,61 @@ class CodeIndex {
   }
 
   /**
+   * File-level dependency graph for visualization.
+   * Returns nodes (files) ranked by PageRank and IMPORTS edges between them.
+   *
+   * @param {object} opts
+   * @param {number} [opts.limit] - Max nodes to return (default: 500)
+   * @returns {{ nodes: Array<{id, label, category, score}>, edges: Array<{source, target}> }}
+   */
+  async graph({ limit = 500 } = {}) {
+    await this._ensureReady();
+    const graph = this.cache.getGraph();
+    if (!graph || graph.order === 0) {
+      return { nodes: [], edges: [] };
+    }
+
+    const fileScores = this._getFileScores();
+
+    // Collect file nodes with scores, sorted by PageRank
+    const fileEntries = [];
+    graph.forEachNode((node, attrs) => {
+      if (attrs.type !== 'file') return;
+      fileEntries.push({ id: node, score: fileScores.get(node) || 0 });
+    });
+    fileEntries.sort((a, b) => b.score - a.score);
+
+    // Cap to limit
+    const capped = fileEntries.slice(0, limit);
+    const cappedSet = new Set(capped.map(f => f.id));
+
+    // Build nodes with category (first path segment) and label (filename)
+    const nodes = capped.map(f => {
+      const parts = f.id.split('/');
+      const category = parts.length > 1 ? parts[0] : 'root';
+      const label = parts[parts.length - 1].replace(/\.[^.]+$/, '');
+      return { id: f.id, label, category, score: f.score };
+    });
+
+    // Collect IMPORTS edges between capped files
+    const edges = [];
+    const edgeSet = new Set();
+    for (const f of capped) {
+      graph.forEachOutEdge(f.id, (_edge, attrs, source, target) => {
+        if (attrs.type !== 'IMPORTS') return;
+        if (!cappedSet.has(target)) return;
+        const key = `${source}->${target}`;
+        if (!edgeSet.has(key)) {
+          edgeSet.add(key);
+          edges.push({ source, target });
+        }
+      });
+    }
+
+    return { nodes, edges };
+  }
+
+  /**
    * Force a full rebuild.
    */
   async reindex() {

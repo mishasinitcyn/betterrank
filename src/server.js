@@ -248,6 +248,15 @@ const routes = {
     json(res, result);
   },
 
+  'GET /api/graph': async (req, res) => {
+    if (!requireIndex(res)) return;
+    const p = params(req.url);
+    const result = await currentIndex.graph({
+      limit: p.getInt('limit', 500),
+    });
+    json(res, result);
+  },
+
   'GET /api/structure': async (req, res) => {
     if (!requireIndex(res)) return;
     const p = params(req.url);

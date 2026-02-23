@@ -1,6 +1,6 @@
 {
   "name": "@mishasinitcyn/betterrank",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Structural code index with PageRank-ranked repo maps, symbol search, call-graph queries, and dependency analysis. Built on tree-sitter and graphology.",
   "type": "module",
   "main": "src/index.js",
