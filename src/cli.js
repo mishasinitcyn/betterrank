@@ -19,6 +19,7 @@ Commands:
   deps        <file>                                What this file imports (ranked)
   dependents  <file>                                What imports this file (ranked)
   neighborhood <file> [--hops N] [--max-files N]    Local subgraph (ranked by PageRank)
+  orphans     [--level file|symbol] [--kind type]   Find disconnected files/symbols
   reindex                                           Force full rebuild
   stats                                             Index statistics
 
@@ -145,6 +146,30 @@ Options:
 Examples:
   betterrank neighborhood src/auth/handlers.ts --root ./backend
   betterrank neighborhood src/api/bid.js --hops 3 --max-files 20 --root .`,
+
+  orphans: `betterrank orphans [--level file|symbol] [--kind type] [--root <path>]
+
+Find disconnected files or symbols — the "satellites" in the graph UI.
+
+Levels:
+  file     Files with zero cross-file imports (default)
+  symbol   Symbols never referenced from outside their own file (dead code candidates)
+
+Options:
+  --level <type>   "file" or "symbol" (default: file)
+  --kind <type>    Filter symbols: function, class, type, variable (only with --level symbol)
+  --count          Return count only
+  --offset N       Skip first N results
+  --limit N        Max results (default: ${DEFAULT_LIMIT})
+
+False positives (entry points, config files, tests, framework hooks, dunders,
+etc.) are automatically excluded.
+
+Examples:
+  betterrank orphans --root ./backend
+  betterrank orphans --level symbol --root .
+  betterrank orphans --level symbol --kind function --root .
+  betterrank orphans --count --root .`,
 
   reindex: `betterrank reindex [--root <path>]
 
@@ -459,6 +484,55 @@ async function main() {
             for (const s of syms) {
               console.log(`    ${String(s.lineStart).padStart(4)}│ ${s.signature}`);
             }
+          }
+        }
+      }
+      break;
+    }
+
+    case 'orphans': {
+      const level = flags.level || 'file';
+      if (level !== 'file' && level !== 'symbol') {
+        console.error(`Unknown level: "${level}". Use "file" or "symbol".`);
+        process.exit(1);
+      }
+      const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
+      const result = await idx.orphans({ level, kind: flags.kind, count: countMode, offset, limit: effectiveLimit });
+
+      if (countMode) {
+        console.log(`total: ${result.total}`);
+      } else if (level === 'file') {
+        for (const f of result) {
+          console.log(`${f.file}  (${f.symbolCount} symbols)`);
+        }
+        if (result.length === 0) {
+          console.log('(no orphan files found)');
+        } else {
+          const total = await idx.orphans({ level, count: true });
+          if (result.length < total.total) {
+            console.log(`\nShowing ${result.length} of ${total.total} orphan files (use --limit N for more)`);
+          }
+        }
+      } else {
+        // symbol level — group by file like map output
+        const byFile = new Map();
+        for (const s of result) {
+          if (!byFile.has(s.file)) byFile.set(s.file, []);
+          byFile.get(s.file).push(s);
+        }
+        for (const [file, syms] of byFile) {
+          console.log(`${file}:`);
+          for (const s of syms) {
+            console.log(`  ${String(s.lineStart).padStart(4)}│ [${s.kind}] ${s.signature}`);
+          }
+          console.log('');
+        }
+        if (result.length === 0) {
+          console.log('(no orphan symbols found)');
+        } else {
+          const total = await idx.orphans({ level, kind: flags.kind, count: true });
+          if (result.length < total.total) {
+            console.log(`Showing ${result.length} of ${total.total} orphan symbols across ${byFile.size} files (use --limit N for more)`);
           }
         }
       }

@@ -3,6 +3,132 @@ import { join, dirname, relative, sep, basename } from 'path';
 import { CodeIndexCache } from './cache.js';
 import { rankedSymbols } from './graph.js';
 
+// ── Orphan false-positive filters ──────────────────────────────────────────
+//
+// Orphan detection finds files/symbols with no cross-file connections.
+// Many of these are false positives: entry points, config, tests, framework
+// hooks, etc. that are invoked by runtimes, not by other source files.
+// These filters aggressively exclude them (at the cost of some true positives).
+
+// File basenames (without extension) that are runtime entry points, config,
+// or package markers — they have no incoming IMPORTS because the runtime
+// loads them directly, not because they're dead.
+const ORPHAN_EXCLUDED_BASENAMES = new Set([
+  'index', 'main', 'app', 'server', 'cli', 'mod', 'lib',
+  'manage', 'wsgi', 'asgi', 'handler', 'lambda',
+  '__init__', '__main__',
+  'config', 'settings', 'conf', 'conftest', 'setup',
+  'gulpfile', 'gruntfile', 'makefile', 'rakefile', 'taskfile',
+]);
+
+// Path segments indicating test/spec directories
+const TEST_PATH_SEGMENTS = [
+  '/test/', '/tests/', '/__tests__/', '/spec/', '/specs/',
+  '/testing/', '/fixtures/', '/mocks/', '/e2e/', '/cypress/',
+];
+
+function isTestFile(filePath) {
+  const lower = '/' + filePath.toLowerCase();
+  for (const seg of TEST_PATH_SEGMENTS) {
+    if (lower.includes(seg)) return true;
+  }
+  const stem = basename(filePath).replace(/\.[^.]+$/, '').toLowerCase();
+  return (
+    stem.startsWith('test_') || stem.startsWith('test.') ||
+    stem.endsWith('.test') || stem.endsWith('.spec') ||
+    stem.endsWith('_test') || stem.endsWith('_spec')
+  );
+}
+
+function isOrphanFalsePositiveFile(filePath) {
+  const base = basename(filePath);
+  const stem = base.replace(/\.[^.]+$/, '').toLowerCase();
+
+  if (ORPHAN_EXCLUDED_BASENAMES.has(stem)) return true;
+
+  // Dotfiles are always config (.eslintrc, .prettierrc, etc.)
+  if (base.startsWith('.')) return true;
+
+  // Type definition files (.d.ts) — consumed by the compiler, not by imports
+  if (filePath.endsWith('.d.ts')) return true;
+
+  // Config files with compound names (vite.config.ts, jest.config.js, etc.)
+  if (/[./]config$/i.test(stem) || /\.rc$/i.test(stem)) return true;
+
+  // Test/spec files — invoked by test runners
+  if (isTestFile(filePath)) return true;
+
+  return false;
+}
+
+// Symbol names that are entry points, lifecycle hooks, or framework-called.
+const FRAMEWORK_INVOKED_SYMBOLS = new Set([
+  'main', 'run', 'start', 'serve', 'handler', 'execute', 'app',
+  'setup', 'teardown', 'setUp', 'tearDown',
+  'beforeAll', 'afterAll', 'beforeEach', 'afterEach', 'before', 'after',
+  'constructor', 'init', 'initialize', 'configure', 'register',
+  'middleware', 'plugin', 'default', 'module', 'exports',
+]);
+
+/**
+ * Detect if a function signature is likely a class/instance method rather
+ * than a standalone function. Method calls (obj.method()) are intentionally
+ * not tracked as references (too noisy without type info), so all methods
+ * appear orphaned. We exclude them to avoid flooding the results.
+ */
+function isLikelyMethod(signature, filePath) {
+  if (!signature) return false;
+  const s = signature.trimStart();
+
+  const ext = filePath.substring(filePath.lastIndexOf('.'));
+
+  // JS/TS: standalone functions always use the `function` keyword.
+  // Class methods don't: `async ensure()`, `getGraph()`, `constructor()`.
+  // Arrow functions assigned to vars are kind='variable', not 'function',
+  // so they don't reach this check.
+  if (['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx'].includes(ext)) {
+    return !/^(export\s+)?(default\s+)?(async\s+)?function[\s(]/.test(s);
+  }
+
+  // Python: methods have self or cls as first parameter
+  if (ext === '.py') {
+    return /\(\s*(self|cls)\s*[,)]/.test(s);
+  }
+
+  // Java/C#/Go: harder to detect without parent context — don't filter
+  return false;
+}
+
+function isOrphanFalsePositiveSymbol(name, kind, filePath, signature) {
+  if (FRAMEWORK_INVOKED_SYMBOLS.has(name)) return true;
+
+  // Python dunders — called implicitly by the runtime
+  if (name.startsWith('__') && name.endsWith('__')) return true;
+
+  // Test functions — called by test runners
+  if (name.startsWith('test_') || name.startsWith('Test') ||
+      name.startsWith('spec_') || name.startsWith('Spec')) return true;
+
+  // Very short names — too generic, ambiguity cap probably suppressed real refs
+  if (name.length <= 2) return true;
+
+  // Class/instance methods — obj.method() calls aren't tracked as references,
+  // so every method appears orphaned. Filter them out.
+  if (kind === 'function' && isLikelyMethod(signature, filePath)) return true;
+
+  // Symbols in test files — all invoked by the test runner
+  if (isTestFile(filePath)) return true;
+
+  // Symbols in entry point / config files — reachable via runtime
+  if (isOrphanFalsePositiveFile(filePath)) return true;
+
+  // Symbol name matches file basename — likely the primary export
+  const fileBase = basename(filePath).replace(/\.[^.]+$/, '');
+  if (name === fileBase || name.toLowerCase() === fileBase.toLowerCase()) return true;
+
+  return false;
+}
+
 /**
  * Find file nodes in the graph that look similar to the given path.
  * Uses basename matching and substring matching on the full path.
@@ -633,6 +759,98 @@ class CodeIndex {
       edges: paginatedEdges,
       total: cappedFiles.length,
     };
+  }
+
+  /**
+   * Find orphaned files or symbols — nodes with no cross-file connections.
+   *
+   * level='file': files with zero IMPORTS edges (neither importing nor imported).
+   *   These are the "satellites" in the graph UI.
+   *
+   * level='symbol': symbols with no incoming REFERENCES from outside their own file.
+   *   Dead code candidates — defined but never used cross-file.
+   *
+   * False positives (entry points, config files, test files, framework hooks,
+   * dunders, etc.) are excluded by default.
+   *
+   * @param {object} [opts]
+   * @param {'file'|'symbol'} [opts.level='file'] - Granularity
+   * @param {string} [opts.kind] - Filter symbols by kind (only for level='symbol')
+   * @param {number} [opts.offset] - Skip first N results
+   * @param {number} [opts.limit] - Max results to return
+   * @param {boolean} [opts.count=false] - If true, return only { total }
+   * @returns {Array|{total: number}}
+   */
+  async orphans({ level = 'file', kind, offset, limit, count = false } = {}) {
+    await this._ensureReady();
+    const graph = this.cache.getGraph();
+    if (!graph || graph.order === 0) return count ? { total: 0 } : [];
+
+    if (level === 'file') {
+      const results = [];
+      graph.forEachNode((node, attrs) => {
+        if (attrs.type !== 'file') return;
+
+        // Skip false positives: entry points, config, tests
+        if (isOrphanFalsePositiveFile(node)) return;
+
+        // Check for any IMPORTS edge (in or out)
+        let hasImport = false;
+        graph.forEachEdge(node, (_edge, edgeAttrs) => {
+          if (!hasImport && edgeAttrs.type === 'IMPORTS') hasImport = true;
+        });
+
+        if (!hasImport) {
+          results.push({ file: node, symbolCount: attrs.symbolCount || 0 });
+        }
+      });
+
+      // Meatier files first — more likely to be real orphans worth investigating
+      results.sort((a, b) => b.symbolCount - a.symbolCount);
+      if (count) return { total: results.length };
+      return paginate(results, { offset, limit }).items;
+    }
+
+    if (level === 'symbol') {
+      const results = [];
+      graph.forEachNode((node, attrs) => {
+        if (attrs.type !== 'symbol') return;
+        if (kind && attrs.kind !== kind) return;
+
+        // Skip false positives: framework hooks, dunders, test funcs, methods, etc.
+        if (isOrphanFalsePositiveSymbol(attrs.name, attrs.kind, attrs.file, attrs.signature)) return;
+
+        // Check for any incoming REFERENCES from a different file
+        let hasExternalRef = false;
+        graph.forEachInEdge(node, (_edge, edgeAttrs, source) => {
+          if (hasExternalRef) return;
+          if (edgeAttrs.type !== 'REFERENCES') return;
+          try {
+            const sourceFile = graph.getNodeAttribute(source, 'file') || source;
+            if (sourceFile !== attrs.file) hasExternalRef = true;
+          } catch {
+            if (source !== attrs.file) hasExternalRef = true;
+          }
+        });
+
+        if (!hasExternalRef) {
+          results.push({
+            name: attrs.name,
+            kind: attrs.kind,
+            file: attrs.file,
+            lineStart: attrs.lineStart,
+            signature: attrs.signature,
+          });
+        }
+      });
+
+      // Group by file, then by line within file
+      results.sort((a, b) => a.file.localeCompare(b.file) || a.lineStart - b.lineStart);
+      if (count) return { total: results.length };
+      return paginate(results, { offset, limit }).items;
+    }
+
+    throw new Error(`Unknown level: "${level}". Use "file" or "symbol".`);
   }
 
   /**

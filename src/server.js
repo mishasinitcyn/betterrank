@@ -257,6 +257,24 @@ const routes = {
     json(res, result);
   },
 
+  'GET /api/orphans': async (req, res) => {
+    if (!requireIndex(res)) return;
+    const p = params(req.url);
+    const level = p.get('level', 'file');
+    const results = await currentIndex.orphans({
+      level,
+      kind: p.get('kind', undefined),
+      offset: p.getInt('offset', undefined),
+      limit: p.getInt('limit', 50),
+    });
+    const total = await currentIndex.orphans({
+      level,
+      kind: p.get('kind', undefined),
+      count: true,
+    });
+    json(res, { results, total: total.total });
+  },
+
   'GET /api/structure': async (req, res) => {
     if (!requireIndex(res)) return;
     const p = params(req.url);
