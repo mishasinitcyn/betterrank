@@ -246,6 +246,26 @@ const KIND_MAP = {
   decorated_definition: 'function',
 };
 
+/**
+ * Find the body/block node of a definition, drilling into wrappers like
+ * lexical_declaration → variable_declarator → arrow_function → body.
+ */
+function findBodyNode(node) {
+  let body = node.childForFieldName('body');
+  if (body) return body;
+
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    body = child.childForFieldName('body');
+    if (body) return body;
+    for (let j = 0; j < child.namedChildCount; j++) {
+      body = child.namedChild(j).childForFieldName('body');
+      if (body) return body;
+    }
+  }
+  return null;
+}
+
 function nodeKind(nodeType) {
   return KIND_MAP[nodeType] || 'other';
 }
@@ -309,6 +329,17 @@ function parseFile(filePath, source) {
         if (!nameCapture) continue;
         const defNode = defCapture || nameCapture;
 
+        // Compute where body content starts (for outline collapsing)
+        const bodyNode = findBodyNode(defNode.node);
+        let bodyStartLine = null;
+        if (bodyNode) {
+          const bodyRow = bodyNode.startPosition.row;    // 0-indexed
+          const defRow = defNode.node.startPosition.row; // 0-indexed
+          // If body opens on same line as def (JS: `function foo() {`),
+          // content starts on next line. Otherwise body IS the content.
+          bodyStartLine = bodyRow === defRow ? bodyRow + 2 : bodyRow + 1; // 1-indexed
+        }
+
         definitions.push({
           name: nameCapture.node.text,
           kind: nodeKind(defNode.node.type),
@@ -316,6 +347,7 @@ function parseFile(filePath, source) {
           lineStart: defNode.node.startPosition.row + 1,
           lineEnd: defNode.node.endPosition.row + 1,
           signature: extractSignature(defNode.node, langName),
+          bodyStartLine,
         });
       }
     } catch (e) {

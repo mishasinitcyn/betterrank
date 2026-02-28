@@ -16,6 +16,12 @@ npm install -g @mishasinitcyn/betterrank
 # Get a ranked overview of any project
 betterrank map --root /path/to/project
 
+# View a file's skeleton without reading the whole thing
+betterrank outline src/auth.py
+
+# Expand a specific function to see its full source
+betterrank outline src/auth.py authenticate_user
+
 # Search for symbols by name or parameter
 betterrank search auth --root /path/to/project
 
@@ -44,6 +50,42 @@ betterrank neighborhood src/auth/handlers.ts --root /path/to/project --limit 10
 JavaScript, TypeScript, Python, Rust, Go, Java, Ruby, C, C++, C#, PHP
 
 ## Commands
+
+### `outline` — File skeleton with collapsed bodies
+
+View a file's structure without reading the entire thing. Function and class bodies are collapsed to `... (N lines)`. Expand specific symbols by name. **No `--root` required** — works on any file standalone.
+
+```bash
+# Skeleton view: imports, signatures, constants — bodies collapsed
+betterrank outline src/auth.py
+
+# Expand a specific function to see its full source
+betterrank outline src/auth.py authenticate_user
+
+# Expand multiple symbols
+betterrank outline src/auth.py validate,process
+
+# Resolve path relative to a root
+betterrank outline src/auth.py --root ./backend
+```
+
+**Example output:**
+```
+   1│ from fastapi import APIRouter, Depends
+   2│ from core.auth import verify_auth
+   3│
+   4│ router = APIRouter(prefix="/api")
+   5│
+   6│ @router.get("/users")
+   7│ async def list_users(db = Depends(get_db)):
+    │   ... (25 lines)
+  33│
+  34│ @router.post("/users")
+  35│ async def create_user(data: UserCreate, db = Depends(get_db)):
+    │   ... (40 lines)
+```
+
+Typical compression: **3-5x** (a 2000-line file becomes ~400 lines of outline).
 
 ### `map` — Repo map
 
@@ -97,6 +139,14 @@ betterrank dependents src/auth.ts --root /path/to/project
 ```bash
 betterrank neighborhood src/auth.ts --root /path/to/project --count
 betterrank neighborhood src/auth.ts --root /path/to/project --hops 2 --limit 10
+```
+
+### `orphans` — Find disconnected files/symbols
+
+```bash
+betterrank orphans --root /path/to/project                          # orphan files
+betterrank orphans --level symbol --root /path/to/project           # orphan symbols
+betterrank orphans --level symbol --kind function --root /path/to/project
 ```
 
 ### `structure` — File tree with symbol counts

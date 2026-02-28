@@ -2,6 +2,7 @@
 
 import { CodeIndex } from './index.js';
 import { resolve, relative, isAbsolute } from 'path';
+import { readFile } from 'fs/promises';
 
 const DEFAULT_LIMIT = 50;
 const DEFAULT_DEPTH = 3;
@@ -11,6 +12,7 @@ betterrank <command> [options]
 
 Commands:
   ui          [--port N]                            Launch web UI (default port: 3333)
+  outline     <file> [symbol1,symbol2]              File skeleton with collapsed bodies
   map         [--focus file1,file2]                 Repo map (ranked by PageRank)
   search      <query> [--kind type]                 Substring search on symbol names + signatures (ranked by PageRank)
   structure   [--depth N]                           File tree with symbol counts (default depth: ${DEFAULT_DEPTH})
@@ -32,6 +34,26 @@ Global flags:
 `.trim();
 
 const COMMAND_HELP = {
+  outline: `betterrank outline <file> [symbol1,symbol2,...] [--root <path>]
+
+View a file's structure with function/class bodies collapsed, or expand
+specific symbols to see their full source.
+
+Without symbol names: shows the file skeleton — imports, constants, and
+function/class signatures with bodies replaced by "... (N lines)".
+
+With symbol names (comma-separated): shows the full source of those
+specific functions/classes with line numbers.
+
+Options:
+  --root <path>   Resolve file path relative to this directory
+
+Examples:
+  betterrank outline src/auth.py
+  betterrank outline src/auth.py authenticate_user
+  betterrank outline src/auth.py validate,process
+  betterrank outline src/handlers.ts --root ./backend`,
+
   map: `betterrank map [--focus file1,file2] [--root <path>]
 
 Aider-style repo map: the most structurally important definitions ranked by PageRank.
@@ -228,6 +250,34 @@ async function main() {
     const { exec } = await import('child_process');
     exec(`${opener} http://localhost:${port}`);
     return; // Keep process alive (server is listening)
+  }
+
+  // Outline command — standalone, no CodeIndex needed
+  if (command === 'outline') {
+    const filePath = flags._positional[0];
+    if (!filePath) {
+      console.error('Usage: betterrank outline <file> [symbol1,symbol2]');
+      process.exit(1);
+    }
+    const expandSymbols = flags._positional[1] ? flags._positional[1].split(',') : [];
+
+    const root = flags.root ? resolve(flags.root) : process.cwd();
+    const absPath = isAbsolute(filePath) ? filePath : resolve(root, filePath);
+
+    let source;
+    try {
+      source = await readFile(absPath, 'utf-8');
+    } catch (err) {
+      console.error(`Cannot read file: ${absPath}`);
+      console.error(err.message);
+      process.exit(1);
+    }
+
+    const relPath = relative(root, absPath);
+    const { buildOutline } = await import('./outline.js');
+    const result = buildOutline(source, relPath, expandSymbols);
+    console.log(result);
+    return;
   }
 
   const projectRoot = resolve(flags.root || process.cwd());
