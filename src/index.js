@@ -2,6 +2,7 @@ import { readFile } from 'fs/promises';
 import { join, dirname, relative, sep, basename } from 'path';
 import { CodeIndexCache } from './cache.js';
 import { rankedSymbols } from './graph.js';
+import { parseFile } from './parser.js';
 
 // ── Orphan false-positive filters ──────────────────────────────────────────
 //
@@ -993,6 +994,284 @@ class CodeIndex {
     });
 
     return counts;
+  }
+
+  /**
+   * Recursive caller chain — walk UP the call graph from a symbol.
+   * At each hop, resolves which function in the caller file contains
+   * the call site by cross-referencing line numbers with definitions.
+   *
+   * Returns a tree: { name, file, line, callers: [...] }
+   *
+   * @param {object} opts
+   * @param {string} opts.symbol - Starting symbol name
+   * @param {string} [opts.file] - Disambiguate by file
+   * @param {number} [opts.depth=3] - Max hops upward
+   * @returns {object} Tree root node
+   */
+  async trace({ symbol, file, depth = 3 }) {
+    await this._ensureReady();
+    const graph = this.cache.getGraph();
+    if (!graph) return null;
+
+    // Find the target symbol node(s)
+    const targetKeys = [];
+    graph.forEachNode((node, attrs) => {
+      if (attrs.type !== 'symbol') return;
+      if (attrs.name !== symbol) return;
+      if (file && attrs.file !== file) return;
+      targetKeys.push(node);
+    });
+
+    if (targetKeys.length === 0) return null;
+
+    // Use the first match (highest PageRank if multiple)
+    const ranked = this._getRanked();
+    const scoreMap = new Map(ranked);
+    targetKeys.sort((a, b) => (scoreMap.get(b) || 0) - (scoreMap.get(a) || 0));
+    const rootKey = targetKeys[0];
+    const rootAttrs = graph.getNodeAttributes(rootKey);
+
+    // Cache of file -> definitions (avoid re-parsing the same file)
+    const defCache = new Map();
+
+    const getFileDefs = async (filePath) => {
+      if (defCache.has(filePath)) return defCache.get(filePath);
+      try {
+        const absPath = join(this.projectRoot, filePath);
+        const source = await readFile(absPath, 'utf-8');
+        const parsed = parseFile(filePath, source);
+        const defs = parsed ? parsed.definitions.sort((a, b) => a.lineStart - b.lineStart) : [];
+        defCache.set(filePath, defs);
+        return defs;
+      } catch {
+        defCache.set(filePath, []);
+        return [];
+      }
+    };
+
+    // Find which definition in a file contains a given line
+    const findContainingDef = (defs, line) => {
+      for (let i = defs.length - 1; i >= 0; i--) {
+        if (line >= defs[i].lineStart && line <= defs[i].lineEnd) return defs[i];
+      }
+      return null;
+    };
+
+    // BFS upward through callers
+    const visited = new Set(); // "file::symbol" keys to prevent cycles
+
+    const buildNode = async (symbolName, symbolFile, symbolLine, currentDepth) => {
+      const nodeKey = `${symbolFile}::${symbolName}`;
+      const node = { name: symbolName, file: symbolFile, line: symbolLine, callers: [] };
+
+      if (currentDepth >= depth) return node;
+      if (visited.has(nodeKey)) return node;
+      visited.add(nodeKey);
+
+      // Find this symbol in the graph
+      const symKeys = [];
+      graph.forEachNode((gNode, attrs) => {
+        if (attrs.type !== 'symbol') return;
+        if (attrs.name !== symbolName) return;
+        if (attrs.file !== symbolFile) return;
+        symKeys.push(gNode);
+      });
+
+      // Collect caller files
+      const callerFiles = new Set();
+      for (const sk of symKeys) {
+        graph.forEachInEdge(sk, (_edge, attrs, source) => {
+          if (attrs.type !== 'REFERENCES') return;
+          const sourceAttrs = graph.getNodeAttributes(source);
+          const sf = sourceAttrs.file || source;
+          if (sf !== symbolFile) callerFiles.add(sf);
+        });
+      }
+
+      // For each caller file, find which function contains the call
+      const callPattern = new RegExp(
+        `(?<![a-zA-Z0-9_])${symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`
+      );
+
+      for (const callerFile of callerFiles) {
+        try {
+          const absPath = join(this.projectRoot, callerFile);
+          const source = await readFile(absPath, 'utf-8');
+          const lines = source.split('\n');
+          const defs = await getFileDefs(callerFile);
+
+          // Find the first call site line
+          let callLine = null;
+          for (let i = 0; i < lines.length; i++) {
+            if (callPattern.test(lines[i])) { callLine = i + 1; break; }
+          }
+
+          // Resolve to containing function
+          const containingDef = callLine ? findContainingDef(defs, callLine) : null;
+
+          if (containingDef) {
+            const callerNode = await buildNode(containingDef.name, callerFile, containingDef.lineStart, currentDepth + 1);
+            node.callers.push(callerNode);
+          } else {
+            // Top-level call (not inside any function) — show as file-level
+            node.callers.push({ name: `<module>`, file: callerFile, line: callLine, callers: [] });
+          }
+        } catch {
+          // Skip unreadable files
+        }
+      }
+
+      // Sort callers by file for deterministic output
+      node.callers.sort((a, b) => a.file.localeCompare(b.file));
+      return node;
+    };
+
+    return buildNode(rootAttrs.name, rootAttrs.file, rootAttrs.lineStart, 0);
+  }
+
+  /**
+   * Git-aware blast radius — what symbols changed and who calls them.
+   *
+   * Compares the working tree (or a git ref) against the index to find
+   * added, removed, and modified symbols, then looks up their callers.
+   *
+   * @param {object} [opts]
+   * @param {string} [opts.ref] - Git ref to diff against (default: HEAD)
+   * @returns {{ changed: Array<{file, symbols: Array<{name, kind, change, callerCount}>}>, totalCallers: number }}
+   */
+  async diff({ ref = 'HEAD' } = {}) {
+    await this._ensureReady();
+    const graph = this.cache.getGraph();
+    if (!graph) return { changed: [], totalCallers: 0 };
+
+    // Get changed files from git
+    const { execSync } = await import('child_process');
+    let changedFiles;
+    try {
+      const output = execSync(`git diff --name-only ${ref}`, {
+        cwd: this.projectRoot,
+        encoding: 'utf-8',
+        timeout: 10000,
+      }).trim();
+      if (!output) return { changed: [], totalCallers: 0 };
+      changedFiles = output.split('\n').filter(Boolean);
+    } catch {
+      return { changed: [], totalCallers: 0, error: 'git diff failed — is this a git repo?' };
+    }
+
+    // Also include untracked new files
+    try {
+      const untracked = execSync('git ls-files --others --exclude-standard', {
+        cwd: this.projectRoot,
+        encoding: 'utf-8',
+        timeout: 10000,
+      }).trim();
+      if (untracked) {
+        for (const f of untracked.split('\n').filter(Boolean)) {
+          if (!changedFiles.includes(f)) changedFiles.push(f);
+        }
+      }
+    } catch { /* ignore */ }
+
+    const results = [];
+    let totalCallers = 0;
+
+    for (const filePath of changedFiles) {
+      // Get OLD symbols from git ref
+      const oldSymbols = new Map();
+      try {
+        const oldSource = execSync(`git show ${ref}:${filePath}`, {
+          cwd: this.projectRoot,
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          timeout: 10000,
+        });
+        const oldParsed = parseFile(filePath, oldSource);
+        if (oldParsed) {
+          for (const def of oldParsed.definitions) {
+            oldSymbols.set(def.name, { kind: def.kind, signature: def.signature });
+          }
+        }
+      } catch {
+        // File is new (doesn't exist in ref) — all symbols are "added"
+      }
+
+      // Get graph keys for caller lookups on current symbols
+      const graphKeys = new Map();
+      graph.forEachNode((node, attrs) => {
+        if (attrs.type !== 'symbol' || attrs.file !== filePath) return;
+        graphKeys.set(attrs.name, node);
+      });
+
+      // Parse the CURRENT file from disk
+      let currentSymbols = new Map();
+      try {
+        const absPath = join(this.projectRoot, filePath);
+        const source = await readFile(absPath, 'utf-8');
+        const parsed = parseFile(filePath, source);
+        if (parsed) {
+          for (const def of parsed.definitions) {
+            currentSymbols.set(def.name, {
+              kind: def.kind,
+              signature: def.signature,
+            });
+          }
+        }
+      } catch {
+        // File might be deleted — all old symbols are "removed"
+      }
+
+      const symbolChanges = [];
+
+      // Detect removed symbols (in old ref, not on disk)
+      for (const [name, old] of oldSymbols) {
+        if (!currentSymbols.has(name)) {
+          const gk = graphKeys.get(name);
+          const callerCount = gk ? this._countExternalCallers(graph, gk, filePath) : 0;
+          symbolChanges.push({ name, kind: old.kind, change: 'removed', signature: old.signature, callerCount });
+          totalCallers += callerCount;
+        }
+      }
+
+      // Detect added and modified symbols
+      for (const [name, current] of currentSymbols) {
+        const old = oldSymbols.get(name);
+        if (!old) {
+          symbolChanges.push({ name, kind: current.kind, change: 'added', signature: current.signature, callerCount: 0 });
+        } else if (old.signature !== current.signature) {
+          const gk = graphKeys.get(name);
+          const callerCount = gk ? this._countExternalCallers(graph, gk, filePath) : 0;
+          symbolChanges.push({ name, kind: current.kind, change: 'modified', signature: current.signature, callerCount });
+          totalCallers += callerCount;
+        }
+      }
+
+      if (symbolChanges.length > 0) {
+        symbolChanges.sort((a, b) => b.callerCount - a.callerCount);
+        results.push({ file: filePath, symbols: symbolChanges });
+      }
+    }
+
+    results.sort((a, b) => {
+      const aMax = Math.max(0, ...a.symbols.map(s => s.callerCount));
+      const bMax = Math.max(0, ...b.symbols.map(s => s.callerCount));
+      return bMax - aMax;
+    });
+
+    return { changed: results, totalCallers };
+  }
+
+  /** Count unique external files that reference a symbol node. */
+  _countExternalCallers(graph, symbolKey, symbolFile) {
+    const files = new Set();
+    graph.forEachInEdge(symbolKey, (_edge, attrs, source) => {
+      if (attrs.type !== 'REFERENCES') return;
+      const sourceAttrs = graph.getNodeAttributes(source);
+      const sf = sourceAttrs.file || source;
+      if (sf !== symbolFile) files.add(sf);
+    });
+    return files.size;
   }
 
   /**

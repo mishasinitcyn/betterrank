@@ -18,6 +18,8 @@ Commands:
   structure   [--depth N]                           File tree with symbol counts (default depth: ${DEFAULT_DEPTH})
   symbols     [--file path] [--kind type]           List definitions (ranked by PageRank)
   callers     <symbol> [--file path] [--context]     All call sites (ranked, with context lines)
+  trace       <symbol> [--depth N]                  Recursive caller chain (call tree)
+  diff        [--ref <commit>]                      Git-aware blast radius (changed symbols + callers)
   deps        <file>                                What this file imports (ranked)
   dependents  <file>                                What imports this file (ranked)
   neighborhood <file> [--hops N] [--max-files N]    Local subgraph (ranked by PageRank)
@@ -133,6 +135,39 @@ Examples:
   betterrank callers authenticateUser --root ./backend
   betterrank callers authenticateUser --root ./backend --context
   betterrank callers resolve --file src/utils.ts --root . --context 3`,
+
+  trace: `betterrank trace <symbol> [--depth N] [--file path] [--root <path>]
+
+Recursive caller chain — walk UP the call graph from a symbol to see
+the full path from entry points to your function.
+
+At each hop, resolves which function in the caller file contains the
+call site. Displays as an indented tree.
+
+Options:
+  --depth N        Max hops upward (default: 3)
+  --file <path>    Disambiguate when multiple symbols share a name
+
+Examples:
+  betterrank trace calculate_bid --root .
+  betterrank trace send_to_firehose --root . --depth 4
+  betterrank trace authenticate --file src/auth.ts --root .`,
+
+  diff: `betterrank diff [--ref <commit>] [--root <path>]
+
+Git-aware blast radius — shows which symbols changed in the working tree
+and how many external files call each changed symbol.
+
+Compares current files on disk against the indexed state. Shows added,
+removed, and modified symbols with their caller counts.
+
+Options:
+  --ref <commit>   Git ref to diff against (default: HEAD)
+
+Examples:
+  betterrank diff --root .
+  betterrank diff --ref main --root .
+  betterrank diff --ref HEAD~3 --root .`,
 
   deps: `betterrank deps <file> [--root <path>]
 
@@ -470,6 +505,52 @@ async function main() {
         } else if (result.length === effectiveLimit && userLimit === undefined) {
           console.log(`\n(showing top ${effectiveLimit} by relevance — use --limit N or --count for total)`);
         }
+      }
+      break;
+    }
+
+    case 'trace': {
+      const symbol = flags._positional[0];
+      if (!symbol) { console.error('Usage: betterrank trace <symbol> [--depth N]'); process.exit(1); }
+      const traceDepth = flags.depth ? parseInt(flags.depth, 10) : 3;
+      const tree = await idx.trace({ symbol, file: normalizeFilePath(flags.file), depth: traceDepth });
+      if (!tree) {
+        console.log(`(symbol "${symbol}" not found)`);
+      } else {
+        const printNode = (node, depth) => {
+          const indent = depth === 0 ? '' : '  '.repeat(depth) + '← ';
+          const loc = `(${node.file}:${node.line || '?'})`;
+          console.log(`${indent}${node.name} ${loc}`);
+          for (const caller of node.callers) {
+            printNode(caller, depth + 1);
+          }
+        };
+        printNode(tree, 0);
+      }
+      break;
+    }
+
+    case 'diff': {
+      const result = await idx.diff({ ref: flags.ref || 'HEAD' });
+      if (result.error) {
+        console.error(result.error);
+        break;
+      }
+      if (result.changed.length === 0) {
+        console.log('(no symbol changes detected)');
+        break;
+      }
+      for (const entry of result.changed) {
+        console.log(`${entry.file}:`);
+        for (const s of entry.symbols) {
+          const tag = s.change === 'added' ? '+' : s.change === 'removed' ? '-' : '~';
+          const callerNote = s.callerCount > 0 ? `  (${s.callerCount} caller${s.callerCount === 1 ? '' : 's'})` : '';
+          console.log(`  ${tag} [${s.kind}] ${s.name}${callerNote}`);
+        }
+        console.log('');
+      }
+      if (result.totalCallers > 0) {
+        console.log(`⚠ ${result.totalCallers} external caller${result.totalCallers === 1 ? '' : 's'} of modified/removed symbols`);
       }
       break;
     }

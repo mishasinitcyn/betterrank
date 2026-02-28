@@ -26,6 +26,8 @@ Requires: `npm install -g @mishasinitcyn/betterrank`
 | Need to read a file | `outline <file>` first, then expand symbols | `Read` on the whole file |
 | Find a function/class/symbol | `search <query> --root <project>` | Grep |
 | Before modifying shared code | `callers <symbol> --context` and/or `dependents <file>` | Guessing, reading every caller file |
+| Trace full call path | `trace <symbol>` | Manual hop-by-hop callers |
+| Pre-commit impact check | `diff` | Guessing what might break |
 | Understand a file's context | `neighborhood <file>` | Reading imports manually |
 
 ## When to skip it
@@ -100,6 +102,29 @@ betterrank callers authenticateUser --root /path/to/project --context 3
 ```
 
 **Use `--context` by default** — it shows HOW each caller uses the function (imports, call arguments, surrounding logic) so you don't need to read each caller file separately. Only matches actual call sites (`symbol(`) and imports, not string literals or the definition itself.
+
+### `trace` — Recursive caller chain
+
+Walk UP the call graph to see the full path from entry point to function. Resolves which function in each caller file contains the call site.
+
+```bash
+betterrank trace calculate_bid --root /path/to/project
+betterrank trace calculate_bid --root /path/to/project --depth 5
+```
+
+Use for: "how does a user request reach this database write?" or "what's the full execution path to this function?"
+
+### `diff` — Git-aware blast radius
+
+Shows which symbols changed and how many files call them. Use before committing to see the impact of your changes.
+
+```bash
+betterrank diff --root /path/to/project              # uncommitted changes vs HEAD
+betterrank diff --ref main --root /path/to/project    # changes vs main branch
+betterrank diff --ref HEAD~5 --root /path/to/project  # changes vs 5 commits ago
+```
+
+Shows `+` (added), `-` (removed), `~` (modified) with caller counts. Modified/removed symbols with callers get a warning.
 
 ### `dependents` — What imports this file
 

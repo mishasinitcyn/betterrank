@@ -28,6 +28,12 @@ betterrank search auth --root /path/to/project
 # Who calls this function? (with call site context)
 betterrank callers authenticateUser --root /path/to/project --context
 
+# Trace the full call chain from entry point to function
+betterrank trace calculate_bid --root /path/to/project
+
+# What symbols changed and what might break?
+betterrank diff --root /path/to/project
+
 # What depends on this file?
 betterrank dependents src/auth/handlers.ts --root /path/to/project
 
@@ -144,6 +150,46 @@ src/engine/pipeline.py:
 
 src/api/serve.py:
      145│     bid = await run_auction(searched, publisher=pub_id)
+```
+
+### `trace` — Recursive caller chain
+
+Walk UP the call graph from a symbol to see the full path from entry points to your function. At each hop, resolves which function in the caller file contains the call site.
+
+```bash
+betterrank trace calculate_bid --root /path/to/project
+betterrank trace calculate_bid --root /path/to/project --depth 5
+```
+
+**Example output:**
+```
+calculate_bid (src/engine/bidding.py:489)
+  ← run_auction (src/engine/bidding.py:833)
+    ← handle_request (src/engine/pipeline.py:153)
+      ← app (src/main.py:45)
+```
+
+### `diff` — Git-aware blast radius
+
+Shows which symbols changed in the working tree and how many external files call each changed symbol. Compares current disk state against a git ref.
+
+```bash
+# Uncommitted changes vs HEAD
+betterrank diff --root /path/to/project
+
+# Changes since a specific commit or branch
+betterrank diff --ref main --root /path/to/project
+betterrank diff --ref HEAD~5 --root /path/to/project
+```
+
+**Example output:**
+```
+src/engine/bidding.py:
+  ~ [function] calculate_bid  (3 callers)
+  + [function] compute_value_multi
+  - [function] old_quality_score  (1 caller)
+
+⚠ 4 external callers of modified/removed symbols
 ```
 
 ### `deps` — What does this file import
