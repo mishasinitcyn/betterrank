@@ -25,8 +25,8 @@ betterrank outline src/auth.py authenticate_user
 # Search for symbols by name or parameter
 betterrank search auth --root /path/to/project
 
-# Who calls this function?
-betterrank callers authenticateUser --root /path/to/project
+# Who calls this function? (with call site context)
+betterrank callers authenticateUser --root /path/to/project --context
 
 # What depends on this file?
 betterrank dependents src/auth/handlers.ts --root /path/to/project
@@ -65,11 +65,14 @@ betterrank outline src/auth.py authenticate_user
 # Expand multiple symbols
 betterrank outline src/auth.py validate,process
 
+# Show caller counts next to each function (requires --root)
+betterrank outline src/auth.py --annotate --root ./backend
+
 # Resolve path relative to a root
 betterrank outline src/auth.py --root ./backend
 ```
 
-**Example output:**
+**Example output (with `--annotate`):**
 ```
    1│ from fastapi import APIRouter, Depends
    2│ from core.auth import verify_auth
@@ -78,14 +81,14 @@ betterrank outline src/auth.py --root ./backend
    5│
    6│ @router.get("/users")
    7│ async def list_users(db = Depends(get_db)):
-    │   ... (25 lines)
+    │   ... (25 lines)                                          ← 2 callers
   33│
   34│ @router.post("/users")
   35│ async def create_user(data: UserCreate, db = Depends(get_db)):
-    │   ... (40 lines)
+    │   ... (40 lines)                                          ← 5 callers
 ```
 
-Typical compression: **3-5x** (a 2000-line file becomes ~400 lines of outline).
+Typical compression: **3-5x** (a 2000-line file becomes ~400 lines of outline). Annotations show how many *external* files reference each function — instantly see what's critical vs dead code.
 
 ### `map` — Repo map
 
@@ -119,7 +122,28 @@ betterrank symbols --root /path/to/project --kind function
 ### `callers` — Who calls this symbol
 
 ```bash
+# File names only
 betterrank callers authenticateUser --root /path/to/project
+
+# With call site context lines (default 2 lines around each site)
+betterrank callers authenticateUser --root /path/to/project --context
+
+# Custom context window
+betterrank callers authenticateUser --root /path/to/project --context 3
+```
+
+**Example output (with `--context`):**
+```
+src/engine/pipeline.py:
+      16│ from app.engine.bidding import run_auction
+      17│
+
+     153│     return await run_auction(
+     154│         searched=campaigns,
+     155│         publisher=config.publisher,
+
+src/api/serve.py:
+     145│     bid = await run_auction(searched, publisher=pub_id)
 ```
 
 ### `deps` — What does this file import
@@ -185,7 +209,8 @@ const idx = new CodeIndex('/path/to/project');
 
 const map = await idx.map({ limit: 100, focusFiles: ['src/main.ts'] });
 const results = await idx.search({ query: 'auth', kind: 'function', limit: 10 });
-const callers = await idx.callers({ symbol: 'authenticate' });
+const callers = await idx.callers({ symbol: 'authenticate', context: 2 });
+const counts = await idx.getCallerCounts('src/auth.ts');
 const deps = await idx.dependencies({ file: 'src/auth.ts' });
 const dependents = await idx.dependents({ file: 'src/auth.ts' });
 const hood = await idx.neighborhood({ file: 'src/auth.ts', hops: 2, maxFiles: 10 });

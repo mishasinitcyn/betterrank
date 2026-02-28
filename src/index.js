@@ -457,15 +457,19 @@ class CodeIndex {
    * Results are ranked by file-level PageRank (most important callers first).
    * Supports offset/limit pagination and count-only mode.
    *
+   * When `context` > 0, reads each caller file from disk and extracts
+   * the actual call-site lines with surrounding context.
+   *
    * @param {object} opts
    * @param {string} opts.symbol - Symbol name
    * @param {string} [opts.file] - Disambiguate by file
+   * @param {number} [opts.context=0] - Lines of context around each call site (0 = off)
    * @param {number} [opts.offset] - Skip first N results
    * @param {number} [opts.limit] - Max results to return
    * @param {boolean} [opts.count] - If true, return only { total }
-   * @returns {Array<{file}>|{total: number}}
+   * @returns {Array<{file, sites?}>|{total: number}}
    */
-  async callers({ symbol, file, offset, limit, count = false }) {
+  async callers({ symbol, file, offset, limit, count = false, context = 0 }) {
     await this._ensureReady();
     const graph = this.cache.getGraph();
     if (!graph) return count ? { total: 0 } : [];
@@ -499,7 +503,56 @@ class CodeIndex {
     for (const r of results) delete r._score;
 
     if (count) return { total: results.length };
-    return paginate(results, { offset, limit }).items;
+
+    const paged = paginate(results, { offset, limit }).items;
+
+    if (context > 0) {
+      // Match call sites: symbol followed by ( — avoids string literals and definitions
+      const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const callPattern = new RegExp(`(?<![a-zA-Z0-9_])${escaped}\\s*\\(`);
+      // Fallback: import/from lines that reference the symbol
+      const importPattern = new RegExp(`(?:import|from)\\s.*\\b${escaped}\\b`);
+
+      // Collect the target symbol's own definition ranges to exclude
+      const defRanges = [];
+      for (const tk of targetKeys) {
+        try {
+          const attrs = graph.getNodeAttributes(tk);
+          if (attrs.type === 'symbol') defRanges.push({ file: attrs.file, start: attrs.lineStart, end: attrs.lineEnd });
+        } catch { /* skip */ }
+      }
+
+      for (const entry of paged) {
+        entry.sites = [];
+        try {
+          const absPath = join(this.projectRoot, entry.file);
+          const source = await readFile(absPath, 'utf-8');
+          const lines = source.split('\n');
+
+          for (let i = 0; i < lines.length; i++) {
+            const lineNum = i + 1;
+            // Skip lines inside the symbol's own definition
+            const inDef = defRanges.some(r => r.file === entry.file && lineNum >= r.start && lineNum <= r.end);
+            if (inDef) continue;
+
+            const line = lines[i];
+            if (!callPattern.test(line) && !importPattern.test(line)) continue;
+
+            const start = Math.max(0, i - context);
+            const end = Math.min(lines.length - 1, i + context);
+            const text = [];
+            for (let j = start; j <= end; j++) {
+              text.push({ line: j + 1, content: lines[j] });
+            }
+            entry.sites.push({ line: lineNum, text });
+          }
+        } catch {
+          // File unreadable — skip context for this caller
+        }
+      }
+    }
+
+    return paged;
   }
 
   /**
@@ -906,6 +959,40 @@ class CodeIndex {
     }
 
     return { nodes, edges };
+  }
+
+  /**
+   * Get caller counts for all symbols defined in a file.
+   * Returns a Map<symbolName, number> where the count is unique
+   * files that reference each symbol (excluding self-references).
+   *
+   * @param {string} file - Relative file path
+   * @returns {Map<string, number>}
+   */
+  async getCallerCounts(file) {
+    await this._ensureReady();
+    const graph = this.cache.getGraph();
+    if (!graph) return new Map();
+
+    const counts = new Map();
+    graph.forEachNode((node, attrs) => {
+      if (attrs.type !== 'symbol') return;
+      if (attrs.file !== file) return;
+
+      const callerFiles = new Set();
+      graph.forEachInEdge(node, (_edge, edgeAttrs, source) => {
+        if (edgeAttrs.type !== 'REFERENCES') return;
+        const sourceAttrs = graph.getNodeAttributes(source);
+        const sourceFile = sourceAttrs.file || source;
+        if (sourceFile !== file) callerFiles.add(sourceFile);
+      });
+
+      if (callerFiles.size > 0) {
+        counts.set(attrs.name, callerFiles.size);
+      }
+    });
+
+    return counts;
   }
 
   /**

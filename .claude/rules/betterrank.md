@@ -25,7 +25,7 @@ Requires: `npm install -g @mishasinitcyn/betterrank`
 | First orientation on any task | `map --root <project>` | Explore agents, Glob/Grep sweeps |
 | Need to read a file | `outline <file>` first, then expand symbols | `Read` on the whole file |
 | Find a function/class/symbol | `search <query> --root <project>` | Grep |
-| Before modifying shared code | `callers <symbol>` and/or `dependents <file>` | Guessing |
+| Before modifying shared code | `callers <symbol> --context` and/or `dependents <file>` | Guessing, reading every caller file |
 | Understand a file's context | `neighborhood <file>` | Reading imports manually |
 
 ## When to skip it
@@ -54,9 +54,14 @@ betterrank outline src/auth.py validate,process
 
 # With --root for path resolution
 betterrank outline src/auth.py --root ./backend
+
+# Show caller counts next to each function (requires --root)
+betterrank outline src/auth.py --annotate --root ./backend
 ```
 
 **Typical compression: 3-5x.** A 2000-line file becomes ~400 lines of outline. Read the outline first, identify the 1-2 functions you care about, then expand just those.
+
+`--annotate` shows `← N callers` next to each collapsed function, counting how many *external* files reference it. Instantly see what's critical (50 callers) vs dead code (no annotation). Requires `--root` for graph data.
 
 ### `map` — Repo overview (use this first)
 
@@ -88,7 +93,13 @@ betterrank search imp --root /path/to/project --limit 10
 ```bash
 betterrank callers authenticateUser --root /path/to/project
 betterrank callers authenticateUser --root /path/to/project --count
+
+# Show actual call site lines (default 2 lines of context)
+betterrank callers authenticateUser --root /path/to/project --context
+betterrank callers authenticateUser --root /path/to/project --context 3
 ```
+
+**Use `--context` by default** — it shows HOW each caller uses the function (imports, call arguments, surrounding logic) so you don't need to read each caller file separately. Only matches actual call sites (`symbol(`) and imports, not string literals or the definition itself.
 
 ### `dependents` — What imports this file
 
@@ -202,14 +213,14 @@ betterrank map --limit 100 --root src/auth
 
 **Right:**
 ```bash
-# 1. See the file's structure
-betterrank outline src/api/campaigns.py
+# 1. See the file's structure + which functions matter
+betterrank outline src/api/campaigns.py --annotate --root .
 
 # 2. Expand only the function you need
 betterrank outline src/api/campaigns.py create_campaign
 
-# 3. Check who else calls it before changing
-betterrank callers create_campaign --root .
+# 3. See exactly HOW it's called (with context lines)
+betterrank callers create_campaign --root . --context
 ```
 
 ### "Can we remove the flush_impressions writer?"
@@ -219,9 +230,9 @@ betterrank callers create_campaign --root .
 # 1. Orient
 betterrank map --limit 50 --root workers/events/flush_impressions
 
-# 2. Trace the call chain
-betterrank callers _flush_impressions --root .
-betterrank callers send_impression_to_firehose --root .
+# 2. Trace the call chain (with context to see how they're called)
+betterrank callers _flush_impressions --root . --context
+betterrank callers send_impression_to_firehose --root . --context
 
 # 3. What depends on this module?
 betterrank dependents workers/events/flush_impressions/main.py --root .

@@ -12,9 +12,11 @@ const MIN_COLLAPSE_LINES = 2;
  * @param {string} source - File contents
  * @param {string} filePath - File path (for language detection)
  * @param {string[]} expandSymbols - Symbol names to expand (empty = outline mode)
+ * @param {object} [opts]
+ * @param {Map<string,number>} [opts.callerCounts] - Map of symbol name → caller file count (for --annotate)
  * @returns {string} Formatted output with line numbers
  */
-export function buildOutline(source, filePath, expandSymbols = []) {
+export function buildOutline(source, filePath, expandSymbols = [], { callerCounts } = {}) {
   const lines = source.split('\n');
   const pad = Math.max(String(lines.length).length, 4);
 
@@ -41,7 +43,7 @@ export function buildOutline(source, filePath, expandSymbols = []) {
   if (expandSymbols.length > 0) {
     return expandMode(lines, defs, filePath, expandSymbols, pad);
   }
-  return outlineMode(lines, defs, pad);
+  return outlineMode(lines, defs, pad, callerCounts);
 }
 
 function rawView(lines, pad) {
@@ -82,7 +84,7 @@ function expandMode(lines, defs, filePath, expandSymbols, pad) {
   return output.join('\n').trimEnd();
 }
 
-function outlineMode(lines, defs, pad) {
+function outlineMode(lines, defs, pad, callerCounts) {
   // Detect containers: definitions that have child definitions inside them
   const containers = new Set();
   for (const def of defs) {
@@ -96,6 +98,7 @@ function outlineMode(lines, defs, pad) {
   }
 
   // Build collapse ranges for leaf definitions with sufficient body size
+  // Track which definition each collapse range belongs to (for annotations)
   const collapseRanges = [];
   for (const def of defs) {
     if (containers.has(def)) continue;
@@ -109,6 +112,7 @@ function outlineMode(lines, defs, pad) {
       start: def.bodyStartLine,
       end: def.lineEnd,
       lineCount: bodyLineCount,
+      name: def.name,
     });
   }
 
@@ -122,10 +126,25 @@ function outlineMode(lines, defs, pad) {
   while (lineNum <= lines.length) {
     if (rangeIdx < collapseRanges.length && collapseRanges[rangeIdx].start === lineNum) {
       const range = collapseRanges[rangeIdx];
-      // Use the indent of the first body line for natural alignment
       const bodyLine = lines[lineNum - 1];
       const indent = bodyLine ? bodyLine.match(/^\s*/)[0] : '';
-      output.push(`${' '.repeat(pad)}│ ${indent}... (${range.lineCount} lines)`);
+      let marker = `${' '.repeat(pad)}│ ${indent}... (${range.lineCount} lines)`;
+
+      // Append caller annotation if available
+      if (callerCounts && callerCounts.has(range.name)) {
+        const count = callerCounts.get(range.name);
+        const annotation = count === 1 ? '← 1 caller' : `← ${count} callers`;
+        // Right-pad to align annotations
+        const minWidth = 60;
+        if (marker.length < minWidth) {
+          marker += ' '.repeat(minWidth - marker.length);
+        } else {
+          marker += '  ';
+        }
+        marker += annotation;
+      }
+
+      output.push(marker);
       lineNum = range.end + 1;
       rangeIdx++;
       continue;

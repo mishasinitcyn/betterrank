@@ -12,12 +12,12 @@ betterrank <command> [options]
 
 Commands:
   ui          [--port N]                            Launch web UI (default port: 3333)
-  outline     <file> [symbol1,symbol2]              File skeleton with collapsed bodies
+  outline     <file> [symbol1,symbol2] [--annotate]  File skeleton (--annotate for caller counts)
   map         [--focus file1,file2]                 Repo map (ranked by PageRank)
   search      <query> [--kind type]                 Substring search on symbol names + signatures (ranked by PageRank)
   structure   [--depth N]                           File tree with symbol counts (default depth: ${DEFAULT_DEPTH})
   symbols     [--file path] [--kind type]           List definitions (ranked by PageRank)
-  callers     <symbol> [--file path]                All call sites (ranked by importance)
+  callers     <symbol> [--file path] [--context]     All call sites (ranked, with context lines)
   deps        <file>                                What this file imports (ranked)
   dependents  <file>                                What imports this file (ranked)
   neighborhood <file> [--hops N] [--max-files N]    Local subgraph (ranked by PageRank)
@@ -34,7 +34,7 @@ Global flags:
 `.trim();
 
 const COMMAND_HELP = {
-  outline: `betterrank outline <file> [symbol1,symbol2,...] [--root <path>]
+  outline: `betterrank outline <file> [symbol1,symbol2,...] [--annotate --root <path>]
 
 View a file's structure with function/class bodies collapsed, or expand
 specific symbols to see their full source.
@@ -46,13 +46,15 @@ With symbol names (comma-separated): shows the full source of those
 specific functions/classes with line numbers.
 
 Options:
-  --root <path>   Resolve file path relative to this directory
+  --root <path>     Resolve file path relative to this directory
+  --annotate        Show caller counts next to each function (requires --root)
 
 Examples:
   betterrank outline src/auth.py
   betterrank outline src/auth.py authenticate_user
   betterrank outline src/auth.py validate,process
-  betterrank outline src/handlers.ts --root ./backend`,
+  betterrank outline src/handlers.ts --root ./backend
+  betterrank outline src/auth.py --annotate --root ./backend`,
 
   map: `betterrank map [--focus file1,file2] [--root <path>]
 
@@ -116,19 +118,21 @@ Examples:
   betterrank symbols --file src/auth/handlers.ts --root ./backend
   betterrank symbols --kind class --root . --limit 20`,
 
-  callers: `betterrank callers <symbol> [--file path] [--root <path>]
+  callers: `betterrank callers <symbol> [--file path] [--context [N]] [--root <path>]
 
 Find all files that reference a symbol. Ranked by file-level PageRank.
 
 Options:
   --file <path>    Disambiguate when multiple symbols share a name
+  --context [N]    Show N lines of context around each call site (default: 2)
   --count          Return count only
   --offset N       Skip first N results
   --limit N        Max results (default: ${DEFAULT_LIMIT})
 
 Examples:
   betterrank callers authenticateUser --root ./backend
-  betterrank callers resolve --file src/utils.ts --root .`,
+  betterrank callers authenticateUser --root ./backend --context
+  betterrank callers resolve --file src/utils.ts --root . --context 3`,
 
   deps: `betterrank deps <file> [--root <path>]
 
@@ -252,14 +256,20 @@ async function main() {
     return; // Keep process alive (server is listening)
   }
 
-  // Outline command — standalone, no CodeIndex needed
+  // Outline command — standalone by default, needs CodeIndex for --annotate
   if (command === 'outline') {
     const filePath = flags._positional[0];
     if (!filePath) {
-      console.error('Usage: betterrank outline <file> [symbol1,symbol2]');
+      console.error('Usage: betterrank outline <file> [symbol1,symbol2] [--annotate --root <path>]');
       process.exit(1);
     }
     const expandSymbols = flags._positional[1] ? flags._positional[1].split(',') : [];
+    const annotate = flags.annotate === true;
+
+    if (annotate && !flags.root) {
+      console.error('outline --annotate requires --root for graph data');
+      process.exit(1);
+    }
 
     const root = flags.root ? resolve(flags.root) : process.cwd();
     const absPath = isAbsolute(filePath) ? filePath : resolve(root, filePath);
@@ -275,7 +285,14 @@ async function main() {
 
     const relPath = relative(root, absPath);
     const { buildOutline } = await import('./outline.js');
-    const result = buildOutline(source, relPath, expandSymbols);
+
+    let callerCounts;
+    if (annotate) {
+      const idx = new CodeIndex(resolve(flags.root));
+      callerCounts = await idx.getCallerCounts(relPath);
+    }
+
+    const result = buildOutline(source, relPath, expandSymbols, { callerCounts });
     console.log(result);
     return;
   }
@@ -421,9 +438,29 @@ async function main() {
       const symbol = flags._positional[0];
       if (!symbol) { console.error('Usage: betterrank callers <symbol> [--file path]'); process.exit(1); }
       const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
-      const result = await idx.callers({ symbol, file: normalizeFilePath(flags.file), count: countMode, offset, limit: effectiveLimit });
+      const contextLines = flags.context === true ? 2 : (flags.context ? parseInt(flags.context, 10) : 0);
+      const result = await idx.callers({ symbol, file: normalizeFilePath(flags.file), count: countMode, offset, limit: effectiveLimit, context: contextLines });
       if (countMode) {
         console.log(`total: ${result.total}`);
+      } else if (contextLines > 0) {
+        // Rich output with call-site context
+        const pad = 6;
+        for (const c of result) {
+          console.log(`${c.file}:`);
+          if (c.sites && c.sites.length > 0) {
+            for (const site of c.sites) {
+              for (const t of site.text) {
+                console.log(`  ${String(t.line).padStart(pad)}│ ${t.content}`);
+              }
+              console.log('');
+            }
+          } else {
+            console.log('  (no call sites found in source)\n');
+          }
+        }
+        if (result.length === 0) {
+          console.log('(no callers found)');
+        }
       } else {
         for (const c of result) {
           console.log(c.file);
