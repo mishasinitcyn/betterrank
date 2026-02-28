@@ -18,6 +18,7 @@ Commands:
   structure   [--depth N]                           File tree with symbol counts (default depth: ${DEFAULT_DEPTH})
   symbols     [--file path] [--kind type]           List definitions (ranked by PageRank)
   callers     <symbol> [--file path] [--context]     All call sites (ranked, with context lines)
+  context     <symbol> [--file path]                 Full context: source, deps, types, callers
   trace       <symbol> [--depth N]                  Recursive caller chain (call tree)
   diff        [--ref <commit>]                      Git-aware blast radius (changed symbols + callers)
   deps        <file>                                What this file imports (ranked)
@@ -135,6 +136,23 @@ Examples:
   betterrank callers authenticateUser --root ./backend
   betterrank callers authenticateUser --root ./backend --context
   betterrank callers resolve --file src/utils.ts --root . --context 3`,
+
+  context: `betterrank context <symbol> [--file path] [--root <path>]
+
+Everything you need to understand a function in one shot.
+
+Shows: the function's source, signatures of all functions/types it references,
+expanded type definitions from the signature, and a callers summary.
+
+Eliminates the multi-command chase of: outline → expand → search types → callers.
+
+Options:
+  --file <path>    Disambiguate when multiple symbols share a name
+  --no-source      Skip the function source (show only deps/types/callers)
+
+Examples:
+  betterrank context calculate_bid --root .
+  betterrank context Router --file src/llm.py --root .`,
 
   trace: `betterrank trace <symbol> [--depth N] [--file path] [--root <path>]
 
@@ -505,6 +523,70 @@ async function main() {
         } else if (result.length === effectiveLimit && userLimit === undefined) {
           console.log(`\n(showing top ${effectiveLimit} by relevance — use --limit N or --count for total)`);
         }
+      }
+      break;
+    }
+
+    case 'context': {
+      const symbol = flags._positional[0];
+      if (!symbol) { console.error('Usage: betterrank context <symbol> [--file path]'); process.exit(1); }
+      const noSource = flags['no-source'] === true;
+      const result = await idx.context({ symbol, file: normalizeFilePath(flags.file) });
+      if (!result) {
+        console.log(`(symbol "${symbol}" not found)`);
+        break;
+      }
+
+      const def = result.definition;
+      const pad = Math.max(String(def.lineEnd).length, 4);
+
+      // Header
+      console.log(`── ${def.name} (${def.file}:${def.lineStart}-${def.lineEnd}) ──`);
+      console.log('');
+
+      // Source (or just the signature in --no-source mode)
+      if (!noSource) {
+        for (let i = 0; i < def.source.length; i++) {
+          console.log(`  ${String(def.lineStart + i).padStart(pad)}│ ${def.source[i]}`);
+        }
+        console.log('');
+      } else if (def.signature) {
+        console.log(`  ${def.signature}`);
+        console.log('');
+      }
+
+      // Type references from signature
+      if (result.typeRefs.length > 0) {
+        console.log('Types:');
+        for (const t of result.typeRefs) {
+          console.log(`  ${t.name} (${t.file}:${t.lineStart})`);
+          if (t.fields) {
+            for (const line of t.fields) {
+              console.log(`    ${line}`);
+            }
+          }
+          console.log('');
+        }
+      }
+
+      // Used symbols (functions/types referenced in the body)
+      if (result.usedSymbols.length > 0) {
+        console.log('References:');
+        for (const s of result.usedSymbols) {
+          const loc = s.file === def.file ? `line ${s.lineStart}` : `${s.file}:${s.lineStart}`;
+          console.log(`  [${s.kind}] ${s.signature || s.name}  (${loc})`);
+        }
+        console.log('');
+      }
+
+      // Callers
+      if (result.callers.length > 0) {
+        console.log(`Callers (${result.callers.length} file${result.callers.length === 1 ? '' : 's'}):`);
+        for (const f of result.callers) {
+          console.log(`  ${f}`);
+        }
+      } else {
+        console.log('Callers: (none detected)');
       }
       break;
     }

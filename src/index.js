@@ -997,6 +997,167 @@ class CodeIndex {
   }
 
   /**
+   * One-shot context: everything needed to understand a function.
+   *
+   * Returns the function's source, the signatures of functions/types it
+   * references, and a callers summary — all from a single command.
+   *
+   * @param {object} opts
+   * @param {string} opts.symbol - Symbol name
+   * @param {string} [opts.file] - Disambiguate by file
+   * @returns {object|null} { definition, usedSymbols, typeRefs, callers }
+   */
+  async context({ symbol, file }) {
+    await this._ensureReady();
+    const graph = this.cache.getGraph();
+    if (!graph) return null;
+
+    // Find the target symbol (highest PageRank if multiple)
+    const candidates = [];
+    graph.forEachNode((node, attrs) => {
+      if (attrs.type !== 'symbol') return;
+      if (attrs.name !== symbol) return;
+      if (file && attrs.file !== file) return;
+      candidates.push({ key: node, ...attrs });
+    });
+    if (candidates.length === 0) return null;
+
+    const ranked = this._getRanked();
+    const scoreMap = new Map(ranked);
+    candidates.sort((a, b) => (scoreMap.get(b.key) || 0) - (scoreMap.get(a.key) || 0));
+    const target = candidates[0];
+
+    // Read the source file
+    let source, lines;
+    try {
+      const absPath = join(this.projectRoot, target.file);
+      source = await readFile(absPath, 'utf-8');
+      lines = source.split('\n');
+    } catch {
+      return null;
+    }
+
+    // Extract the function body text
+    const bodyLines = lines.slice(target.lineStart - 1, target.lineEnd);
+    const bodyText = bodyLines.join('\n');
+
+    // Build a set of all symbol names in the graph (for matching)
+    const allSymbols = new Map(); // name -> [{ file, kind, signature, lineStart }]
+    graph.forEachNode((node, attrs) => {
+      if (attrs.type !== 'symbol') return;
+      if (attrs.file === target.file && attrs.name === target.name) return; // skip self
+      if (!allSymbols.has(attrs.name)) allSymbols.set(attrs.name, []);
+      allSymbols.get(attrs.name).push({
+        file: attrs.file,
+        kind: attrs.kind,
+        signature: attrs.signature,
+        lineStart: attrs.lineStart,
+        lineEnd: attrs.lineEnd,
+      });
+    });
+
+    // Find symbols referenced in the body
+    // Use word-boundary matching for each known symbol name
+    // Skip very common names that cause false positives
+    const NOISE_NAMES = new Set([
+      'get', 'set', 'put', 'post', 'delete', 'head', 'patch',
+      'start', 'stop', 'run', 'main', 'init', 'setup', 'close',
+      'dict', 'list', 'str', 'int', 'bool', 'float', 'type',
+      'key', 'value', 'name', 'data', 'config', 'result', 'error',
+      'test', 'self', 'cls', 'app', 'log', 'logger',
+      'enabled', 'default', 'constructor', 'length', 'size',
+      'fetch', 'send', 'table', 'one', 'append', 'write', 'read',
+      'update', 'create', 'find', 'add', 'remove', 'index', 'map',
+      'filter', 'sort', 'join', 'split', 'trim', 'replace',
+      'push', 'pop', 'shift', 'reduce', 'keys', 'values', 'items',
+      'search', 'match', 'query', 'count', 'call', 'apply', 'bind',
+    ]);
+    const usedSymbols = [];
+    const seen = new Set();
+    for (const [name, defs] of allSymbols) {
+      if (name.length < 3) continue; // skip very short names
+      if (NOISE_NAMES.has(name)) continue;
+      if (seen.has(name)) continue;
+      const pattern = new RegExp(`(?<![a-zA-Z0-9_])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-zA-Z0-9_])`);
+      if (pattern.test(bodyText)) {
+        seen.add(name);
+        // Pick the best definition (same-file first, then highest PageRank)
+        const sameFile = defs.find(d => d.file === target.file);
+        const best = sameFile || defs[0];
+        usedSymbols.push({ name, ...best });
+      }
+    }
+    // Sort: functions first, then types, then by name
+    const kindOrder = { function: 0, class: 1, type: 2, variable: 3 };
+    usedSymbols.sort((a, b) => (kindOrder[a.kind] ?? 9) - (kindOrder[b.kind] ?? 9) || a.name.localeCompare(b.name));
+
+    // Resolve type annotations in the signature
+    // Extract type-like tokens from the signature (capitalized words, common patterns)
+    const typeRefs = [];
+    const sigText = target.signature || '';
+    const typePattern = /(?<![a-zA-Z0-9_])([A-Z][a-zA-Z0-9_]+)(?![a-zA-Z0-9_])/g;
+    const seenTypes = new Set();
+    let match;
+    while ((match = typePattern.exec(sigText)) !== null) {
+      const typeName = match[1];
+      if (seenTypes.has(typeName)) continue;
+      seenTypes.add(typeName);
+      const typeDefs = allSymbols.get(typeName);
+      if (!typeDefs) continue;
+      // Find the type definition and get its fields (expand its body)
+      const best = typeDefs.find(d => d.file === target.file) || typeDefs[0];
+      if (best.kind === 'class' || best.kind === 'type') {
+        let fields = null;
+        try {
+          const typeAbsPath = join(this.projectRoot, best.file);
+          const typeSource = await readFile(typeAbsPath, 'utf-8');
+          const typeLines = typeSource.split('\n');
+          // Extract the body lines (up to 15 lines to keep it compact)
+          const maxPreview = 15;
+          const bodyStart = best.lineStart; // 1-indexed
+          const bodyEnd = Math.min(best.lineEnd, best.lineStart + maxPreview - 1);
+          fields = typeLines.slice(bodyStart - 1, bodyEnd).map(l => l);
+          if (best.lineEnd > bodyEnd) {
+            fields.push(`    ... (${best.lineEnd - bodyEnd} more lines)`);
+          }
+        } catch { /* skip */ }
+        typeRefs.push({ name: typeName, file: best.file, lineStart: best.lineStart, kind: best.kind, fields });
+      }
+    }
+
+    // Get callers (external files only) — union across ALL same-name nodes
+    // to handle ambiguous graph resolution (same name in different files)
+    const callerFiles = new Set();
+    for (const c of candidates) {
+      graph.forEachInEdge(c.key, (_edge, attrs, src) => {
+        if (attrs.type !== 'REFERENCES') return;
+        const srcAttrs = graph.getNodeAttributes(src);
+        const sf = srcAttrs.file || src;
+        if (sf !== target.file) callerFiles.add(sf);
+      });
+    }
+
+    // Remove symbols already shown in typeRefs to avoid redundancy
+    const typeRefNames = new Set(typeRefs.map(t => t.name));
+    const filteredSymbols = usedSymbols.filter(s => !typeRefNames.has(s.name));
+
+    return {
+      definition: {
+        name: target.name,
+        kind: target.kind,
+        file: target.file,
+        lineStart: target.lineStart,
+        lineEnd: target.lineEnd,
+        signature: target.signature,
+        source: bodyLines,
+      },
+      usedSymbols: filteredSymbols,
+      typeRefs,
+      callers: [...callerFiles].sort(),
+    };
+  }
+
+  /**
    * Recursive caller chain — walk UP the call graph from a symbol.
    * At each hop, resolves which function in the caller file contains
    * the call site by cross-referencing line numbers with definitions.

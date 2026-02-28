@@ -28,6 +28,9 @@ betterrank search auth --root /path/to/project
 # Who calls this function? (with call site context)
 betterrank callers authenticateUser --root /path/to/project --context
 
+# Everything about a function: source, types, deps, callers
+betterrank context calculate_bid --root /path/to/project
+
 # Trace the full call chain from entry point to function
 betterrank trace calculate_bid --root /path/to/project
 
@@ -150,6 +153,37 @@ src/engine/pipeline.py:
 
 src/api/serve.py:
      145│     bid = await run_auction(searched, publisher=pub_id)
+```
+
+### `context` — Full function context in one shot
+
+Everything you need to understand a function: its source, the types in its signature (expanded inline), the functions it calls (with signatures), and a callers summary. Eliminates the multi-command chase.
+
+```bash
+betterrank context calculate_bid --root /path/to/project
+
+# Skip the source, just show deps/types/callers
+betterrank context calculate_bid --root /path/to/project --no-source
+```
+
+**Example output (`--no-source`):**
+```
+── calculate_bid (src/engine/bidding.py:489-718) ──
+
+Types:
+  AuctionData2 (src/engine/bidding.py:74)
+    publisher_id: str
+    campaign_metrics: Dict[str, CampaignMetrics]
+    time_remaining_pct: float
+
+References:
+  [function] def from_microdollars(microdollars) -> Decimal  (src/core/currency.py:108)
+  [function] def get_config() -> ValuePredictorConfig        (src/engine/predictor/config.py:316)
+  [function] def get_value_predictor() -> ValuePredictor      (src/engine/predictor/persistence.py:123)
+  [class]    class ValuePredictor                             (src/engine/predictor/predictor.py:43)
+
+Callers (1 file):
+  src/engine/bidding.py
 ```
 
 ### `trace` — Recursive caller chain

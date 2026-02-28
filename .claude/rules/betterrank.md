@@ -25,6 +25,7 @@ Requires: `npm install -g @mishasinitcyn/betterrank`
 | First orientation on any task | `map --root <project>` | Explore agents, Glob/Grep sweeps |
 | Need to read a file | `outline <file>` first, then expand symbols | `Read` on the whole file |
 | Find a function/class/symbol | `search <query> --root <project>` | Grep |
+| Understand a function fully | `context <symbol>` | Reading the function + chasing types + chasing deps |
 | Before modifying shared code | `callers <symbol> --context` and/or `dependents <file>` | Guessing, reading every caller file |
 | Trace full call path | `trace <symbol>` | Manual hop-by-hop callers |
 | Pre-commit impact check | `diff` | Guessing what might break |
@@ -89,6 +90,15 @@ betterrank search imp --root /path/to/project --limit 10
 ```
 
 **CRITICAL: Use short substrings (3-5 chars), not exact names.** `search imp` finds `encrypt_imp_payload`, `decrypt_imp_payload`, `increment_impression`, etc. ranked by importance. `search impUrl` finds nothing because camelCase field names aren't symbols. The PageRank ranking handles noise — cast a wide net and let ranking sort it.
+
+### `context` — Full function context in one shot
+
+**Use this before modifying a function.** Shows the function's source, expands type definitions from its signature, lists all functions/classes it references (with their signatures), and shows callers. One command replaces: `outline → expand → search types → callers`.
+
+```bash
+betterrank context calculate_bid --root /path/to/project
+betterrank context calculate_bid --root /path/to/project --no-source   # skip source, just deps/types/callers
+```
 
 ### `callers` — Who calls this symbol
 
