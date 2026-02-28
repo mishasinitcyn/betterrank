@@ -19,6 +19,7 @@ Commands:
   symbols     [--file path] [--kind type]           List definitions (ranked by PageRank)
   callers     <symbol> [--file path] [--context]     All call sites (ranked, with context lines)
   context     <symbol> [--file path]                 Full context: source, deps, types, callers
+  history     <symbol> [--file path]                Git history of a specific function
   trace       <symbol> [--depth N]                  Recursive caller chain (call tree)
   diff        [--ref <commit>]                      Git-aware blast radius (changed symbols + callers)
   deps        <file>                                What this file imports (ranked)
@@ -153,6 +154,24 @@ Options:
 Examples:
   betterrank context calculate_bid --root .
   betterrank context Router --file src/llm.py --root .`,
+
+  history: `betterrank history <symbol> [--file path] [--patch] [--limit N] [--root <path>]
+
+Git history of a specific function. Uses the tree-sitter line range to
+show only commits that touched that function's lines.
+
+More accurate than git log -L :funcname: because betterrank knows the
+exact line range from tree-sitter, not git's heuristic function detection.
+
+Options:
+  --file <path>    Disambiguate when multiple symbols share a name
+  --patch, -p      Include function-scoped diffs (not just commit list)
+  --limit N        Max commits to show (default: 20)
+
+Examples:
+  betterrank history calculate_bid --root .
+  betterrank history calculate_bid --root . --patch --limit 3
+  betterrank history Router --file src/llm.py --root .`,
 
   trace: `betterrank trace <symbol> [--depth N] [--file path] [--root <path>]
 
@@ -587,6 +606,36 @@ async function main() {
         }
       } else {
         console.log('Callers: (none detected)');
+      }
+      break;
+    }
+
+    case 'history': {
+      const symbol = flags._positional[0];
+      if (!symbol) { console.error('Usage: betterrank history <symbol> [--file path] [--patch]'); process.exit(1); }
+      const histLimit = flags.limit ? parseInt(flags.limit, 10) : 20;
+      const histOffset = flags.offset ? parseInt(flags.offset, 10) : 0;
+      const showPatch = flags.patch === true || flags.p === true;
+      const result = await idx.history({ symbol, file: normalizeFilePath(flags.file), offset: histOffset, limit: histLimit, patch: showPatch });
+      if (!result) {
+        console.log(`(symbol "${symbol}" not found)`);
+      } else if (result.error) {
+        console.error(result.error);
+      } else if (result.raw) {
+        // --patch mode: print git's full output
+        const def = result.definition;
+        console.log(`${def.name} (${def.file}:${def.lineStart}-${def.lineEnd})\n`);
+        console.log(result.raw);
+      } else {
+        const def = result.definition;
+        console.log(`${def.name} (${def.file}:${def.lineStart}-${def.lineEnd})\n`);
+        if (result.commits.length === 0) {
+          console.log('(no commits found)');
+        } else {
+          for (const line of result.commits) {
+            console.log(`  ${line}`);
+          }
+        }
       }
       break;
     }

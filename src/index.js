@@ -1158,6 +1158,62 @@ class CodeIndex {
   }
 
   /**
+   * Git history of a specific function, using its tree-sitter line range.
+   *
+   * @param {object} opts
+   * @param {string} opts.symbol - Symbol name
+   * @param {string} [opts.file] - Disambiguate by file
+   * @param {number} [opts.offset=0] - Skip first N commits
+   * @param {number} [opts.limit=20] - Max commits to show
+   * @param {boolean} [opts.patch=false] - Include function-scoped diffs
+   * @returns {object|null} { definition, commits, raw? }
+   */
+  async history({ symbol, file, offset = 0, limit = 20, patch = false }) {
+    await this._ensureReady();
+    const graph = this.cache.getGraph();
+    if (!graph) return null;
+
+    const candidates = [];
+    graph.forEachNode((node, attrs) => {
+      if (attrs.type !== 'symbol') return;
+      if (attrs.name !== symbol) return;
+      if (file && attrs.file !== file) return;
+      candidates.push(attrs);
+    });
+    if (candidates.length === 0) return null;
+
+    const ranked = this._getRanked();
+    const scoreMap = new Map(ranked);
+    candidates.sort((a, b) => {
+      const aKey = `${a.file}::${a.name}`;
+      const bKey = `${b.file}::${b.name}`;
+      return (scoreMap.get(bKey) || 0) - (scoreMap.get(aKey) || 0);
+    });
+    const target = candidates[0];
+
+    const { execSync } = await import('child_process');
+    try {
+      if (patch) {
+        // Full output with diffs — return raw text
+        const raw = execSync(
+          `git log -L ${target.lineStart},${target.lineEnd}:${target.file} --skip=${offset} -n ${limit}`,
+          { cwd: this.projectRoot, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 }
+        ).trim();
+        return { definition: target, commits: [], raw };
+      }
+      // Summary only
+      const output = execSync(
+        `git log -L ${target.lineStart},${target.lineEnd}:${target.file} --no-patch --format="%h  %ad  %s" --date=short --skip=${offset} -n ${limit}`,
+        { cwd: this.projectRoot, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 }
+      ).trim();
+      const commits = output ? output.split('\n').filter(Boolean) : [];
+      return { definition: target, commits };
+    } catch {
+      return { definition: target, commits: [], error: 'git log failed — is this a git repo?' };
+    }
+  }
+
+  /**
    * Recursive caller chain — walk UP the call graph from a symbol.
    * At each hop, resolves which function in the caller file contains
    * the call site by cross-referencing line numbers with definitions.

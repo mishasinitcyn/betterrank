@@ -27,6 +27,7 @@ Requires: `npm install -g @mishasinitcyn/betterrank`
 | Find a function/class/symbol | `search <query> --root <project>` | Grep |
 | Understand a function fully | `context <symbol>` | Reading the function + chasing types + chasing deps |
 | Before modifying shared code | `callers <symbol> --context` and/or `dependents <file>` | Guessing, reading every caller file |
+| Git history of a function | `history <symbol>` (add `--patch` for diffs) | `git log` on the whole file |
 | Trace full call path | `trace <symbol>` | Manual hop-by-hop callers |
 | Pre-commit impact check | `diff` | Guessing what might break |
 | Understand a file's context | `neighborhood <file>` | Reading imports manually |
@@ -112,6 +113,18 @@ betterrank callers authenticateUser --root /path/to/project --context 3
 ```
 
 **Use `--context` by default** — it shows HOW each caller uses the function (imports, call arguments, surrounding logic) so you don't need to read each caller file separately. Only matches actual call sites (`symbol(`) and imports, not string literals or the definition itself.
+
+### `history` — Git history of a specific function
+
+Shows only commits that touched a function's lines. Uses tree-sitter line ranges. Add `--patch` / `-p` for function-scoped diffs.
+
+```bash
+betterrank history calculate_bid --root /path/to/project
+betterrank history calculate_bid --root /path/to/project --patch --limit 3
+betterrank history calculate_bid --root /path/to/project --offset 5 --limit 5
+```
+
+Use for: "when did this function last change?", "who introduced this bug?", "what was the original implementation?"
 
 ### `trace` — Recursive caller chain
 

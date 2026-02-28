@@ -186,6 +186,31 @@ Callers (1 file):
   src/engine/bidding.py
 ```
 
+### `history` — Git history of a specific function
+
+Shows only commits that touched a function's lines. Uses tree-sitter line ranges for accuracy (better than git's heuristic `:funcname:` detection). Add `--patch` to include function-scoped diffs.
+
+```bash
+# Commit list (compact)
+betterrank history calculate_bid --root /path/to/project
+
+# With function-scoped diffs
+betterrank history calculate_bid --root /path/to/project --patch --limit 3
+
+# Paginate through older commits
+betterrank history calculate_bid --root /path/to/project --offset 5 --limit 5
+```
+
+**Example output:**
+```
+calculate_bid (src/engine/bidding.py:489-718)
+
+  082b9d5  2026-02-24  fix: restore GSP auction pricing
+  c75f5ff  2026-02-14  fix: resolve lint errors from main merge
+  623429c  2026-02-13  hot fix
+  5d236d3  2026-02-06  feat: wire ad_position to ValuePredictor
+```
+
 ### `trace` — Recursive caller chain
 
 Walk UP the call graph from a symbol to see the full path from entry points to your function. At each hop, resolves which function in the caller file contains the call site.
