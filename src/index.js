@@ -4,6 +4,73 @@ import { CodeIndexCache } from './cache.js';
 import { rankedSymbols } from './graph.js';
 import { parseFile } from './parser.js';
 
+/**
+ * Collapse unchanged context lines in git log -L diff output.
+ * Keeps `ctx` lines of context around each +/- change, replaces
+ * long unchanged runs with "...".
+ */
+function _collapseDiffContext(raw, ctx = 2) {
+  const output = [];
+  // Split into per-commit sections (each starts with "commit ")
+  const sections = raw.split(/^(?=commit )/m);
+
+  for (const section of sections) {
+    if (!section.trim()) continue;
+    const lines = section.split('\n');
+    // Find the diff start (line starting with "diff --git")
+    const diffStart = lines.findIndex(l => l.startsWith('diff --git'));
+    if (diffStart === -1) {
+      // No diff in this section (e.g., initial commit with just +++ lines)
+      output.push(section);
+      continue;
+    }
+
+    // Keep the commit header (everything before "diff --git")
+    output.push(lines.slice(0, diffStart).join('\n'));
+
+    // Process the diff portion
+    const diffLines = lines.slice(diffStart);
+    // Find lines that are actual diff content (after the @@ hunk header)
+    const hunkStart = diffLines.findIndex(l => l.startsWith('@@'));
+    if (hunkStart === -1) {
+      output.push(diffLines.join('\n'));
+      continue;
+    }
+
+    // Keep diff headers (diff --git, ---, +++, @@)
+    output.push(diffLines.slice(0, hunkStart + 1).join('\n'));
+
+    const content = diffLines.slice(hunkStart + 1);
+    // Mark which lines are "interesting" (changed or near a change)
+    const isChange = content.map(l => l.startsWith('+') || l.startsWith('-'));
+    const show = new Array(content.length).fill(false);
+
+    for (let i = 0; i < content.length; i++) {
+      if (isChange[i]) {
+        for (let j = Math.max(0, i - ctx); j <= Math.min(content.length - 1, i + ctx); j++) {
+          show[j] = true;
+        }
+      }
+    }
+
+    // Build collapsed output
+    let inEllipsis = false;
+    const collapsed = [];
+    for (let i = 0; i < content.length; i++) {
+      if (show[i]) {
+        inEllipsis = false;
+        collapsed.push(content[i]);
+      } else if (!inEllipsis) {
+        inEllipsis = true;
+        collapsed.push('   ...');
+      }
+    }
+    output.push(collapsed.join('\n'));
+  }
+
+  return output.join('\n');
+}
+
 // ── Orphan false-positive filters ──────────────────────────────────────────
 //
 // Orphan detection finds files/symbols with no cross-file connections.
@@ -1194,12 +1261,13 @@ class CodeIndex {
     const { execSync } = await import('child_process');
     try {
       if (patch) {
-        // Full output with diffs — return raw text
         const raw = execSync(
           `git log -L ${target.lineStart},${target.lineEnd}:${target.file} --skip=${offset} -n ${limit}`,
           { cwd: this.projectRoot, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 }
         ).trim();
-        return { definition: target, commits: [], raw };
+        // Collapse unchanged context lines in diffs — keep 2 lines around changes
+        const collapsed = _collapseDiffContext(raw, 2);
+        return { definition: target, commits: [], raw: collapsed };
       }
       // Summary only
       const output = execSync(
