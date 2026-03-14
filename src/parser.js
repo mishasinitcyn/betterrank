@@ -247,6 +247,99 @@ const KIND_MAP = {
 };
 
 /**
+ * Walk an AST subtree and count node types that reveal structural shape.
+ * Returns a flat object like { if_statement: 3, for_statement: 1, call_expression: 7, ... }
+ * This is intentionally coarse — we want "shape" not identity.
+ */
+const STRUCTURAL_NODE_TYPES = new Set([
+  // Control flow
+  'if_statement', 'if_expression', 'elif_clause', 'else_clause',
+  'for_statement', 'for_in_statement', 'for_expression',
+  'while_statement', 'loop_expression',
+  'match_statement', 'match_expression', 'switch_statement', 'case_clause',
+  'try_statement', 'try_expression', 'except_clause', 'catch_clause', 'finally_clause',
+  'with_statement',
+  // Returns / yields
+  'return_statement', 'yield', 'yield_expression', 'await_expression',
+  // Calls & access
+  'call_expression', 'call', 'method_call_expression',
+  'member_expression', 'attribute', 'subscript_expression', 'subscript',
+  // Assignments
+  'assignment', 'assignment_expression', 'augmented_assignment',
+  // Data structures
+  'list', 'list_comprehension', 'dictionary', 'dictionary_comprehension',
+  'array', 'object', 'tuple',
+  // Assertions / raises
+  'assert_statement', 'raise_statement', 'throw_statement',
+  // Boolean logic
+  'boolean_operator', 'binary_expression', 'comparison_operator', 'not_operator',
+  // Conditionals
+  'conditional_expression', 'ternary_expression',
+  // String operations
+  'string', 'f_string', 'template_string',
+  // Decorators
+  'decorator',
+]);
+
+function buildAstProfile(node) {
+  const profile = {};
+  let totalNodes = 0;
+
+  function walk(n) {
+    if (STRUCTURAL_NODE_TYPES.has(n.type)) {
+      profile[n.type] = (profile[n.type] || 0) + 1;
+    }
+    totalNodes++;
+    for (let i = 0; i < n.namedChildCount; i++) {
+      walk(n.namedChild(i));
+    }
+  }
+
+  walk(node);
+  profile._totalNodes = totalNodes;
+  return profile;
+}
+
+/**
+ * Extract parameter names from a function's tree-sitter node.
+ * Works across languages by looking for common parameter node patterns.
+ */
+function extractParamNames(node) {
+  const params = [];
+  // Find the parameter list node
+  const paramNodes = [];
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child.type === 'parameters' || child.type === 'formal_parameters' ||
+        child.type === 'parameter_list') {
+      paramNodes.push(child);
+    }
+    // Drill into wrappers (e.g. variable_declarator -> arrow_function)
+    for (let j = 0; j < child.namedChildCount; j++) {
+      const gc = child.namedChild(j);
+      if (gc.type === 'parameters' || gc.type === 'formal_parameters' ||
+          gc.type === 'parameter_list') {
+        paramNodes.push(gc);
+      }
+    }
+  }
+
+  for (const paramList of paramNodes) {
+    for (let i = 0; i < paramList.namedChildCount; i++) {
+      const p = paramList.namedChild(i);
+      // Try to get the identifier name from various param shapes
+      const nameNode = p.childForFieldName('name') || p.childForFieldName('pattern');
+      if (nameNode && nameNode.type === 'identifier') {
+        params.push(nameNode.text);
+      } else if (p.type === 'identifier') {
+        params.push(p.text);
+      }
+    }
+  }
+  return params;
+}
+
+/**
  * Find the body/block node of a definition, drilling into wrappers like
  * lexical_declaration → variable_declarator → arrow_function → body.
  */
@@ -340,6 +433,11 @@ function parseFile(filePath, source) {
           bodyStartLine = bodyRow === defRow ? bodyRow + 2 : bodyRow + 1; // 1-indexed
         }
 
+        // Build AST profile from function body (or whole node if no body)
+        const profileNode = bodyNode || defNode.node;
+        const astProfile = buildAstProfile(profileNode);
+        const paramNames = extractParamNames(defNode.node);
+
         definitions.push({
           name: nameCapture.node.text,
           kind: nodeKind(defNode.node.type),
@@ -348,6 +446,8 @@ function parseFile(filePath, source) {
           lineEnd: defNode.node.endPosition.row + 1,
           signature: extractSignature(defNode.node, langName),
           bodyStartLine,
+          astProfile,
+          paramNames,
         });
       }
     } catch (e) {
@@ -373,9 +473,28 @@ function parseFile(filePath, source) {
     }
   }
 
+  // Associate each reference with its enclosing definition (by line range).
+  // This gives us per-function reference sets for similarity analysis.
+  // Sort definitions by lineStart for binary search.
+  const sortedDefs = [...definitions].sort((a, b) => a.lineStart - b.lineStart);
+  for (const ref of references) {
+    // Find the innermost enclosing definition
+    let enclosing = null;
+    for (const def of sortedDefs) {
+      if (ref.line >= def.lineStart && ref.line <= def.lineEnd) {
+        // Pick innermost (last matching, since sorted by start and nested defs start later)
+        enclosing = def;
+      }
+    }
+    if (enclosing) {
+      if (!enclosing.localRefs) enclosing.localRefs = [];
+      enclosing.localRefs.push(ref.name);
+    }
+  }
+
   // No tree.delete()/parser.delete() needed — native GC handles cleanup
 
   return { file: filePath, definitions, references };
 }
 
-export { parseFile, SUPPORTED_EXTENSIONS, LANG_MAP };
+export { parseFile, buildAstProfile, extractParamNames, SUPPORTED_EXTENSIONS, LANG_MAP };

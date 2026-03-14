@@ -20,12 +20,14 @@ Commands:
   callers     <symbol> [--file path] [--context]     All call sites (ranked, with context lines)
   context     <symbol> [--file path]                 Full context: source, deps, types, callers
   history     <symbol> [--file path]                Git history of a specific function
-  trace       <symbol> [--depth N]                  Recursive caller chain (call tree)
+  trace       <symbol> [--depth N]                  Recursive caller chain (upward)
+  callees     <symbol> [--depth N]                  Recursive callee chain (downward)
   diff        [--ref <commit>]                      Git-aware blast radius (changed symbols + callers)
   deps        <file>                                What this file imports (ranked)
   dependents  <file>                                What imports this file (ranked)
   neighborhood <file> [--hops N] [--max-files N]    Local subgraph (ranked by PageRank)
   orphans     [--level file|symbol] [--kind type]   Find disconnected files/symbols
+  compare     <pathA> <pathB>                        Structural diff between two files/dirs
   reindex                                           Force full rebuild
   stats                                             Index statistics
 
@@ -269,6 +271,27 @@ Examples:
   betterrank orphans --level symbol --kind function --root .
   betterrank orphans --count --root .`,
 
+  compare: `betterrank compare <pathA> <pathB> [--kind type] [--include-tests]
+
+Structural diff between two files or directories. Shows which symbols
+exist in both, which are unique to each side, and how their signatures
+and dependencies differ. No scores — just deterministic structural facts.
+
+For directories: also shows file-level overlap (shared basenames).
+By default filters out test files and generic names (get, set, __init__, etc.)
+to focus on meaningful structural overlap.
+
+Options:
+  --kind <type>         Filter to: function, class, type, variable
+  --include-tests       Include test files and test_ functions
+  --limit N             Max items per section (default: 30)
+
+Examples:
+  betterrank compare src/auth.py lib/auth.py
+  betterrank compare ./repo-a ./repo-b
+  betterrank compare ./repo-a ./repo-b --kind function
+  betterrank compare flask/app.py bottle/bottle.py --kind class`,
+
   reindex: `betterrank reindex [--root <path>]
 
 Force a full rebuild of the index. Use after branch switches, large merges,
@@ -326,6 +349,126 @@ async function main() {
     const { exec } = await import('child_process');
     exec(`${opener} http://localhost:${port}`);
     return; // Keep process alive (server is listening)
+  }
+
+  // Compare command — standalone, doesn't need CodeIndex
+  if (command === 'compare') {
+    const pathA = flags._positional[0];
+    const pathB = flags._positional[1];
+    if (!pathA || !pathB) {
+      console.error('Usage: betterrank compare <pathA> <pathB> [--kind type]');
+      process.exit(1);
+    }
+    const absA = resolve(pathA);
+    const absB = resolve(pathB);
+    const { compare } = await import('./compare.js');
+    const includeTests = flags['include-tests'] === true;
+    const countMode = flags.count === true;
+
+    let result;
+    try {
+      result = await compare(absA, absB, { kind: flags.kind, includeTests });
+    } catch (err) {
+      console.error(err.message);
+      process.exit(1);
+    }
+
+    // --count mode: just print totals
+    if (countMode) {
+      const sm = result.summary;
+      console.log(`shared: ${sm.sharedNames}`);
+      console.log(`only_a: ${sm.onlyACount}`);
+      console.log(`only_b: ${sm.onlyBCount}`);
+      console.log(`total_a: ${sm.totalA}`);
+      console.log(`total_b: ${sm.totalB}`);
+      return;
+    }
+
+    const limit = flags.limit !== undefined ? parseInt(flags.limit, 10) : DEFAULT_LIMIT;
+    const off = flags.offset !== undefined ? parseInt(flags.offset, 10) : 0;
+
+    // Helper: paginate a list and print a range header
+    const paginateSection = (items, label) => {
+      const total = items.length;
+      if (total === 0) return [];
+      const shown = items.slice(off, off + limit);
+      if (shown.length === 0) {
+        console.log(`\n── ${label} (${total}) ── (offset ${off} exceeds ${total} results)`);
+        return [];
+      }
+      const rangeStr = total > limit || off > 0 ? `, showing ${off + 1}-${off + shown.length}` : '';
+      console.log(`\n── ${label} (${total}${rangeStr}) ──`);
+      return shown;
+    };
+
+    // Warn if either side had zero symbols
+    if (result.summary.totalA === 0) {
+      process.stderr.write(`⚠ No parseable symbols found in A: ${result.labelA}\n`);
+    }
+    if (result.summary.totalB === 0) {
+      process.stderr.write(`⚠ No parseable symbols found in B: ${result.labelB}\n`);
+    }
+
+    // Summary first (most useful at a glance)
+    const sm = result.summary;
+    console.log(`── Summary ──`);
+    console.log(`  A: ${result.labelA} (${sm.totalA} symbols)`);
+    console.log(`  B: ${result.labelB} (${sm.totalB} symbols)`);
+    console.log(`  Shared names: ${sm.sharedNames}  |  Only A: ${sm.onlyACount}  |  Only B: ${sm.onlyBCount}`);
+
+    // File-level overlap (directory mode)
+    if (result.isDirectoryMode) {
+      console.log(`\n── Files ──`);
+      console.log(`  A: ${result.files.totalA} files  |  B: ${result.files.totalB} files`);
+      if (result.files.shared.length > 0) {
+        const fileList = result.files.shared.length > 15
+          ? result.files.shared.slice(0, 15).join(', ') + ` (+${result.files.shared.length - 15} more)`
+          : result.files.shared.join(', ');
+        console.log(`  Shared basenames (${result.files.shared.length}): ${fileList}`);
+      }
+    }
+
+    // Shared symbols — compact grouped format, sorted by sharedRefs
+    const sharedShown = paginateSection(result.shared, 'Shared symbols');
+    for (const s of sharedShown) {
+      const kinds = new Set([...s.inA.map(d => d.kind), ...s.inB.map(d => d.kind)]);
+      const kindStr = [...kinds].join('/');
+      const refTag = s.sharedRefs.length > 0 ? `  ${s.sharedRefs.length} shared refs` : '';
+      console.log(`  ${s.name}  [${kindStr}]  A:${s.inA.length} def${s.inA.length > 1 ? 's' : ''}  B:${s.inB.length} def${s.inB.length > 1 ? 's' : ''}${refTag}`);
+      for (const d of s.inA.slice(0, 2)) {
+        console.log(`    A: ${d.file}:${d.line}  ${d.signature}`);
+      }
+      if (s.inA.length > 2) console.log(`    A: ... and ${s.inA.length - 2} more`);
+      for (const d of s.inB.slice(0, 2)) {
+        console.log(`    B: ${d.file}:${d.line}  ${d.signature}`);
+      }
+      if (s.inB.length > 2) console.log(`    B: ... and ${s.inB.length - 2} more`);
+      if (s.sharedRefs.length > 0) {
+        console.log(`    Shared refs: ${s.sharedRefs.slice(0, 10).join(', ')}${s.sharedRefs.length > 10 ? ` (+${s.sharedRefs.length - 10} more)` : ''}`);
+      }
+    }
+    if (result.shared.length > off + limit) {
+      console.log(`  (use --offset ${off + limit} to see more)`);
+    }
+
+    // Only in A
+    const onlyAShown = paginateSection(result.onlyA, 'Only in A');
+    for (const s of onlyAShown) {
+      console.log(`  [${s.kind}] ${s.file}:${s.line}  ${s.signature}`);
+    }
+    if (result.onlyA.length > off + limit) {
+      console.log(`  (use --offset ${off + limit} to see more)`);
+    }
+
+    // Only in B
+    const onlyBShown = paginateSection(result.onlyB, 'Only in B');
+    for (const s of onlyBShown) {
+      console.log(`  [${s.kind}] ${s.file}:${s.line}  ${s.signature}`);
+    }
+    if (result.onlyB.length > off + limit) {
+      console.log(`  (use --offset ${off + limit} to see more)`);
+    }
+    return;
   }
 
   // Outline command — standalone by default, needs CodeIndex for --annotate
@@ -661,6 +804,27 @@ async function main() {
       break;
     }
 
+    case 'callees': {
+      const symbol = flags._positional[0];
+      if (!symbol) { console.error('Usage: betterrank callees <symbol> [--depth N]'); process.exit(1); }
+      const calleesDepth = flags.depth ? parseInt(flags.depth, 10) : 3;
+      const tree = await idx.callees({ symbol, file: normalizeFilePath(flags.file), depth: calleesDepth });
+      if (!tree) {
+        console.log(`(symbol "${symbol}" not found)`);
+      } else {
+        const printNode = (node, depth) => {
+          const indent = depth === 0 ? '' : '  '.repeat(depth) + '→ ';
+          const loc = `(${node.file}:${node.line || '?'})`;
+          console.log(`${indent}${node.name} ${loc}`);
+          for (const callee of node.callees) {
+            printNode(callee, depth + 1);
+          }
+        };
+        printNode(tree, 0);
+      }
+      break;
+    }
+
     case 'diff': {
       const result = await idx.diff({ ref: flags.ref || 'HEAD' });
       if (result.error) {
@@ -836,6 +1000,12 @@ async function main() {
         }
       }
       break;
+    }
+
+    case 'similar': {
+      console.error('The "similar" command has been replaced by "compare".');
+      console.error('Usage: betterrank compare <pathA> <pathB>');
+      process.exit(1);
     }
 
     case 'reindex': {

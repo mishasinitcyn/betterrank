@@ -28,7 +28,8 @@ Requires: `npm install -g @mishasinitcyn/betterrank`
 | Understand a function fully | `context <symbol>` | Reading the function + chasing types + chasing deps |
 | Before modifying shared code | `callers <symbol> --context` and/or `dependents <file>` | Guessing, reading every caller file |
 | Git history of a function | `history <symbol>` (add `--patch` for diffs) | `git log` on the whole file |
-| Trace full call path | `trace <symbol>` | Manual hop-by-hop callers |
+| Trace call path upward | `trace <symbol>` | Manual hop-by-hop callers |
+| Trace call path downward | `callees <symbol>` | Reading the function + chasing every reference |
 | Pre-commit impact check | `diff` | Guessing what might break |
 | Understand a file's context | `neighborhood <file>` | Reading imports manually |
 
@@ -126,7 +127,7 @@ betterrank history calculate_bid --root /path/to/project --offset 5 --limit 5
 
 Use for: "when did this function last change?", "who introduced this bug?", "what was the original implementation?"
 
-### `trace` — Recursive caller chain
+### `trace` — Recursive caller chain (upward)
 
 Walk UP the call graph to see the full path from entry point to function. Resolves which function in each caller file contains the call site.
 
@@ -136,6 +137,19 @@ betterrank trace calculate_bid --root /path/to/project --depth 5
 ```
 
 Use for: "how does a user request reach this database write?" or "what's the full execution path to this function?"
+
+### `callees` — Recursive callee chain (downward)
+
+Walk DOWN the call graph to see everything a function calls, transitively. The mirror of `trace`.
+
+```bash
+betterrank callees calculate_bid --root /path/to/project
+betterrank callees calculate_bid --root /path/to/project --depth 5
+```
+
+Use for: "what downstream code does this function touch?" or "what's the full blast radius if I refactor this?"
+
+**Sandwich view:** Use `trace` + `callees` together on the same symbol to see both upstream callers and downstream dependencies — the complete picture before any refactor.
 
 ### `diff` — Git-aware blast radius
 
@@ -269,6 +283,20 @@ betterrank outline src/api/campaigns.py create_campaign
 
 # 3. See exactly HOW it's called (with context lines)
 betterrank callers create_campaign --root . --context
+```
+
+### "I need to refactor this function — what breaks?"
+
+**Right:**
+```bash
+# 1. What does it depend on downstream?
+betterrank callees create_campaign --root . --depth 3
+
+# 2. Who depends on it upstream?
+betterrank trace create_campaign --root . --depth 3
+
+# Now you have the full sandwich: upstream callers + downstream deps
+# You know exactly what to test and what might break
 ```
 
 ### "Can we remove the flush_impressions writer?"

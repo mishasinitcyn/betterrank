@@ -1416,6 +1416,133 @@ class CodeIndex {
   }
 
   /**
+   * Recursive callee chain — walk DOWN the call graph.
+   * Mirror of trace(): shows what a function calls, transitively.
+   *
+   * @param {string} opts.symbol - Symbol name
+   * @param {string} [opts.file] - Disambiguate by file
+   * @param {number} [opts.depth=3] - Max hops downward
+   * @returns {object} Tree root node with .callees[]
+   */
+  async callees({ symbol, file, depth = 3 }) {
+    await this._ensureReady();
+    const graph = this.cache.getGraph();
+    if (!graph) return null;
+
+    // Find the target symbol node(s)
+    const targetKeys = [];
+    graph.forEachNode((node, attrs) => {
+      if (attrs.type !== 'symbol') return;
+      if (attrs.name !== symbol) return;
+      if (file && attrs.file !== file) return;
+      targetKeys.push(node);
+    });
+
+    if (targetKeys.length === 0) return null;
+
+    // Use the first match (highest PageRank if multiple)
+    const ranked = this._getRanked();
+    const scoreMap = new Map(ranked);
+    targetKeys.sort((a, b) => (scoreMap.get(b) || 0) - (scoreMap.get(a) || 0));
+    const rootKey = targetKeys[0];
+    const rootAttrs = graph.getNodeAttributes(rootKey);
+
+    // Build a map: symbolKey -> set of symbol keys it references (outgoing REFERENCES)
+    // For each file node that has an outgoing REFERENCES edge to a symbol,
+    // we need to resolve which function in that file makes the call.
+    // Approach: for each symbol, find what other symbols it references
+    // by looking at REFERENCES edges from the symbol's file to other symbols,
+    // then filtering to references that occur within the symbol's line range.
+
+    // Cache of file -> definitions
+    const defCache = new Map();
+    const getFileDefs = async (filePath) => {
+      if (defCache.has(filePath)) return defCache.get(filePath);
+      try {
+        const absPath = join(this.projectRoot, filePath);
+        const source = await readFile(absPath, 'utf-8');
+        const parsed = parseFile(filePath, source);
+        const defs = parsed ? parsed.definitions.sort((a, b) => a.lineStart - b.lineStart) : [];
+        defCache.set(filePath, defs);
+        return defs;
+      } catch {
+        defCache.set(filePath, []);
+        return [];
+      }
+    };
+
+    const visited = new Set();
+
+    const buildNode = async (symbolName, symbolFile, symbolLine, currentDepth) => {
+      const nodeKey = `${symbolFile}::${symbolName}`;
+      const node = { name: symbolName, file: symbolFile, line: symbolLine, callees: [] };
+
+      if (currentDepth >= depth) return node;
+      if (visited.has(nodeKey)) return node;
+      visited.add(nodeKey);
+
+      // Find the definition's line range so we know which references belong to it
+      const defs = await getFileDefs(symbolFile);
+      const thisDef = defs.find(d => d.name === symbolName && d.lineStart === symbolLine)
+        || defs.find(d => d.name === symbolName);
+      if (!thisDef) return node;
+
+      // Get the source to find call sites within this function's body
+      let sourceLines;
+      try {
+        const absPath = join(this.projectRoot, symbolFile);
+        const source = await readFile(absPath, 'utf-8');
+        sourceLines = source.split('\n');
+      } catch {
+        return node;
+      }
+
+      // Find the file node in the graph for this symbol's file
+      const fileNodeKey = symbolFile;
+
+      // Collect all symbols that this file references (outgoing REFERENCES from file node)
+      const referencedSymbols = new Map(); // name -> {file, line, name}
+      if (graph.hasNode(fileNodeKey)) {
+        graph.forEachOutEdge(fileNodeKey, (_edge, attrs, _source, target) => {
+          if (attrs.type !== 'REFERENCES') return;
+          const targetAttrs = graph.getNodeAttributes(target);
+          if (targetAttrs.type !== 'symbol') return;
+          // Skip self-references
+          if (targetAttrs.name === symbolName && targetAttrs.file === symbolFile) return;
+          referencedSymbols.set(`${targetAttrs.file}::${targetAttrs.name}`, {
+            name: targetAttrs.name,
+            file: targetAttrs.file,
+            line: targetAttrs.lineStart
+          });
+        });
+      }
+
+      // Filter to references that appear within this function's line range
+      for (const [key, ref] of referencedSymbols) {
+        const callPattern = new RegExp(
+          `(?<![a-zA-Z0-9_])${ref.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`
+        );
+
+        let found = false;
+        for (let i = thisDef.lineStart - 1; i < Math.min(thisDef.lineEnd, sourceLines.length); i++) {
+          if (callPattern.test(sourceLines[i])) { found = true; break; }
+        }
+
+        if (found) {
+          const calleeNode = await buildNode(ref.name, ref.file, ref.line, currentDepth + 1);
+          node.callees.push(calleeNode);
+        }
+      }
+
+      // Sort callees by file then name for deterministic output
+      node.callees.sort((a, b) => a.file.localeCompare(b.file) || a.name.localeCompare(b.name));
+      return node;
+    };
+
+    return buildNode(rootAttrs.name, rootAttrs.file, rootAttrs.lineStart, 0);
+  }
+
+  /**
    * Git-aware blast radius — what symbols changed and who calls them.
    *
    * Compares the working tree (or a git ref) against the index to find
@@ -1557,6 +1684,273 @@ class CodeIndex {
       if (sf !== symbolFile) files.add(sf);
     });
     return files.size;
+  }
+
+  /**
+   * Find structurally similar functions/classes across the codebase.
+   *
+   * Similarity is computed from multiple signals:
+   * - AST shape profile (node-type frequency vector) — captures structural patterns
+   * - Reference overlap — functions that call the same things do similar work
+   * - Parameter name overlap — shared param names suggest shared purpose
+   * - Name similarity — tokenized name overlap (camelCase/snake_case aware)
+   *
+   * @param {object} opts
+   * @param {string} [opts.symbol] - Find symbols similar to this one
+   * @param {string} [opts.file] - Disambiguate symbol by file, or find similar symbols across this file
+   * @param {string} [opts.kind] - Filter candidates to this kind (function, class, type)
+   * @param {number} [opts.threshold=0.4] - Minimum similarity score (0-1)
+   * @param {number} [opts.offset] - Skip first N results
+   * @param {number} [opts.limit=20] - Max results to return
+   * @param {boolean} [opts.count=false] - If true, return only { total }
+   * @returns {Array<{symbol, file, line, signature, score, breakdown}>|{total: number}}
+   */
+  async similar({ symbol, file, kind, threshold = 0.4, offset, limit = 20, count = false } = {}) {
+    await this._ensureReady();
+    const graph = this.cache.getGraph();
+    if (!graph) return count ? { total: 0 } : [];
+
+    // Collect all symbol nodes with their attributes
+    // Filter out trivial symbols that match everything due to lack of structure
+    const allSymbols = [];
+    graph.forEachNode((key, attrs) => {
+      if (attrs.type !== 'symbol') return;
+      if (kind && attrs.kind !== kind) return;
+      allSymbols.push({ key, ...attrs });
+    });
+
+    // Identify which symbols are "non-trivial" (enough structure to be meaningful)
+    const isNonTrivial = (attrs) => {
+      const profile = attrs.astProfile;
+      if (!profile) return false;
+      const bodyLines = (attrs.lineEnd || 0) - (attrs.lineStart || 0);
+      const structuralNodes = Object.entries(profile)
+        .filter(([k]) => k !== '_totalNodes')
+        .reduce((sum, [, v]) => sum + v, 0);
+      // At least 3 structural nodes (ifs, calls, returns, etc.) or 5+ lines
+      return structuralNodes >= 3 || bodyLines >= 5;
+    };
+
+    // Build reference sets per symbol from localRefs (per-function scoped refs from parser)
+    const refSets = new Map();
+    for (const sym of allSymbols) {
+      refSets.set(sym.key, new Set(sym.localRefs || []));
+    }
+
+    // Compute IDF weights for AST node types (rare types are more discriminative)
+    const nodeTypeDocFreq = new Map(); // nodeType -> count of symbols that have it
+    for (const sym of allSymbols) {
+      if (!sym.astProfile) continue;
+      for (const [k, v] of Object.entries(sym.astProfile)) {
+        if (k === '_totalNodes' || v === 0) continue;
+        nodeTypeDocFreq.set(k, (nodeTypeDocFreq.get(k) || 0) + 1);
+      }
+    }
+    const totalDocs = allSymbols.length;
+    const idfWeights = new Map();
+    for (const [nodeType, docFreq] of nodeTypeDocFreq) {
+      // IDF: log(N / df) — rare types get higher weight
+      idfWeights.set(nodeType, Math.log(totalDocs / docFreq));
+    }
+
+    // Find the target symbol(s) to compare against
+    let targets;
+    if (symbol) {
+      targets = allSymbols.filter(s => {
+        if (s.name !== symbol) return false;
+        if (file && s.file !== file) return false;
+        return true;
+      });
+      if (targets.length === 0) return count ? { total: 0 } : [];
+    } else if (file) {
+      // Compare all symbols in this file against the rest
+      targets = allSymbols.filter(s => s.file === file);
+      if (targets.length === 0) return count ? { total: 0 } : [];
+    } else {
+      return count ? { total: 0 } : [];
+    }
+
+    // Compute similarity for each candidate against each target
+    const results = [];
+    for (const candidate of allSymbols) {
+      // Skip self-matches
+      if (targets.some(t => t.key === candidate.key)) continue;
+      // Skip trivial candidates — they match everything and are noise
+      if (!isNonTrivial(candidate)) continue;
+
+      let bestScore = 0;
+      let bestBreakdown = null;
+      let bestTarget = null;
+
+      for (const target of targets) {
+        const breakdown = this._computeSimilarity(target, candidate, refSets, idfWeights);
+        if (breakdown.total > bestScore) {
+          bestScore = breakdown.total;
+          bestBreakdown = breakdown;
+          bestTarget = target;
+        }
+      }
+
+      if (bestScore >= threshold) {
+        results.push({
+          symbol: candidate.name,
+          file: candidate.file,
+          line: candidate.lineStart,
+          signature: candidate.signature,
+          score: Math.round(bestScore * 100) / 100,
+          matchedWith: bestTarget ? `${bestTarget.file}::${bestTarget.name}` : null,
+          breakdown: bestBreakdown,
+        });
+      }
+    }
+
+    // Sort by score descending
+    results.sort((a, b) => b.score - a.score);
+
+    if (count) return { total: results.length };
+    return paginate(results, { offset, limit }).items;
+  }
+
+  /**
+   * Compute multi-signal similarity between two symbols.
+   * Returns { total, astShape, refOverlap, paramOverlap, nameScore }
+   */
+  _computeSimilarity(a, b, refSets, idfWeights = null) {
+    const astShape = this._astProfileSimilarity(a.astProfile, b.astProfile, idfWeights);
+    const refOverlap = this._setOverlap(refSets.get(a.key), refSets.get(b.key), 2);
+    const paramOverlap = this._paramSimilarity(a.paramNames, b.paramNames);
+    const nameScore = this._nameSimilarity(a.name, b.name);
+
+    // Weighted combination — AST shape is most important, refs second
+    const total = (
+      astShape   * 0.40 +
+      refOverlap * 0.30 +
+      paramOverlap * 0.15 +
+      nameScore  * 0.15
+    );
+
+    return {
+      total: Math.round(total * 100) / 100,
+      astShape: Math.round(astShape * 100) / 100,
+      refOverlap: Math.round(refOverlap * 100) / 100,
+      paramOverlap: Math.round(paramOverlap * 100) / 100,
+      nameScore: Math.round(nameScore * 100) / 100,
+    };
+  }
+
+  /**
+   * Cosine similarity between two AST profile vectors.
+   * Ignores _totalNodes (used separately for size gating).
+   */
+  _astProfileSimilarity(a, b, idfWeights = null) {
+    if (!a || !b) return 0;
+
+    // Collect all keys (excluding _totalNodes)
+    const keys = new Set([
+      ...Object.keys(a).filter(k => k !== '_totalNodes'),
+      ...Object.keys(b).filter(k => k !== '_totalNodes'),
+    ]);
+    if (keys.size === 0) return 0;
+
+    // Size ratio penalty: very different sized functions get dampened
+    const sizeA = a._totalNodes || 1;
+    const sizeB = b._totalNodes || 1;
+    const sizeRatio = Math.min(sizeA, sizeB) / Math.max(sizeA, sizeB);
+    // Only penalize extreme size differences (>10x)
+    const sizePenalty = sizeRatio < 0.1 ? sizeRatio * 2 : 1;
+
+    // If both profiles have very few distinct node types, similarity is unreliable.
+    // Two functions both having {call_expression: 1, return_statement: 1} is not meaningful.
+    const distinctA = Object.keys(a).filter(k => k !== '_totalNodes').length;
+    const distinctB = Object.keys(b).filter(k => k !== '_totalNodes').length;
+    const minDistinct = Math.min(distinctA, distinctB);
+    // Penalize low-diversity profiles
+    const diversityPenalty = minDistinct <= 2 ? 0.4 : minDistinct <= 3 ? 0.7 : 1.0;
+
+    // Normalize counts to proportions, then apply IDF weighting.
+    // IDF makes rare node types (try_statement, list_comprehension) more
+    // discriminative than ubiquitous ones (call, return_statement).
+    const normalize = (profile) => {
+      const total = Object.entries(profile)
+        .filter(([k]) => k !== '_totalNodes')
+        .reduce((sum, [, v]) => sum + v, 0) || 1;
+      const result = {};
+      for (const k of keys) {
+        const proportion = (profile[k] || 0) / total;
+        const idf = (idfWeights && idfWeights.has(k)) ? idfWeights.get(k) : 1;
+        result[k] = proportion * idf;
+      }
+      return result;
+    };
+
+    const na = normalize(a);
+    const nb = normalize(b);
+
+    // Cosine similarity
+    let dot = 0, magA = 0, magB = 0;
+    for (const k of keys) {
+      dot += na[k] * nb[k];
+      magA += na[k] * na[k];
+      magB += nb[k] * nb[k];
+    }
+    const denom = Math.sqrt(magA) * Math.sqrt(magB);
+    const cosine = denom > 0 ? dot / denom : 0;
+
+    return cosine * sizePenalty * diversityPenalty;
+  }
+
+  /**
+   * Jaccard similarity between two sets.
+   * @param {number} [minSize=0] - Minimum set size for overlap to count
+   */
+  _setOverlap(a, b, minSize = 0) {
+    if (!a || !b || a.size === 0 || b.size === 0) return 0;
+    if (a.size < minSize && b.size < minSize) return 0;
+    let intersection = 0;
+    for (const item of a) {
+      if (b.has(item)) intersection++;
+    }
+    const union = a.size + b.size - intersection;
+    return union > 0 ? intersection / union : 0;
+  }
+
+  /**
+   * Parameter name similarity: Jaccard overlap on lowercased param names.
+   */
+  _paramSimilarity(a, b) {
+    if (!a || !b || a.length === 0 || b.length === 0) return 0;
+    const setA = new Set(a.map(p => p.toLowerCase()));
+    const setB = new Set(b.map(p => p.toLowerCase()));
+    // Remove 'self', 'cls', 'this' — they're noise
+    for (const noise of ['self', 'cls', 'this']) {
+      setA.delete(noise);
+      setB.delete(noise);
+    }
+    if (setA.size === 0 || setB.size === 0) return 0;
+    return this._setOverlap(setA, setB);
+  }
+
+  /**
+   * Name similarity: tokenize camelCase/snake_case names, compute Jaccard overlap.
+   */
+  _nameSimilarity(a, b) {
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+
+    const tokenize = (name) => {
+      // Split on _ and camelCase boundaries, lowercase
+      return name
+        .replace(/([a-z])([A-Z])/g, '$1_$2')
+        .toLowerCase()
+        .split(/[_\s]+/)
+        .filter(t => t.length > 1); // drop single-char tokens
+    };
+
+    const tokA = new Set(tokenize(a));
+    const tokB = new Set(tokenize(b));
+    if (tokA.size === 0 || tokB.size === 0) return 0;
+
+    return this._setOverlap(tokA, tokB);
   }
 
   /**

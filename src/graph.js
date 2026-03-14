@@ -61,6 +61,9 @@ function buildGraph(allSymbols) {
         lineStart: def.lineStart,
         lineEnd: def.lineEnd,
         signature: def.signature,
+        astProfile: def.astProfile || null,
+        paramNames: def.paramNames || null,
+        localRefs: def.localRefs || null,
       });
       graph.addEdge(file, symbolKey, { type: 'DEFINES' });
     }
@@ -148,6 +151,9 @@ function updateGraphFiles(graph, removedFiles, newSymbols) {
         lineStart: def.lineStart,
         lineEnd: def.lineEnd,
         signature: def.signature,
+        astProfile: def.astProfile || null,
+        paramNames: def.paramNames || null,
+        localRefs: def.localRefs || null,
       });
       graph.addEdge(file, symbolKey, { type: 'DEFINES' });
 

@@ -31,8 +31,11 @@ betterrank callers authenticateUser --root /path/to/project --context
 # Everything about a function: source, types, deps, callers
 betterrank context calculate_bid --root /path/to/project
 
-# Trace the full call chain from entry point to function
+# Trace the full call chain from entry point to function (upward)
 betterrank trace calculate_bid --root /path/to/project
+
+# What does a function call, recursively? (downward)
+betterrank callees calculate_bid --root /path/to/project
 
 # What symbols changed and what might break?
 betterrank diff --root /path/to/project
@@ -211,7 +214,7 @@ calculate_bid (src/engine/bidding.py:489-718)
   5d236d3  2026-02-06  feat: wire ad_position to ValuePredictor
 ```
 
-### `trace` — Recursive caller chain
+### `trace` — Recursive caller chain (upward)
 
 Walk UP the call graph from a symbol to see the full path from entry points to your function. At each hop, resolves which function in the caller file contains the call site.
 
@@ -227,6 +230,26 @@ calculate_bid (src/engine/bidding.py:489)
     ← handle_request (src/engine/pipeline.py:153)
       ← app (src/main.py:45)
 ```
+
+### `callees` — Recursive callee chain (downward)
+
+Walk DOWN the call graph from a symbol to see everything it calls, transitively. The mirror of `trace`. Use before refactoring to understand downstream dependencies.
+
+```bash
+betterrank callees calculate_bid --root /path/to/project
+betterrank callees calculate_bid --root /path/to/project --depth 5
+```
+
+**Example output:**
+```
+calculate_bid (src/engine/bidding.py:489)
+  → from_microdollars (src/core/currency.py:108)
+  → get_config (src/engine/predictor/config.py:316)
+    → load_yaml (src/core/config.py:22)
+  → get_value_predictor (src/engine/predictor/persistence.py:123)
+```
+
+Use both together for a full "sandwich view" of a function — who calls it (upstream) and what it touches (downstream).
 
 ### `diff` — Git-aware blast radius
 
@@ -315,6 +338,7 @@ const idx = new CodeIndex('/path/to/project');
 const map = await idx.map({ limit: 100, focusFiles: ['src/main.ts'] });
 const results = await idx.search({ query: 'auth', kind: 'function', limit: 10 });
 const callers = await idx.callers({ symbol: 'authenticate', context: 2 });
+const tree = await idx.callees({ symbol: 'authenticate', depth: 3 });
 const counts = await idx.getCallerCounts('src/auth.ts');
 const deps = await idx.dependencies({ file: 'src/auth.ts' });
 const dependents = await idx.dependents({ file: 'src/auth.ts' });
