@@ -84,24 +84,79 @@ function expandMode(lines, defs, filePath, expandSymbols, pad) {
   return output.join('\n').trimEnd();
 }
 
+// Detect a contiguous block of import statements at the top of the file.
+// Returns { start, end, lineCount } (1-indexed) or null if block is < 3 lines.
+// Blank lines and leading non-import lines (e.g. "use client") are skipped over.
+function detectImportBlock(lines) {
+  let braceDepth = 0;
+  let inImport = false;
+  let firstImportLine = -1; // 0-indexed
+  let lastImportLine = -1;  // 0-indexed
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed === '') continue;
+
+    if (!inImport) {
+      if (trimmed.startsWith('import ') || trimmed === 'import') {
+        if (firstImportLine === -1) firstImportLine = i;
+        braceDepth = 0;
+        for (const ch of lines[i]) {
+          if (ch === '{') braceDepth++;
+          else if (ch === '}') braceDepth--;
+        }
+        if (braceDepth > 0) {
+          inImport = true;
+        } else {
+          lastImportLine = i;
+        }
+      } else if (firstImportLine !== -1) {
+        // First non-blank, non-import line after imports began
+        break;
+      }
+      // else: pre-import line ("use client", comments) — keep scanning
+    } else {
+      for (const ch of lines[i]) {
+        if (ch === '{') braceDepth++;
+        else if (ch === '}') braceDepth--;
+      }
+      if (braceDepth <= 0) {
+        inImport = false;
+        lastImportLine = i;
+      }
+    }
+  }
+
+  if (firstImportLine === -1 || lastImportLine === -1) return null;
+  const lineCount = lastImportLine - firstImportLine + 1;
+  if (lineCount < 3) return null;
+  return { start: firstImportLine + 1, end: lastImportLine + 1, lineCount, name: null };
+}
+
 function outlineMode(lines, defs, pad, callerCounts) {
-  // Detect containers: definitions that have child definitions inside them
-  const containers = new Set();
+  // Mark definitions that are nested inside another definition.
+  // Only top-level defs get their own collapse range — nested ones are swallowed
+  // by the parent's collapse, preventing dozens of inline-callback markers.
+  const nested = new Set();
   for (const def of defs) {
     for (const other of defs) {
       if (other === def) continue;
-      if (other.lineStart > def.lineStart && other.lineEnd <= def.lineEnd) {
-        containers.add(def);
+      if (def.lineStart > other.lineStart && def.lineEnd <= other.lineEnd) {
+        nested.add(def);
         break;
       }
     }
   }
 
-  // Build collapse ranges for leaf definitions with sufficient body size
-  // Track which definition each collapse range belongs to (for annotations)
   const collapseRanges = [];
+
+  // Collapse the import block first (covers the lucide/shadcn import wall in TSX)
+  const importCollapse = detectImportBlock(lines);
+  if (importCollapse) collapseRanges.push(importCollapse);
+
+  // Collapse all top-level definitions (functions, classes, interfaces, components)
   for (const def of defs) {
-    if (containers.has(def)) continue;
+    if (nested.has(def)) continue;
     if (!def.bodyStartLine) continue;
     if (def.bodyStartLine > def.lineEnd) continue;
 
@@ -131,7 +186,7 @@ function outlineMode(lines, defs, pad, callerCounts) {
       let marker = `${' '.repeat(pad)}│ ${indent}... (${range.lineCount} lines)`;
 
       // Append caller annotation if available
-      if (callerCounts && callerCounts.has(range.name)) {
+      if (callerCounts && range.name && callerCounts.has(range.name)) {
         const count = callerCounts.get(range.name);
         const annotation = count === 1 ? '← 1 caller' : `← ${count} callers`;
         // Right-pad to align annotations
