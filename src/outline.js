@@ -133,19 +133,61 @@ function detectImportBlock(lines) {
   return { start: firstImportLine + 1, end: lastImportLine + 1, lineCount, name: null };
 }
 
-function outlineMode(lines, defs, pad, callerCounts) {
-  // Mark definitions that are nested inside another definition.
-  // Only top-level defs get their own collapse range — nested ones are swallowed
-  // by the parent's collapse, preventing dozens of inline-callback markers.
-  const nested = new Set();
+function findImmediateParents(defs) {
+  const parents = new Map();
+
   for (const def of defs) {
+    let parent = null;
+
     for (const other of defs) {
       if (other === def) continue;
-      if (def.lineStart > other.lineStart && def.lineEnd <= other.lineEnd) {
-        nested.add(def);
-        break;
+      if (def.lineStart <= other.lineStart || def.lineEnd > other.lineEnd) continue;
+
+      if (!parent) {
+        parent = other;
+        continue;
       }
+
+      const isCloserParent =
+        other.lineStart >= parent.lineStart && other.lineEnd <= parent.lineEnd;
+      if (isCloserParent) parent = other;
     }
+
+    parents.set(def, parent);
+  }
+
+  return parents;
+}
+
+function findDelegatingContainers(defs, parentMap) {
+  const propertyChildCounts = new Map();
+
+  for (const def of defs) {
+    if (def.kind !== 'property') continue;
+    const parent = parentMap.get(def);
+    if (!parent || parent.kind !== 'variable') continue;
+    propertyChildCounts.set(parent, (propertyChildCounts.get(parent) || 0) + 1);
+  }
+
+  return new Set(
+    [...propertyChildCounts.entries()]
+      .filter(([, count]) => count > 0)
+      .map(([def]) => def),
+  );
+}
+
+function outlineMode(lines, defs, pad, callerCounts) {
+  // Mark definitions that are nested inside another definition.
+  // Only defs nested inside opaque parents are swallowed.
+  // Some top-level variables are really structural containers, like exported
+  // procedure maps or routers. Those should delegate to their direct property
+  // children instead of collapsing the entire wrapper object.
+  const parentMap = findImmediateParents(defs);
+  const delegatingContainers = findDelegatingContainers(defs, parentMap);
+  const nested = new Set();
+  for (const def of defs) {
+    const parent = parentMap.get(def);
+    if (parent && !delegatingContainers.has(parent)) nested.add(def);
   }
 
   const collapseRanges = [];
@@ -157,6 +199,7 @@ function outlineMode(lines, defs, pad, callerCounts) {
   // Collapse all top-level definitions (functions, classes, interfaces, components)
   for (const def of defs) {
     if (nested.has(def)) continue;
+    if (delegatingContainers.has(def)) continue;
     if (!def.bodyStartLine) continue;
     if (def.bodyStartLine > def.lineEnd) continue;
 
