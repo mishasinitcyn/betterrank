@@ -188,6 +188,7 @@ const REF_QUERIES = {
     (call_expression function: (identifier) @ref)
     (import_specifier name: (identifier) @ref)
     (import_clause (identifier) @ref)
+    (member_expression property: (property_identifier) @prop_ref)
     (jsx_opening_element (identifier) @jsx_ref)
     (jsx_self_closing_element (identifier) @jsx_ref)
     (jsx_opening_element (member_expression (identifier) @jsx_ref))
@@ -198,6 +199,7 @@ const REF_QUERIES = {
     (call_expression function: (identifier) @ref)
     (import_specifier name: (identifier) @ref)
     (import_clause (identifier) @ref)
+    (member_expression property: (property_identifier) @prop_ref)
     (type_identifier) @ref
   `,
 
@@ -205,6 +207,7 @@ const REF_QUERIES = {
     (call_expression function: (identifier) @ref)
     (import_specifier name: (identifier) @ref)
     (import_clause (identifier) @ref)
+    (member_expression property: (property_identifier) @prop_ref)
     (type_identifier) @ref
     (jsx_opening_element (identifier) @jsx_ref)
     (jsx_self_closing_element (identifier) @jsx_ref)
@@ -287,8 +290,12 @@ const KIND_MAP = {
 };
 
 const OUTLINE_EXTRA_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
+const INDEX_EXTRA_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
 const OUTLINE_BODY_TYPES = new Set(['statement_block', 'class_body', 'object', 'array']);
 const OUTLINE_CALL_TYPES = new Set(['call_expression', 'new_expression']);
+const SEMANTIC_CONTAINER_NAME_RE = /(router|routes|handlers|actions|reducers|selectors|queries|mutations|registry|registries|map|maps|config|configs|options|endpoints|procedures)$/i;
+const NON_SEMANTIC_CONTAINER_NAME_RE = /(schema|shape|validator|payload|params?|props?|input|output|response|request|dto)$/i;
+const NON_SEMANTIC_CALLEE_NAME_RE = /^(object|array|enum|union|literal|record|tuple|pick|omit|extend|merge|intersection|partial|strictObject|looseObject)$/i;
 
 /**
  * Walk an AST subtree and count node types that reveal structural shape.
@@ -488,6 +495,111 @@ function hasMultilinePairChildren(node) {
   return false;
 }
 
+function isTopLevelVariableDeclarator(node) {
+  if (!node || node.type !== 'variable_declarator') return false;
+  const decl = node.parent;
+  if (!decl || decl.type !== 'lexical_declaration') return false;
+  const container = decl.parent;
+  return !!container && (container.type === 'program' || container.type === 'export_statement');
+}
+
+function extractDeclaratorName(node) {
+  const nameNode = node?.childForFieldName('name');
+  return nameNode?.type === 'identifier' ? nameNode.text : null;
+}
+
+function extractCalleeLeafName(node) {
+  if (!node) return null;
+
+  if (['identifier', 'property_identifier', 'private_property_identifier', 'type_identifier'].includes(node.type)) {
+    return node.text;
+  }
+
+  if (node.type === 'member_expression') {
+    const propertyNode = node.childForFieldName('property');
+    if (propertyNode) return extractCalleeLeafName(propertyNode);
+    return extractCalleeLeafName(node.namedChild(node.namedChildCount - 1));
+  }
+
+  return null;
+}
+
+function extractCallLikeCalleeName(node) {
+  if (!node || (node.type !== 'call_expression' && node.type !== 'new_expression')) return null;
+
+  const calleeNode = node.childForFieldName('function')
+    || node.childForFieldName('constructor')
+    || node.namedChild(0);
+  return extractCalleeLeafName(calleeNode);
+}
+
+function shouldIndexSemanticObjectMembers(node) {
+  if (!isTopLevelVariableDeclarator(node)) return false;
+
+  const variableName = extractDeclaratorName(node);
+  const valueNode = node.childForFieldName('value');
+  const calleeName = extractCallLikeCalleeName(valueNode);
+
+  const hasSemanticVariableName = !!variableName
+    && SEMANTIC_CONTAINER_NAME_RE.test(variableName)
+    && !NON_SEMANTIC_CONTAINER_NAME_RE.test(variableName);
+  const hasSemanticCalleeName = !!calleeName && !NON_SEMANTIC_CALLEE_NAME_RE.test(calleeName);
+
+  if (valueNode?.type === 'object') {
+    return hasSemanticVariableName;
+  }
+
+  if (valueNode?.type === 'call_expression' || valueNode?.type === 'new_expression') {
+    return hasSemanticVariableName || hasSemanticCalleeName;
+  }
+
+  return false;
+}
+
+function collectDirectPairDefinitions(node, filePath, langName) {
+  if (!node || node.type !== 'object') return [];
+
+  const definitions = [];
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child.type !== 'pair') continue;
+
+    const name = extractPairName(child);
+    if (!name) continue;
+    if (child.endPosition.row <= child.startPosition.row) continue;
+
+    definitions.push(createDefinition(name, child, filePath, langName, {
+      bodyStartLine: child.startPosition.row + 2,
+      kind: 'property',
+    }));
+  }
+
+  return definitions;
+}
+
+function collectIndexDefinitions(rootNode, filePath, langName) {
+  if (!INDEX_EXTRA_LANGUAGES.has(langName)) return [];
+
+  const definitions = [];
+
+  function visit(node) {
+    if (node.type === 'variable_declarator' && shouldIndexSemanticObjectMembers(node)) {
+      const bodyNode = findBodyNode(node);
+      if (bodyNode && bodyNode.type === 'object') {
+        definitions.push(...collectDirectPairDefinitions(bodyNode, filePath, langName));
+      }
+      return;
+    }
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+      visit(node.namedChild(i));
+    }
+  }
+
+  visit(rootNode);
+  return definitions;
+}
+
 function collectOutlineDefinitions(rootNode, filePath, langName) {
   if (!OUTLINE_EXTRA_LANGUAGES.has(langName)) return [];
 
@@ -581,6 +693,52 @@ function normalizeImportPathCapture(capture) {
   return text.replace(/^['"`]|['"`]$/g, '');
 }
 
+function createImportEntry(path, filePath, node) {
+  if (!path || !filePath || !node) return null;
+  return {
+    path,
+    file: filePath,
+    line: node.startPosition.row + 1,
+  };
+}
+
+function collectPythonImports(rootNode, filePath) {
+  const imports = [];
+
+  function push(path, node) {
+    const entry = createImportEntry(path, filePath, node);
+    if (entry) imports.push(entry);
+  }
+
+  function visit(node) {
+    if (node.type === 'import_statement') {
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child.type === 'dotted_name') {
+          push(child.text, child);
+          continue;
+        }
+        if (child.type === 'aliased_import') {
+          const moduleNode = child.namedChild(0);
+          if (moduleNode?.type === 'dotted_name') {
+            push(moduleNode.text, moduleNode);
+          }
+        }
+      }
+    } else if (node.type === 'import_from_statement') {
+      const moduleNode = node.childForFieldName('module_name');
+      if (moduleNode) push(moduleNode.text, moduleNode);
+    }
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+      visit(node.namedChild(i));
+    }
+  }
+
+  visit(rootNode);
+  return imports;
+}
+
 /**
  * Parse a single source file and extract definitions, references, and imports.
  * Returns null if the language is unsupported.
@@ -618,6 +776,8 @@ function parseFile(filePath, source, { includeOutlineDefinitions = false } = {})
     }
   }
 
+  definitions.push(...collectIndexDefinitions(tree.rootNode, filePath, langName));
+
   if (includeOutlineDefinitions) {
     definitions.push(...collectOutlineDefinitions(tree.rootNode, filePath, langName));
   }
@@ -628,11 +788,12 @@ function parseFile(filePath, source, { includeOutlineDefinitions = false } = {})
       const refQuery = new Parser.Query(lang, refQueryStr);
       for (const match of refQuery.matches(tree.rootNode)) {
         for (const capture of match.captures) {
-          if (capture.name !== 'ref' && capture.name !== 'jsx_ref') continue;
+          if (capture.name !== 'ref' && capture.name !== 'jsx_ref' && capture.name !== 'prop_ref') continue;
           const name = normalizeReferenceCapture(capture);
           if (!name) continue;
           references.push({
             name,
+            kind: capture.name === 'prop_ref' ? 'property' : 'symbol',
             file: filePath,
             line: capture.node.startPosition.row + 1,
           });
@@ -664,6 +825,10 @@ function parseFile(filePath, source, { includeOutlineDefinitions = false } = {})
     } catch (e) {
       // Degrade gracefully
     }
+  }
+
+  if (langName === 'python') {
+    imports.push(...collectPythonImports(tree.rootNode, filePath));
   }
 
   // Associate each reference with its enclosing definition (by line range).

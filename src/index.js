@@ -232,6 +232,26 @@ function paginate(arr, { offset = 0, limit } = {}) {
   return { items, total };
 }
 
+const CONTEXT_NOISE_NAMES = new Set([
+  'get', 'set', 'put', 'post', 'delete', 'head', 'patch',
+  'start', 'stop', 'run', 'main', 'init', 'setup', 'close',
+  'dict', 'list', 'str', 'int', 'bool', 'float', 'type',
+  'key', 'value', 'name', 'data', 'config', 'result', 'error',
+  'test', 'self', 'cls', 'app', 'log', 'logger',
+  'enabled', 'default', 'constructor', 'length', 'size',
+  'fetch', 'send', 'table', 'one', 'append', 'write', 'read',
+  'update', 'create', 'find', 'add', 'remove', 'index', 'map',
+  'filter', 'sort', 'join', 'split', 'trim', 'replace',
+  'push', 'pop', 'shift', 'reduce', 'keys', 'values', 'items',
+  'search', 'match', 'query', 'count', 'call', 'apply', 'bind',
+]);
+
+const CONTEXT_KIND_ORDER = { function: 0, class: 1, type: 2, property: 3, variable: 4 };
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 class CodeIndex {
   constructor(projectRoot, opts = {}) {
     this.projectRoot = projectRoot;
@@ -579,6 +599,8 @@ class CodeIndex {
       const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const callPattern = new RegExp(`(?<![a-zA-Z0-9_])${escaped}\\s*\\(`);
       const jsxPattern = new RegExp(`<\\s*${escaped}(?=[\\s>/.]|$)`);
+      const memberPattern = new RegExp(`\\.\\s*${escaped}\\b`);
+      const bracketPattern = new RegExp(`\\[\\s*['"\`]${escaped}['"\`]\\s*\\]`);
       // Fallback: import/from lines that reference the symbol
       const importPattern = new RegExp(`(?:import|from)\\s.*\\b${escaped}\\b`);
 
@@ -605,7 +627,13 @@ class CodeIndex {
             if (inDef) continue;
 
             const line = lines[i];
-            if (!callPattern.test(line) && !jsxPattern.test(line) && !importPattern.test(line)) continue;
+            if (
+              !callPattern.test(line) &&
+              !jsxPattern.test(line) &&
+              !memberPattern.test(line) &&
+              !bracketPattern.test(line) &&
+              !importPattern.test(line)
+            ) continue;
 
             const start = Math.max(0, i - context);
             const end = Math.min(lines.length - 1, i + context);
@@ -1109,55 +1137,60 @@ class CodeIndex {
     const bodyLines = lines.slice(target.lineStart - 1, target.lineEnd);
     const bodyText = bodyLines.join('\n');
 
-    // Build a set of all symbol names in the graph (for matching)
-    const allSymbols = new Map(); // name -> [{ file, kind, signature, lineStart }]
+    // Build a set of all symbol names in the graph.
+    const allSymbols = new Map(); // name -> [{ file, kind, signature, lineStart, score }]
     graph.forEachNode((node, attrs) => {
       if (attrs.type !== 'symbol') return;
       if (attrs.file === target.file && attrs.name === target.name) return; // skip self
       if (!allSymbols.has(attrs.name)) allSymbols.set(attrs.name, []);
       allSymbols.get(attrs.name).push({
+        key: node,
         file: attrs.file,
         kind: attrs.kind,
         signature: attrs.signature,
         lineStart: attrs.lineStart,
         lineEnd: attrs.lineEnd,
+        score: scoreMap.get(node) || 0,
       });
     });
 
-    // Find symbols referenced in the body
-    // Use word-boundary matching for each known symbol name
-    // Skip very common names that cause false positives
-    const NOISE_NAMES = new Set([
-      'get', 'set', 'put', 'post', 'delete', 'head', 'patch',
-      'start', 'stop', 'run', 'main', 'init', 'setup', 'close',
-      'dict', 'list', 'str', 'int', 'bool', 'float', 'type',
-      'key', 'value', 'name', 'data', 'config', 'result', 'error',
-      'test', 'self', 'cls', 'app', 'log', 'logger',
-      'enabled', 'default', 'constructor', 'length', 'size',
-      'fetch', 'send', 'table', 'one', 'append', 'write', 'read',
-      'update', 'create', 'find', 'add', 'remove', 'index', 'map',
-      'filter', 'sort', 'join', 'split', 'trim', 'replace',
-      'push', 'pop', 'shift', 'reduce', 'keys', 'values', 'items',
-      'search', 'match', 'query', 'count', 'call', 'apply', 'bind',
-    ]);
-    const usedSymbols = [];
-    const seen = new Set();
-    for (const [name, defs] of allSymbols) {
-      if (name.length < 3) continue; // skip very short names
-      if (NOISE_NAMES.has(name)) continue;
-      if (seen.has(name)) continue;
-      const pattern = new RegExp(`(?<![a-zA-Z0-9_])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-zA-Z0-9_])`);
-      if (pattern.test(bodyText)) {
-        seen.add(name);
-        // Pick the best definition (same-file first, then highest PageRank)
-        const sameFile = defs.find(d => d.file === target.file);
-        const best = sameFile || defs[0];
-        usedSymbols.push({ name, ...best });
+    for (const defs of allSymbols.values()) {
+      defs.sort((a, b) =>
+        Number(b.file === target.file) - Number(a.file === target.file)
+        || (b.score || 0) - (a.score || 0)
+        || a.file.localeCompare(b.file)
+        || a.lineStart - b.lineStart,
+      );
+    }
+
+    // Find symbols referenced in the body, preferring parser-scoped local refs.
+    const referenceNames = new Set();
+    for (const name of target.localRefs || []) {
+      if (!name || name.length < 3) continue;
+      if (CONTEXT_NOISE_NAMES.has(name)) continue;
+      if (!allSymbols.has(name)) continue;
+      referenceNames.add(name);
+    }
+
+    // Fallback for older caches or definitions without scoped refs.
+    if (referenceNames.size === 0) {
+      for (const name of allSymbols.keys()) {
+        if (name.length < 3) continue;
+        if (CONTEXT_NOISE_NAMES.has(name)) continue;
+        const pattern = new RegExp(`(?<![a-zA-Z0-9_])${escapeRegExp(name)}(?![a-zA-Z0-9_])`);
+        if (pattern.test(bodyText)) {
+          referenceNames.add(name);
+        }
       }
     }
-    // Sort: functions first, then types, then by name
-    const kindOrder = { function: 0, class: 1, type: 2, variable: 3 };
-    usedSymbols.sort((a, b) => (kindOrder[a.kind] ?? 9) - (kindOrder[b.kind] ?? 9) || a.name.localeCompare(b.name));
+
+    const usedSymbols = [];
+    for (const name of referenceNames) {
+      const defs = allSymbols.get(name);
+      if (!defs || defs.length === 0) continue;
+      usedSymbols.push({ name, ...defs[0] });
+    }
+    usedSymbols.sort((a, b) => (CONTEXT_KIND_ORDER[a.kind] ?? 9) - (CONTEXT_KIND_ORDER[b.kind] ?? 9) || a.name.localeCompare(b.name));
 
     // Resolve type annotations in the signature
     // Extract type-like tokens from the signature (capitalized words, common patterns)
@@ -1173,7 +1206,7 @@ class CodeIndex {
       const typeDefs = allSymbols.get(typeName);
       if (!typeDefs) continue;
       // Find the type definition and get its fields (expand its body)
-      const best = typeDefs.find(d => d.file === target.file) || typeDefs[0];
+      const best = typeDefs[0];
       if (best.kind === 'class' || best.kind === 'type') {
         let fields = null;
         try {

@@ -25,6 +25,13 @@ const IMPORT_RESOLVE_EXTENSIONS = [
   '.py', '.rs', '.go', '.rb', '.java',
   '.c', '.h', '.cpp', '.hpp', '.cc', '.cs', '.php',
 ];
+const FOCUS_MAX_HOPS = 2;
+const FOCUS_DISTANCE_WEIGHTS = new Map([
+  [0, 250],
+  [1, 12],
+  [2, 2.5],
+]);
+const FOCUS_DEFAULT_WEIGHT = 0.15;
 
 /**
  * Disambiguate which targets a reference should wire to.
@@ -77,6 +84,37 @@ function buildFileLookup(graph) {
   return fileLookup;
 }
 
+function isPythonFile(filePath) {
+  return normalizeFilePath(filePath).endsWith('.py');
+}
+
+function resolvePythonImportBase(sourceFile, specifier) {
+  if (!isPythonFile(sourceFile)) return null;
+  if (!specifier) return null;
+
+  if (specifier.startsWith('.')) {
+    const match = specifier.match(/^(\.+)(.*)$/);
+    if (!match) return null;
+
+    const dots = match[1].length;
+    let baseDir = posix.dirname(sourceFile);
+    for (let i = 1; i < dots; i++) {
+      baseDir = posix.dirname(baseDir);
+    }
+
+    const remainder = match[2].replace(/^\./, '');
+    if (!remainder) return baseDir;
+
+    return posix.normalize(posix.join(baseDir, remainder.replace(/\./g, '/')));
+  }
+
+  if (/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(specifier)) {
+    return specifier.replace(/\./g, '/');
+  }
+
+  return null;
+}
+
 function resolveImportBase(sourceFile, specifier) {
   const normalizedSource = normalizeFilePath(sourceFile);
   const normalizedSpecifier = normalizeFilePath(specifier);
@@ -98,6 +136,9 @@ function resolveImportBase(sourceFile, specifier) {
     return posix.normalize(normalizedSpecifier);
   }
 
+  const pythonBase = resolvePythonImportBase(normalizedSource, normalizedSpecifier);
+  if (pythonBase) return pythonBase;
+
   return null;
 }
 
@@ -114,8 +155,11 @@ function resolveImportTargetFile(sourceFile, specifier, fileLookup) {
     for (const ext of IMPORT_RESOLVE_EXTENSIONS) {
       candidates.push(`${importBase}${ext}`);
     }
+    const packageEntryNames = isPythonFile(sourceFile) ? ['__init__'] : ['index'];
     for (const ext of IMPORT_RESOLVE_EXTENSIONS) {
-      candidates.push(posix.join(importBase, `index${ext}`));
+      for (const entryName of packageEntryNames) {
+        candidates.push(posix.join(importBase, `${entryName}${ext}`));
+      }
     }
   }
 
@@ -133,7 +177,14 @@ function wireSymbolReferences(records, graph, defIndex, addedRefs, addedImports)
       const targets = defIndex.get(ref.name);
       if (!targets) continue;
 
-      const resolvedTargets = disambiguateTargets(targets, file, graph);
+      const filteredTargets = ref.kind === 'property'
+        ? targets.filter(target => {
+          try { return graph.getNodeAttribute(target, 'kind') === 'property'; } catch { return false; }
+        })
+        : targets;
+      if (filteredTargets.length === 0) continue;
+
+      const resolvedTargets = disambiguateTargets(filteredTargets, file, graph);
 
       for (const target of resolvedTargets) {
         const targetFile = graph.getNodeAttribute(target, 'file');
@@ -222,6 +273,10 @@ function updateGraphFiles(graph, removedFiles, newSymbols) {
       continue;
     }
 
+    if (!graph.hasNode(filePath)) {
+      continue;
+    }
+
     const outgoingEdges = [];
     graph.forEachOutEdge(filePath, edge => {
       outgoingEdges.push(edge);
@@ -263,6 +318,56 @@ function removeFileNodes(graph, filePath) {
   }
 }
 
+function buildFocusDistanceMap(graph, focusFiles, maxHops = FOCUS_MAX_HOPS) {
+  const distances = new Map();
+  const queue = [];
+
+  for (const file of focusFiles) {
+    if (!graph.hasNode(file)) continue;
+    const attrs = graph.getNodeAttributes(file);
+    if (attrs.type !== 'file') continue;
+    distances.set(file, 0);
+    queue.push(file);
+  }
+
+  for (let i = 0; i < queue.length; i++) {
+    const current = queue[i];
+    const currentDistance = distances.get(current);
+    if (currentDistance >= maxHops) continue;
+
+    const visitNeighbor = neighbor => {
+      if (!graph.hasNode(neighbor)) return;
+      const neighborAttrs = graph.getNodeAttributes(neighbor);
+      if (neighborAttrs.type !== 'file') return;
+
+      const nextDistance = currentDistance + 1;
+      const existing = distances.get(neighbor);
+      if (existing !== undefined && existing <= nextDistance) return;
+      distances.set(neighbor, nextDistance);
+      queue.push(neighbor);
+    };
+
+    graph.forEachOutEdge(current, (_edge, attrs, _source, target) => {
+      if (attrs.type !== 'IMPORTS') return;
+      visitNeighbor(target);
+    });
+
+    graph.forEachInEdge(current, (_edge, attrs, source) => {
+      if (attrs.type !== 'IMPORTS') return;
+      visitNeighbor(source);
+    });
+  }
+
+  return distances;
+}
+
+function getFocusWeight(filePath, focusDistances) {
+  if (!focusDistances || focusDistances.size === 0) return 1.0;
+  const distance = focusDistances.get(filePath);
+  if (distance === undefined) return FOCUS_DEFAULT_WEIGHT;
+  return FOCUS_DISTANCE_WEIGHTS.get(distance) || FOCUS_DEFAULT_WEIGHT;
+}
+
 // Path-tier dampening: files outside core source directories get their
 // PageRank scores multiplied by a fraction. This prevents scripts, tests,
 // and temp files from dominating the map output over actual source code.
@@ -298,6 +403,7 @@ function rankedSymbols(graph, focusFiles = [], pathTiers = DEFAULT_PATH_TIERS) {
   if (graph.order === 0) return [];
 
   const g = graph.copy();
+  const focusDistances = focusFiles.length > 0 ? buildFocusDistanceMap(graph, focusFiles) : null;
 
   if (focusFiles.length > 0) {
     g.mergeNode('__focus__', { type: 'virtual' });
@@ -329,7 +435,7 @@ function rankedSymbols(graph, focusFiles = [], pathTiers = DEFAULT_PATH_TIERS) {
     .map(([key, score]) => {
       try {
         const file = graph.getNodeAttribute(key, 'file');
-        return [key, score * getPathWeight(file, pathTiers)];
+        return [key, score * getPathWeight(file, pathTiers) * getFocusWeight(file, focusDistances)];
       } catch {
         return [key, score];
       }
