@@ -3,7 +3,7 @@ const { MultiDirectedGraph } = graphology;
 import pagerankModule from 'graphology-metrics/centrality/pagerank.js';
 const pagerank = pagerankModule.default || pagerankModule;
 import { writeFile, readFile, mkdir } from 'fs/promises';
-import { dirname } from 'path';
+import { dirname, posix } from 'path';
 
 /**
  * Build a multi-directed graph from parsed symbol data.
@@ -20,6 +20,11 @@ import { dirname } from 'path';
 // Names with more definitions than this (main, run, get, close, etc.) are
 // too ambiguous to provide useful structural signal.
 const AMBIGUITY_CAP = 5;
+const IMPORT_RESOLVE_EXTENSIONS = [
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.rs', '.go', '.rb', '.java',
+  '.c', '.h', '.cpp', '.hpp', '.cc', '.cs', '.php',
+];
 
 /**
  * Disambiguate which targets a reference should wire to.
@@ -45,50 +50,89 @@ function disambiguateTargets(targets, sourceFile, graph) {
   return targets;
 }
 
-function buildGraph(allSymbols) {
-  const graph = new MultiDirectedGraph({ allowSelfLoops: false });
+function normalizeFilePath(filePath) {
+  return filePath.replace(/\\/g, '/');
+}
 
-  for (const { file, definitions } of allSymbols) {
-    graph.mergeNode(file, { type: 'file', symbolCount: definitions.length });
-
-    for (const def of definitions) {
-      const symbolKey = `${file}::${def.name}`;
-      graph.mergeNode(symbolKey, {
-        type: 'symbol',
-        kind: def.kind,
-        name: def.name,
-        file,
-        lineStart: def.lineStart,
-        lineEnd: def.lineEnd,
-        signature: def.signature,
-        astProfile: def.astProfile || null,
-        paramNames: def.paramNames || null,
-        localRefs: def.localRefs || null,
-      });
-      graph.addEdge(file, symbolKey, { type: 'DEFINES' });
-    }
-  }
-
-  // Build a name→symbolKey index for wiring references
+function buildDefinitionIndex(graph) {
   const defIndex = new Map();
-  for (const { file, definitions } of allSymbols) {
-    for (const def of definitions) {
-      const key = `${file}::${def.name}`;
-      if (!defIndex.has(def.name)) defIndex.set(def.name, []);
-      defIndex.get(def.name).push(key);
+
+  graph.forEachNode((node, attrs) => {
+    if (attrs.type !== 'symbol') return;
+    if (!defIndex.has(attrs.name)) defIndex.set(attrs.name, []);
+    defIndex.get(attrs.name).push(node);
+  });
+
+  return defIndex;
+}
+
+function buildFileLookup(graph) {
+  const fileLookup = new Map();
+
+  graph.forEachNode((node, attrs) => {
+    if (attrs.type !== 'file') return;
+    fileLookup.set(normalizeFilePath(node), node);
+  });
+
+  return fileLookup;
+}
+
+function resolveImportBase(sourceFile, specifier) {
+  const normalizedSource = normalizeFilePath(sourceFile);
+  const normalizedSpecifier = normalizeFilePath(specifier);
+  if (!normalizedSpecifier || normalizedSpecifier.startsWith('node:')) return null;
+
+  if (normalizedSpecifier.startsWith('.')) {
+    return posix.normalize(posix.join(posix.dirname(normalizedSource), normalizedSpecifier));
+  }
+
+  if (normalizedSpecifier.startsWith('~/') || normalizedSpecifier.startsWith('@/')) {
+    return posix.normalize(posix.join('src', normalizedSpecifier.slice(2)));
+  }
+
+  if (normalizedSpecifier.startsWith('/')) {
+    return posix.normalize(normalizedSpecifier.slice(1));
+  }
+
+  if (normalizedSpecifier.startsWith('src/')) {
+    return posix.normalize(normalizedSpecifier);
+  }
+
+  return null;
+}
+
+function hasExplicitImportExtension(filePath) {
+  return IMPORT_RESOLVE_EXTENSIONS.some(ext => filePath.endsWith(ext));
+}
+
+function resolveImportTargetFile(sourceFile, specifier, fileLookup) {
+  const importBase = resolveImportBase(sourceFile, specifier);
+  if (!importBase) return null;
+
+  const candidates = [importBase];
+  if (!hasExplicitImportExtension(importBase)) {
+    for (const ext of IMPORT_RESOLVE_EXTENSIONS) {
+      candidates.push(`${importBase}${ext}`);
+    }
+    for (const ext of IMPORT_RESOLVE_EXTENSIONS) {
+      candidates.push(posix.join(importBase, `index${ext}`));
     }
   }
 
-  // Dedup: one REFERENCES edge and one IMPORTS edge per unique (source, target) pair
-  const addedRefs = new Set();
-  const addedImports = new Set();
+  for (const candidate of candidates) {
+    const resolved = fileLookup.get(normalizeFilePath(candidate));
+    if (resolved) return resolved;
+  }
 
-  for (const { file, references } of allSymbols) {
+  return null;
+}
+
+function wireSymbolReferences(records, graph, defIndex, addedRefs, addedImports) {
+  for (const { file, references } of records) {
     for (const ref of references) {
       const targets = defIndex.get(ref.name);
       if (!targets) continue;
 
-      // Disambiguate: resolve which targets to actually wire
       const resolvedTargets = disambiguateTargets(targets, file, graph);
 
       for (const target of resolvedTargets) {
@@ -110,6 +154,56 @@ function buildGraph(allSymbols) {
       }
     }
   }
+}
+
+function wireExplicitImportEdges(records, graph, fileLookup, addedImports) {
+  for (const { file, imports = [] } of records) {
+    for (const entry of imports) {
+      const targetFile = resolveImportTargetFile(file, entry.path, fileLookup);
+      if (!targetFile || targetFile === file) continue;
+
+      const impKey = `${file}\0${targetFile}`;
+      if (addedImports.has(impKey)) continue;
+
+      addedImports.add(impKey);
+      graph.addEdge(file, targetFile, { type: 'IMPORTS' });
+    }
+  }
+}
+
+function mergeDefinitions(graph, records) {
+  for (const { file, definitions } of records) {
+    graph.mergeNode(file, { type: 'file', symbolCount: definitions.length });
+
+    for (const def of definitions) {
+      const symbolKey = `${file}::${def.name}`;
+      graph.mergeNode(symbolKey, {
+        type: 'symbol',
+        kind: def.kind,
+        name: def.name,
+        file,
+        lineStart: def.lineStart,
+        lineEnd: def.lineEnd,
+        signature: def.signature,
+        astProfile: def.astProfile || null,
+        paramNames: def.paramNames || null,
+        localRefs: def.localRefs || null,
+      });
+      graph.addEdge(file, symbolKey, { type: 'DEFINES' });
+    }
+  }
+}
+
+function buildGraph(allSymbols) {
+  const graph = new MultiDirectedGraph({ allowSelfLoops: false });
+  mergeDefinitions(graph, allSymbols);
+  const defIndex = buildDefinitionIndex(graph);
+
+  // Dedup: one REFERENCES edge and one IMPORTS edge per unique (source, target) pair
+  const addedRefs = new Set();
+  const addedImports = new Set();
+  wireSymbolReferences(allSymbols, graph, defIndex, addedRefs, addedImports);
+  wireExplicitImportEdges(allSymbols, graph, buildFileLookup(graph), addedImports);
 
   return graph;
 }
@@ -119,73 +213,42 @@ function buildGraph(allSymbols) {
  * then re-add from fresh parse results.
  */
 function updateGraphFiles(graph, removedFiles, newSymbols) {
+  const changedFiles = new Map(newSymbols.map(record => [record.file, record]));
+
   for (const filePath of removedFiles) {
-    removeFileNodes(graph, filePath);
+    const nextRecord = changedFiles.get(filePath);
+    if (!nextRecord) {
+      removeFileNodes(graph, filePath);
+      continue;
+    }
+
+    const outgoingEdges = [];
+    graph.forEachOutEdge(filePath, edge => {
+      outgoingEdges.push(edge);
+    });
+    for (const edge of outgoingEdges) {
+      graph.dropEdge(edge);
+    }
+
+    const nextNames = new Set(nextRecord.definitions.map(def => def.name));
+    const staleNodes = [];
+    graph.forEachNode((node, attrs) => {
+      if (attrs.type !== 'symbol' || attrs.file !== filePath) return;
+      if (!nextNames.has(attrs.name)) staleNodes.push(node);
+    });
+    for (const node of staleNodes) {
+      graph.dropNode(node);
+    }
   }
 
-  // Re-add from newSymbols using the same logic as buildGraph,
-  // but operating on the existing graph.
-  const defIndex = new Map();
+  mergeDefinitions(graph, newSymbols);
 
-  // Rebuild defIndex from the entire graph (existing + new)
-  graph.forEachNode((node, attrs) => {
-    if (attrs.type === 'symbol') {
-      if (!defIndex.has(attrs.name)) defIndex.set(attrs.name, []);
-      defIndex.get(attrs.name).push(node);
-    }
-  });
-
+  const defIndex = buildDefinitionIndex(graph);
+  const fileLookup = buildFileLookup(graph);
   const addedRefs = new Set();
   const addedImports = new Set();
-
-  for (const { file, definitions, references } of newSymbols) {
-    graph.mergeNode(file, { type: 'file', symbolCount: definitions.length });
-
-    for (const def of definitions) {
-      const symbolKey = `${file}::${def.name}`;
-      graph.mergeNode(symbolKey, {
-        type: 'symbol',
-        kind: def.kind,
-        name: def.name,
-        file,
-        lineStart: def.lineStart,
-        lineEnd: def.lineEnd,
-        signature: def.signature,
-        astProfile: def.astProfile || null,
-        paramNames: def.paramNames || null,
-        localRefs: def.localRefs || null,
-      });
-      graph.addEdge(file, symbolKey, { type: 'DEFINES' });
-
-      if (!defIndex.has(def.name)) defIndex.set(def.name, []);
-      defIndex.get(def.name).push(symbolKey);
-    }
-
-    for (const ref of references) {
-      const targets = defIndex.get(ref.name);
-      if (!targets) continue;
-
-      const resolvedTargets = disambiguateTargets(targets, file, graph);
-
-      for (const target of resolvedTargets) {
-        const targetFile = graph.getNodeAttribute(target, 'file');
-
-        const refKey = `${file}\0${target}`;
-        if (!addedRefs.has(refKey)) {
-          addedRefs.add(refKey);
-          graph.addEdge(file, target, { type: 'REFERENCES' });
-        }
-
-        if (targetFile !== file) {
-          const impKey = `${file}\0${targetFile}`;
-          if (!addedImports.has(impKey)) {
-            addedImports.add(impKey);
-            graph.addEdge(file, targetFile, { type: 'IMPORTS' });
-          }
-        }
-      }
-    }
-  }
+  wireSymbolReferences(newSymbols, graph, defIndex, addedRefs, addedImports);
+  wireExplicitImportEdges(newSymbols, graph, fileLookup, addedImports);
 }
 
 function removeFileNodes(graph, filePath) {

@@ -578,6 +578,7 @@ class CodeIndex {
       // Match call sites: symbol followed by ( — avoids string literals and definitions
       const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const callPattern = new RegExp(`(?<![a-zA-Z0-9_])${escaped}\\s*\\(`);
+      const jsxPattern = new RegExp(`<\\s*${escaped}(?=[\\s>/.]|$)`);
       // Fallback: import/from lines that reference the symbol
       const importPattern = new RegExp(`(?:import|from)\\s.*\\b${escaped}\\b`);
 
@@ -604,7 +605,7 @@ class CodeIndex {
             if (inDef) continue;
 
             const line = lines[i];
-            if (!callPattern.test(line) && !importPattern.test(line)) continue;
+            if (!callPattern.test(line) && !jsxPattern.test(line) && !importPattern.test(line)) continue;
 
             const start = Math.max(0, i - context);
             const end = Math.min(lines.length - 1, i + context);

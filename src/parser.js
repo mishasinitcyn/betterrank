@@ -82,6 +82,11 @@ const DEF_QUERIES = {
     (export_statement declaration: (function_declaration name: (identifier) @name) @definition)
     (export_statement declaration: (class_declaration name: (identifier) @name) @definition)
     (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (call_expression) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (new_expression) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (object) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (array) @_val)) @definition)
   `,
 
   typescript: `
@@ -95,6 +100,11 @@ const DEF_QUERIES = {
     (export_statement declaration: (function_declaration name: (identifier) @name) @definition)
     (export_statement declaration: (class_declaration name: (type_identifier) @name) @definition)
     (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (call_expression) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (new_expression) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (object) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (array) @_val)) @definition)
     (export_statement declaration: (interface_declaration name: (type_identifier) @name) @definition)
     (export_statement declaration: (type_alias_declaration name: (type_identifier) @name) @definition)
     (export_statement declaration: (enum_declaration name: (identifier) @name) @definition)
@@ -178,6 +188,10 @@ const REF_QUERIES = {
     (call_expression function: (identifier) @ref)
     (import_specifier name: (identifier) @ref)
     (import_clause (identifier) @ref)
+    (jsx_opening_element (identifier) @jsx_ref)
+    (jsx_self_closing_element (identifier) @jsx_ref)
+    (jsx_opening_element (member_expression (identifier) @jsx_ref))
+    (jsx_self_closing_element (member_expression (identifier) @jsx_ref))
   `,
 
   typescript: `
@@ -185,6 +199,17 @@ const REF_QUERIES = {
     (import_specifier name: (identifier) @ref)
     (import_clause (identifier) @ref)
     (type_identifier) @ref
+  `,
+
+  tsx: `
+    (call_expression function: (identifier) @ref)
+    (import_specifier name: (identifier) @ref)
+    (import_clause (identifier) @ref)
+    (type_identifier) @ref
+    (jsx_opening_element (identifier) @jsx_ref)
+    (jsx_self_closing_element (identifier) @jsx_ref)
+    (jsx_opening_element (member_expression (identifier) @jsx_ref))
+    (jsx_self_closing_element (member_expression (identifier) @jsx_ref))
   `,
 
   python: `
@@ -213,7 +238,21 @@ const REF_QUERIES = {
   `,
 };
 
-REF_QUERIES.tsx = REF_QUERIES.typescript;
+const IMPORT_QUERIES = {
+  javascript: `
+    (import_statement source: (string) @import_path)
+    (export_statement source: (string) @import_path)
+    (call_expression function: (identifier) @require_fn arguments: (arguments (string) @import_path))
+  `,
+
+  typescript: `
+    (import_statement source: (string) @import_path)
+    (export_statement source: (string) @import_path)
+    (call_expression function: (identifier) @require_fn arguments: (arguments (string) @import_path))
+  `,
+};
+
+IMPORT_QUERIES.tsx = IMPORT_QUERIES.typescript;
 
 const KIND_MAP = {
   function_declaration: 'function',
@@ -522,8 +561,28 @@ function extractSignature(node, langName) {
   return sig.length > 200 ? sig.substring(0, 200) + '...' : sig;
 }
 
+function normalizeReferenceCapture(capture) {
+  if (!capture) return null;
+  const text = capture.node.text;
+  if (!text) return null;
+
+  if (capture.name === 'jsx_ref') {
+    return /^[A-Z]/.test(text) ? text : null;
+  }
+
+  return text;
+}
+
+function normalizeImportPathCapture(capture) {
+  if (!capture) return null;
+  const text = capture.node.text;
+  if (!text) return null;
+
+  return text.replace(/^['"`]|['"`]$/g, '');
+}
+
 /**
- * Parse a single source file and extract definitions + references.
+ * Parse a single source file and extract definitions, references, and imports.
  * Returns null if the language is unsupported.
  */
 function parseFile(filePath, source, { includeOutlineDefinitions = false } = {}) {
@@ -540,6 +599,7 @@ function parseFile(filePath, source, { includeOutlineDefinitions = false } = {})
 
   const definitions = [];
   const references = [];
+  const imports = [];
 
   const defQueryStr = DEF_QUERIES[langName] || null;
   if (defQueryStr) {
@@ -567,12 +627,38 @@ function parseFile(filePath, source, { includeOutlineDefinitions = false } = {})
     try {
       const refQuery = new Parser.Query(lang, refQueryStr);
       for (const match of refQuery.matches(tree.rootNode)) {
-        const refCapture = match.captures.find(c => c.name === 'ref');
-        if (!refCapture) continue;
-        references.push({
-          name: refCapture.node.text,
+        for (const capture of match.captures) {
+          if (capture.name !== 'ref' && capture.name !== 'jsx_ref') continue;
+          const name = normalizeReferenceCapture(capture);
+          if (!name) continue;
+          references.push({
+            name,
+            file: filePath,
+            line: capture.node.startPosition.row + 1,
+          });
+        }
+      }
+    } catch (e) {
+      // Degrade gracefully
+    }
+  }
+
+  const importQueryStr = IMPORT_QUERIES[langName] || null;
+  if (importQueryStr) {
+    try {
+      const importQuery = new Parser.Query(lang, importQueryStr);
+      for (const match of importQuery.matches(tree.rootNode)) {
+        const requireCapture = match.captures.find(c => c.name === 'require_fn');
+        if (requireCapture && requireCapture.node.text !== 'require') continue;
+
+        const pathCapture = match.captures.find(c => c.name === 'import_path');
+        const path = normalizeImportPathCapture(pathCapture);
+        if (!path) continue;
+
+        imports.push({
+          path,
           file: filePath,
-          line: refCapture.node.startPosition.row + 1,
+          line: pathCapture.node.startPosition.row + 1,
         });
       }
     } catch (e) {
@@ -601,7 +687,7 @@ function parseFile(filePath, source, { includeOutlineDefinitions = false } = {})
 
   // No tree.delete()/parser.delete() needed — native GC handles cleanup
 
-  return { file: filePath, definitions, references };
+  return { file: filePath, definitions, references, imports };
 }
 
 export { parseFile, buildAstProfile, extractParamNames, SUPPORTED_EXTENSIONS, LANG_MAP };

@@ -130,6 +130,7 @@ class CodeIndexCache {
     this.graph = null;
     this.mtimes = new Map();
     this.initialized = false;
+    this.skipCacheLoadOnce = false;
     this.extensions = opts.extensions || SUPPORTED_EXTENSIONS;
     this.ignorePatterns = [...IGNORE_PATTERNS, ...(opts.ignore || [])];
   }
@@ -142,11 +143,14 @@ class CodeIndexCache {
     if (!this.initialized) {
       await this._loadConfig();
 
-      const cached = await loadGraph(this.cachePath);
-      if (cached) {
-        this.graph = cached.graph;
-        this.mtimes = cached.mtimes;
+      if (!this.skipCacheLoadOnce) {
+        const cached = await loadGraph(this.cachePath);
+        if (cached) {
+          this.graph = cached.graph;
+          this.mtimes = cached.mtimes;
+        }
       }
+      this.skipCacheLoadOnce = false;
       this.initialized = true;
     }
 
@@ -179,7 +183,11 @@ class CodeIndexCache {
       updateGraphFiles(this.graph, allRemoved, newSymbols);
     }
 
-    await saveGraph(this.graph, this.mtimes, this.cachePath);
+    try {
+      await saveGraph(this.graph, this.mtimes, this.cachePath);
+    } catch {
+      // Cache persistence is best-effort. Keep the in-memory graph usable.
+    }
 
     if (isColdStart) {
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
@@ -218,6 +226,7 @@ class CodeIndexCache {
     this.graph = null;
     this.mtimes = new Map();
     this.initialized = false;
+    this.skipCacheLoadOnce = true;
 
     // Delete the cache file
     try {
