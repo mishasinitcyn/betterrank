@@ -244,7 +244,12 @@ const KIND_MAP = {
   variable_declarator: 'variable',
   namespace_definition: 'namespace',
   decorated_definition: 'function',
+  pair: 'property',
 };
+
+const OUTLINE_EXTRA_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
+const OUTLINE_BODY_TYPES = new Set(['statement_block', 'class_body', 'object', 'array']);
+const OUTLINE_CALL_TYPES = new Set(['call_expression', 'new_expression']);
 
 /**
  * Walk an AST subtree and count node types that reveal structural shape.
@@ -343,20 +348,144 @@ function extractParamNames(node) {
  * Find the body/block node of a definition, drilling into wrappers like
  * lexical_declaration → variable_declarator → arrow_function → body.
  */
-function findBodyNode(node) {
-  let body = node.childForFieldName('body');
-  if (body) return body;
+function findCallArgumentBody(node, depth) {
+  if (!node) return null;
+  let fallback = null;
 
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
-    body = child.childForFieldName('body');
-    if (body) return body;
-    for (let j = 0; j < child.namedChildCount; j++) {
-      body = child.namedChild(j).childForFieldName('body');
-      if (body) return body;
+    const body = findBodyNode(child, depth + 1);
+    if (!body) continue;
+    if (body.type === 'statement_block' || body.type === 'class_body') {
+      return body;
+    }
+    if (!fallback) fallback = body;
+  }
+
+  return fallback;
+}
+
+function findBodyNode(node, depth = 0) {
+  if (!node || depth > 12) return null;
+  if (OUTLINE_BODY_TYPES.has(node.type)) return node;
+
+  const body = node.childForFieldName('body');
+  if (body) {
+    const nestedBody = findBodyNode(body, depth + 1);
+    return nestedBody || body;
+  }
+
+  if (OUTLINE_CALL_TYPES.has(node.type)) {
+    const argBody = findCallArgumentBody(node.childForFieldName('arguments'), depth);
+    if (argBody) return argBody;
+  }
+
+  for (const fieldName of ['value', 'expression', 'argument']) {
+    const child = node.childForFieldName(fieldName);
+    if (!child) continue;
+    const nestedBody = findBodyNode(child, depth + 1);
+    if (nestedBody) return nestedBody;
+  }
+
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const nestedBody = findBodyNode(node.namedChild(i), depth + 1);
+    if (nestedBody) return nestedBody;
+  }
+
+  return null;
+}
+
+function computeBodyStartLine(node, bodyNode) {
+  if (!bodyNode) return null;
+
+  const bodyRow = bodyNode.startPosition.row;
+  const defRow = node.startPosition.row;
+  return bodyRow === defRow ? bodyRow + 2 : bodyRow + 1;
+}
+
+function createDefinition(name, node, filePath, langName, { bodyStartLine = null, kind } = {}) {
+  const bodyNode = bodyStartLine == null ? findBodyNode(node) : null;
+  const resolvedBodyStartLine = bodyStartLine ?? computeBodyStartLine(node, bodyNode);
+  const profileNode = bodyNode || node;
+
+  return {
+    name,
+    kind: kind || nodeKind(node.type),
+    file: filePath,
+    lineStart: node.startPosition.row + 1,
+    lineEnd: node.endPosition.row + 1,
+    signature: extractSignature(node, langName),
+    bodyStartLine: resolvedBodyStartLine,
+    astProfile: buildAstProfile(profileNode),
+    paramNames: extractParamNames(node),
+  };
+}
+
+function extractPairName(node) {
+  const keyNode = node.childForFieldName('key') || node.namedChild(0);
+  if (!keyNode) return null;
+
+  if (['property_identifier', 'identifier', 'private_property_identifier', 'number'].includes(keyNode.type)) {
+    return keyNode.text;
+  }
+
+  if (keyNode.type === 'string') {
+    return keyNode.text.replace(/^['"`]|['"`]$/g, '');
+  }
+
+  return null;
+}
+
+function hasMultilinePairChildren(node) {
+  if (!node || node.type !== 'object') return false;
+
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child.type !== 'pair') continue;
+    if (!extractPairName(child)) continue;
+    if (child.endPosition.row > child.startPosition.row) return true;
+  }
+
+  return false;
+}
+
+function collectOutlineDefinitions(rootNode, filePath, langName) {
+  if (!OUTLINE_EXTRA_LANGUAGES.has(langName)) return [];
+
+  const definitions = [];
+
+  function visit(node) {
+    if (node.type === 'pair') {
+      const name = extractPairName(node);
+      if (name && node.endPosition.row > node.startPosition.row) {
+        definitions.push(createDefinition(name, node, filePath, langName, {
+          bodyStartLine: node.startPosition.row + 2,
+          kind: 'property',
+        }));
+      }
+    } else if (node.type === 'variable_declarator') {
+      const nameNode = node.childForFieldName('name');
+      const bodyNode = findBodyNode(node);
+      if (
+        nameNode &&
+        nameNode.type === 'identifier' &&
+        node.endPosition.row > node.startPosition.row &&
+        !(bodyNode && bodyNode.type === 'object' && hasMultilinePairChildren(bodyNode))
+      ) {
+        definitions.push(createDefinition(nameNode.text, node, filePath, langName, {
+          bodyStartLine: node.startPosition.row + 2,
+          kind: 'variable',
+        }));
+      }
+    }
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+      visit(node.namedChild(i));
     }
   }
-  return null;
+
+  visit(rootNode);
+  return definitions;
 }
 
 function nodeKind(nodeType) {
@@ -397,7 +526,7 @@ function extractSignature(node, langName) {
  * Parse a single source file and extract definitions + references.
  * Returns null if the language is unsupported.
  */
-function parseFile(filePath, source) {
+function parseFile(filePath, source, { includeOutlineDefinitions = false } = {}) {
   const dotIdx = filePath.lastIndexOf('.');
   if (dotIdx === -1) return null;
   const ext = filePath.substring(dotIdx);
@@ -422,37 +551,15 @@ function parseFile(filePath, source) {
         if (!nameCapture) continue;
         const defNode = defCapture || nameCapture;
 
-        // Compute where body content starts (for outline collapsing)
-        const bodyNode = findBodyNode(defNode.node);
-        let bodyStartLine = null;
-        if (bodyNode) {
-          const bodyRow = bodyNode.startPosition.row;    // 0-indexed
-          const defRow = defNode.node.startPosition.row; // 0-indexed
-          // If body opens on same line as def (JS: `function foo() {`),
-          // content starts on next line. Otherwise body IS the content.
-          bodyStartLine = bodyRow === defRow ? bodyRow + 2 : bodyRow + 1; // 1-indexed
-        }
-
-        // Build AST profile from function body (or whole node if no body)
-        const profileNode = bodyNode || defNode.node;
-        const astProfile = buildAstProfile(profileNode);
-        const paramNames = extractParamNames(defNode.node);
-
-        definitions.push({
-          name: nameCapture.node.text,
-          kind: nodeKind(defNode.node.type),
-          file: filePath,
-          lineStart: defNode.node.startPosition.row + 1,
-          lineEnd: defNode.node.endPosition.row + 1,
-          signature: extractSignature(defNode.node, langName),
-          bodyStartLine,
-          astProfile,
-          paramNames,
-        });
+        definitions.push(createDefinition(nameCapture.node.text, defNode.node, filePath, langName));
       }
     } catch (e) {
       // Query may fail on some grammar versions; degrade gracefully
     }
+  }
+
+  if (includeOutlineDefinitions) {
+    definitions.push(...collectOutlineDefinitions(tree.rootNode, filePath, langName));
   }
 
   const refQueryStr = REF_QUERIES[langName] || REF_QUERIES.default;

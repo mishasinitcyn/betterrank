@@ -25,7 +25,7 @@ export function buildOutline(source, filePath, expandSymbols = [], { callerCount
     return rawView(lines, pad);
   }
 
-  const parsed = parseFile(filePath, source);
+  const parsed = parseFile(filePath, source, { includeOutlineDefinitions: true });
   if (!parsed || parsed.definitions.length === 0) {
     return rawView(lines, pad);
   }
