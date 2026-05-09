@@ -51,6 +51,10 @@ function/class signatures with bodies replaced by "... (N lines)".
 With symbol names (comma-separated): shows the full source of those
 specific functions/classes with line numbers.
 
+Also works well for indexed JS/TS object members like router procedures:
+use \`outline file.ts getTeamStatistics\` instead of expanding a whole giant
+\`createTRPCRouter({ ... })\` blob.
+
 Options:
   --root <path>     Resolve file path relative to this directory
   --annotate        Show caller counts next to each function (requires --root)
@@ -67,7 +71,8 @@ Examples:
 Aider-style repo map: the most structurally important definitions ranked by PageRank.
 
 Options:
-  --focus <files>   Comma-separated files to bias ranking toward
+  --focus <files>   Comma-separated files to strongly bias ranking toward the
+                    local import neighborhood of those files
   --count           Return total symbol count only
   --offset N        Skip first N symbols
   --limit N         Max symbols to return (default: ${DEFAULT_LIMIT})
@@ -83,7 +88,7 @@ Substring search on symbol names + full signatures (param names, types, defaults
 Results ranked by PageRank (most structurally important first).
 
 Options:
-  --kind <type>    Filter: function, class, type, variable, namespace, import
+  --kind <type>    Filter: function, class, type, variable, property, namespace, import
   --count          Return match count only
   --offset N       Skip first N results
   --limit N        Max results (default: ${DEFAULT_LIMIT})
@@ -92,6 +97,7 @@ Tips:
   Use short substrings (3-5 chars) — PageRank ranking handles noise.
   "imp" finds encrypt_imp_payload, increment_impression, etc.
   Searches match against both symbol names AND full signatures (param names, types).
+  JS/TS router procedures and other indexed object members appear as [property].
 
 Examples:
   betterrank search resolve --root ./backend
@@ -115,18 +121,22 @@ Results ranked by PageRank (most structurally important first).
 
 Options:
   --file <path>    Filter to a specific file (relative to --root)
-  --kind <type>    Filter: function, class, type, variable, namespace, import
+  --kind <type>    Filter: function, class, type, variable, property, namespace, import
   --count          Return count only
   --offset N       Skip first N results
   --limit N        Max results (default: ${DEFAULT_LIMIT})
 
 Examples:
   betterrank symbols --file src/auth/handlers.ts --root ./backend
-  betterrank symbols --kind class --root . --limit 20`,
+  betterrank symbols --kind class --root . --limit 20
+  betterrank symbols --file src/server/api/routers/project.ts --kind property --root .`,
 
   callers: `betterrank callers <symbol> [--file path] [--context [N]] [--root <path>]
 
 Find all files that reference a symbol. Ranked by file-level PageRank.
+
+For React/TS apps this includes JSX render sites like <Providers /> and
+property access sites like api.project.getTeamStatistics.useQuery().
 
 Options:
   --file <path>    Disambiguate when multiple symbols share a name
@@ -142,7 +152,7 @@ Examples:
 
   context: `betterrank context <symbol> [--file path] [--root <path>]
 
-Everything you need to understand a function in one shot.
+Everything you need to understand a function or indexed property in one shot.
 
 Shows: the function's source, signatures of all functions/types it references,
 expanded type definitions from the signature, and a callers summary.
@@ -155,7 +165,8 @@ Options:
 
 Examples:
   betterrank context calculate_bid --root .
-  betterrank context Router --file src/llm.py --root .`,
+  betterrank context Router --file src/llm.py --root .
+  betterrank context getTeamStatistics --file src/server/api/routers/project.ts --root .`,
 
   history: `betterrank history <symbol> [--file path] [--patch] [--limit N] [--root <path>]
 
@@ -212,6 +223,8 @@ Examples:
 
 What this file imports / depends on. Ranked by PageRank.
 
+Resolves explicit import paths including TS/JS aliases and Python relative imports.
+
 Options:
   --count          Return count only
   --offset N       Skip first N results
@@ -223,6 +236,9 @@ Examples:
   dependents: `betterrank dependents <file> [--root <path>]
 
 What files import this file. Ranked by PageRank.
+
+Resolves explicit import paths including side-effect imports, TS/JS aliases,
+and Python relative imports.
 
 Options:
   --count          Return count only
