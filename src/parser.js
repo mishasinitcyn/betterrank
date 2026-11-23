@@ -336,6 +336,38 @@ const STDLIB_RECEIVERS = new Set([
   'hashlib', 'hmac', 'base64', 'uuid', 'urllib', 'io', 'csv', 'struct', 'random',
 ]);
 
+// Ubiquitous built-in / runtime method names that should not be cross-wired
+// via untyped `obj.method()` member access.
+const METHOD_NOISE_NAMES = new Set([
+  'constructor', 'toString', 'valueOf', 'toJSON', 'hasOwnProperty',
+  'map', 'filter', 'reduce', 'forEach', 'flat', 'flatMap', 'some', 'every',
+  'find', 'findIndex', 'includes', 'indexOf', 'lastIndexOf', 'push', 'pop',
+  'shift', 'unshift', 'slice', 'splice', 'concat', 'join', 'split', 'trim',
+  'trimStart', 'trimEnd', 'replace', 'replaceAll', 'match', 'matchAll',
+  'startsWith', 'endsWith', 'toLowerCase', 'toUpperCase', 'substring', 'substr',
+  'keys', 'values', 'entries', 'from', 'of', 'isArray', 'assign', 'freeze',
+  'then', 'catch', 'finally', 'bind', 'call', 'apply', 'resolve', 'reject',
+  'get', 'set', 'has', 'add', 'delete', 'clear', 'size', 'length', 'prototype',
+  'log', 'warn', 'error', 'info', 'debug', 'trace',
+  'json', 'text', 'blob', 'arrayBuffer', 'clone', 'headers', 'status',
+  'all', 'first', 'run', 'exec', 'test', 'sort', 'reverse', 'fill',
+  'emit', 'on', 'off', 'once', 'addEventListener', 'removeEventListener',
+  'preventDefault', 'stopPropagation', 'stringify', 'parse', 'append', 'close',
+  'open', 'start', 'stop', 'init', 'copy', 'setdefault', 'update', 'items',
+  '__init__', '__repr__', '__str__', '__eq__', '__hash__', '__len__',
+  '__iter__', '__next__', '__enter__', '__exit__', '__getitem__', '__setitem__',
+]);
+
+const RPC_TERMINAL_METHODS = new Set([
+  'useQuery', 'useMutation', 'useInfiniteQuery', 'useSuspenseQuery',
+  'useSuspenseInfiniteQuery', 'useQueries', 'useUtils', 'useSubscription',
+  'invalidate', 'fetch', 'prefetch', 'cancel', 'getData', 'setData',
+  'getInfiniteData', 'setInfiniteData', 'ensureData', 'query', 'mutate',
+  'subscribe',
+]);
+
+const RPC_ROOT_RECEIVERS = new Set(['api', 'trpc', 'rpc', 'utils']);
+
 const KIND_MAP = {
   function_declaration: 'function',
   function_definition: 'function',
@@ -488,33 +520,231 @@ function collectJsBottomExports(rootNode) {
 }
 
 /**
- * Collect JS/TS import aliases (`import { orig as local }`) so calls to `local()`
- * also resolve back to `orig`.
+ * Collect JS/TS import aliases (`import { orig as local }`), imported symbol
+ * module paths (`reviewRouter -> './review'`), namespace imports (`import * as m`),
+ * and tRPC caller bindings (`const caller = createCallerFactory(router)`).
  */
-function collectJsImportAliases(rootNode) {
-  const aliases = new Map(); // localName -> originalName
+function collectJsImportInfo(rootNode, source) {
+  const symbolAliases = new Map(); // localName -> originalName
+  const moduleAliases = new Map(); // localReceiver -> moduleSpecifier
+  const importedSymSources = new Map(); // localSymName -> moduleSpecifier
+
   for (let i = 0; i < rootNode.namedChildCount; i++) {
     const stmt = rootNode.namedChild(i);
     if (stmt.type !== 'import_statement') continue;
+    const sourceNode = stmt.childForFieldName('source');
+    const specPath = sourceNode ? sourceNode.text.replace(/^['"`]|['"`]$/g, '') : null;
+
     for (let j = 0; j < stmt.namedChildCount; j++) {
       const clause = stmt.namedChild(j);
       if (clause.type !== 'import_clause') continue;
       for (let k = 0; k < clause.namedChildCount; k++) {
-        const named = clause.namedChild(k);
-        if (named.type !== 'named_imports') continue;
-        for (let m = 0; m < named.namedChildCount; m++) {
-          const spec = named.namedChild(m);
-          if (spec.type !== 'import_specifier') continue;
-          const orig = spec.childForFieldName('name');
-          const alias = spec.childForFieldName('alias');
-          if (orig && alias && orig.text !== alias.text) {
-            aliases.set(alias.text, orig.text);
+        const ch = clause.namedChild(k);
+        if (ch.type === 'identifier' && specPath) {
+          importedSymSources.set(ch.text, specPath);
+        } else if (ch.type === 'namespace_import' && specPath) {
+          const id = ch.namedChild(0);
+          if (id?.type === 'identifier') moduleAliases.set(id.text, specPath);
+        } else if (ch.type === 'named_imports') {
+          for (let m = 0; m < ch.namedChildCount; m++) {
+            const spec = ch.namedChild(m);
+            if (spec.type !== 'import_specifier') continue;
+            const orig = spec.childForFieldName('name');
+            const alias = spec.childForFieldName('alias');
+            if (orig && alias && orig.text !== alias.text) {
+              symbolAliases.set(alias.text, orig.text);
+              if (specPath) importedSymSources.set(alias.text, specPath);
+            } else if (orig && specPath) {
+              importedSymSources.set(orig.text, specPath);
+            }
           }
         }
       }
     }
   }
-  return aliases;
+
+  // Fast pre-checked binding pass for tRPC server/test callers:
+  //   const caller = createCallerFactory(myRouter)(ctx)
+  //   const createMyCaller = createCallerFactory(myRouter); const caller = createMyCaller(ctx)
+  //   const caller = myRouter.createCaller(ctx)
+  if (importedSymSources.size > 0 && source && source.includes('createCaller')) {
+    const factoryToMod = new Map();
+    const directRe = /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:createCallerFactory\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)|([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*createCaller\s*\()/g;
+    let m;
+    while ((m = directRe.exec(source)) !== null) {
+      const varName = m[1];
+      const routerName = m[2] || m[3];
+      const modSpec = importedSymSources.get(routerName);
+      if (!modSpec) continue;
+      // Check whether this was invoked immediately `createCallerFactory(router)(ctx)` or stored as a factory
+      const after = source.slice(directRe.lastIndex, directRe.lastIndex + 40).trimStart();
+      if (m[2] && !after.startsWith('(')) {
+        factoryToMod.set(varName, modSpec);
+      } else {
+        moduleAliases.set(varName, modSpec);
+      }
+    }
+    if (factoryToMod.size > 0) {
+      const callRe = /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
+      while ((m = callRe.exec(source)) !== null) {
+        const modSpec = factoryToMod.get(m[2]);
+        if (modSpec) moduleAliases.set(m[1], modSpec);
+      }
+    }
+  }
+
+  return { symbolAliases, moduleAliases };
+}
+
+/**
+ * Determine whether a JS/TS `@prop_ref` property_identifier belongs to a chained
+ * RPC proxy expression (e.g. `api.review.getEpisode.useQuery()` or `utils.review.getEpisode`).
+ */
+function isRpcChainProp(propNode) {
+  const member = propNode?.parent;
+  if (!member || member.type !== 'member_expression') return false;
+
+  const grand = member.parent;
+  if (grand?.type === 'member_expression' && grand.childForFieldName('object') === member) {
+    const nextProp = grand.childForFieldName('property');
+    if (nextProp && RPC_TERMINAL_METHODS.has(nextProp.text)) {
+      return true;
+    }
+  }
+
+  // Check if receiver chain starts at a known RPC root (`api.x.y`, `trpc.x.y`, `utils.x.y`)
+  const obj = member.childForFieldName('object');
+  if (obj?.type === 'member_expression') {
+    let cur = obj;
+    let hops = 0;
+    while (cur && cur.type === 'member_expression' && hops < 6) {
+      cur = cur.childForFieldName('object');
+      hops++;
+    }
+    if (cur?.type === 'identifier' && RPC_ROOT_RECEIVERS.has(cur.text)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Strip comments and string literals from source in pure JS while preserving
+ * line breaks, so same-file constant reads can be detected without N-API walks
+ * or docstring/comment false positives.
+ */
+function stripCommentsAndStrings(source, isPython) {
+  let out = '';
+  const len = source.length;
+  let i = 0;
+
+  while (i < len) {
+    const ch = source[i];
+    const next = source[i + 1];
+
+    if (isPython) {
+      if (ch === '#') {
+        while (i < len && source[i] !== '\n') i++;
+        continue;
+      }
+      if ((ch === '"' || ch === "'") && source[i + 1] === ch && source[i + 2] === ch) {
+        const q = ch;
+        i += 3;
+        while (i < len) {
+          if (source[i] === '\\') { i += 2; continue; }
+          if (source[i] === '\n') out += '\n';
+          if (source[i] === q && source[i + 1] === q && source[i + 2] === q) {
+            i += 3;
+            break;
+          }
+          i++;
+        }
+        out += ' ';
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        const q = ch;
+        i++;
+        while (i < len && source[i] !== '\n') {
+          if (source[i] === '\\') { i += 2; continue; }
+          if (source[i] === q) { i++; break; }
+          i++;
+        }
+        out += ' ';
+        continue;
+      }
+      out += ch;
+      i++;
+      continue;
+    }
+
+    // JS / TS
+    if (ch === '/' && next === '/') {
+      i += 2;
+      while (i < len && source[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < len && !(source[i] === '*' && source[i + 1] === '/')) {
+        if (source[i] === '\n') out += '\n';
+        i++;
+      }
+      i += 2;
+      out += ' ';
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const q = ch;
+      i++;
+      while (i < len) {
+        if (source[i] === '\\') { i += 2; continue; }
+        if (source[i] === '\n') out += '\n';
+        if (source[i] === q) { i++; break; }
+        i++;
+      }
+      out += ' ';
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+
+  return out;
+}
+
+function collectSameFileVariableRefs(source, definitions, filePath, langName) {
+  const varDefs = definitions.filter(d => d.kind === 'variable' && d.name && d.name.length >= 2);
+  if (varDefs.length === 0) return [];
+
+  const isPy = langName === 'python';
+  const stripped = stripCommentsAndStrings(source, isPy);
+  const lines = stripped.split('\n');
+  const refs = [];
+
+  for (const def of varDefs) {
+    const escaped = def.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`);
+    for (let i = 0; i < lines.length; i++) {
+      const lineNum = i + 1;
+      if (lineNum >= def.lineStart && lineNum <= def.lineEnd) continue;
+      const line = lines[i];
+      if (!line.includes(def.name)) continue;
+      if (!isPy && /^\s*export\s*\{/.test(line)) continue;
+      if (re.test(line)) {
+        refs.push({
+          name: def.name,
+          kind: 'symbol',
+          file: filePath,
+          line: lineNum,
+        });
+        break;
+      }
+    }
+  }
+
+  return refs;
 }
 
 function extractParamNames(node) {
@@ -1096,9 +1326,9 @@ function collectLocalAstInfo(defNode) {
           refs.add(node.text);
         }
       } else if (node.type === 'property_identifier') {
-        // Only include if receiver is NOT a stdlib object
+        // Only include if receiver is NOT a stdlib object and not a generic built-in method name
         const parent = node.parent;
-        if (parent?.type === 'member_expression') {
+        if (parent?.type === 'member_expression' && !METHOD_NOISE_NAMES.has(node.text)) {
           const recv = extractCalleeLeafName(parent.childForFieldName('object'));
           if (!recv || !STDLIB_RECEIVERS.has(recv)) {
             refs.add(node.text);
@@ -1211,7 +1441,9 @@ function parseFile(
     let moduleAliases = null;
 
     if (JS_LANGS.has(langName)) {
-      symbolAliases = collectJsImportAliases(tree.rootNode);
+      const jsInfo = collectJsImportInfo(tree.rootNode, source);
+      symbolAliases = jsInfo.symbolAliases;
+      moduleAliases = jsInfo.moduleAliases;
     }
 
     if (langName === 'python') {
@@ -1262,11 +1494,13 @@ function parseFile(
             if (capture.name === 'prop_ref') {
               if (propRecv && STDLIB_RECEIVERS.has(propRecv)) continue;
               const receiverModule = moduleAliases?.get(propRecv) || null;
+              const isRpcChain = JS_LANGS.has(langName) ? isRpcChainProp(capture.node) : false;
               references.push({
                 name,
                 kind: 'property',
                 receiver: propRecv,
                 receiverModule,
+                isRpcChain,
                 file: filePath,
                 line: capture.node.startPosition.row + 1,
               });
@@ -1287,6 +1521,12 @@ function parseFile(
           }
         }
       }
+    }
+
+    // Same-file constant/variable reads (e.g. Python `set(ENABLED_CHECKS)`, TS `return CONST.has(x)`)
+    if (JS_LANGS.has(langName) || langName === 'python') {
+      const sameFileVarRefs = collectSameFileVariableRefs(source, definitions, filePath, langName);
+      if (sameFileVarRefs.length > 0) references.push(...sameFileVarRefs);
     }
 
     const importQueryStr = langName === 'python' ? null : (IMPORT_QUERIES[langName] || null);
@@ -1354,6 +1594,7 @@ export {
   extractParamNames,
   getLanguageFamily,
   STDLIB_RECEIVERS,
+  METHOD_NOISE_NAMES,
   SUPPORTED_EXTENSIONS,
   LANG_MAP,
 };

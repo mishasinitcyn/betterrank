@@ -245,7 +245,8 @@ function findImmediateParents(defs) {
 }
 
 function findDelegatingContainers(defs, parentMap, depth = 1) {
-  const childCounts = new Map();
+  const structuralContainers = new Set();
+  const deepFunctionContainers = new Set();
 
   for (const def of defs) {
     const parent = parentMap.get(def);
@@ -261,16 +262,22 @@ function findDelegatingContainers(defs, parentMap, depth = 1) {
       !parentMap.get(parent) &&
       (def.kind === 'function' || def.kind === 'variable');
 
-    if (isObjectRouterChild || isClassMemberChild || isDeepFunctionChild) {
-      childCounts.set(parent, (childCounts.get(parent) || 0) + 1);
+    if (isObjectRouterChild || isClassMemberChild) {
+      structuralContainers.add(parent);
+    } else if (isDeepFunctionChild) {
+      deepFunctionContainers.add(parent);
     }
   }
 
-  return new Set(
-    [...childCounts.entries()]
-      .filter(([, count]) => count > 0)
-      .map(([def]) => def),
-  );
+  // Structural containers (classes/routers) keep all non-child lines open;
+  // deep function containers (promoted only by `--depth 2`) collapse non-declaration
+  // body runs (e.g. giant JSX `return (...)` blocks) between inner declarations.
+  for (const c of structuralContainers) {
+    deepFunctionContainers.delete(c);
+  }
+
+  const delegatingContainers = new Set([...structuralContainers, ...deepFunctionContainers]);
+  return { delegatingContainers, deepFunctionContainers };
 }
 
 function appendAnnotation(line, count) {
@@ -282,7 +289,7 @@ function appendAnnotation(line, count) {
 
 function outlineMode(lines, defs, pad, { callerCounts, noComments = false, depth = 1, collapseImports = false, ext = '' } = {}) {
   const parentMap = findImmediateParents(defs);
-  const delegatingContainers = findDelegatingContainers(defs, parentMap, depth);
+  const { delegatingContainers, deepFunctionContainers } = findDelegatingContainers(defs, parentMap, depth);
 
   const nested = new Set();
   for (const def of defs) {
@@ -332,6 +339,42 @@ function outlineMode(lines, defs, pad, { callerCounts, noComments = false, depth
       lineCount: def.lineEnd - def.bodyStartLine + 1,
       name: def.name,
     });
+  }
+
+  // Collapse non-declaration gaps (such as large JSX return trees or imperative blocks)
+  // inside `--depth 2` expanded functions/components so only inner declaration signatures show.
+  for (const container of deepFunctionContainers) {
+    if (!container.bodyStartLine || container.bodyStartLine >= container.lineEnd) continue;
+    const directChildren = defs
+      .filter(d => !nested.has(d) && parentMap.get(d) === container)
+      .sort((a, b) => a.lineStart - b.lineStart);
+
+    let cursor = container.bodyStartLine;
+    const endLimit = container.lineEnd - 1; // keep closing `}` line visible
+
+    for (const child of directChildren) {
+      const gapEnd = child.lineStart - 1;
+      if (gapEnd >= cursor && (gapEnd - cursor + 1) >= MIN_COLLAPSE_LINES) {
+        collapseRanges.push({
+          start: cursor,
+          end: gapEnd,
+          lineCount: gapEnd - cursor + 1,
+          name: null,
+        });
+      }
+      if (child.lineEnd + 1 > cursor) {
+        cursor = child.lineEnd + 1;
+      }
+    }
+
+    if (endLimit >= cursor && (endLimit - cursor + 1) >= MIN_COLLAPSE_LINES) {
+      collapseRanges.push({
+        start: cursor,
+        end: endLimit,
+        lineCount: endLimit - cursor + 1,
+        name: null,
+      });
+    }
   }
 
   collapseRanges.sort((a, b) => a.start - b.start);

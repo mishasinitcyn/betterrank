@@ -213,17 +213,61 @@ const SKIP_META_DIRS = new Set([
   'coverage', '__pycache__', '.venv', 'venv', 'Pods', 'target', '.cache',
 ]);
 
+function stripJsonCommentsAndTrailingCommas(raw) {
+  let out = '';
+  let inStr = false;
+  let escape = false;
+  let i = 0;
+  while (i < raw.length) {
+    const ch = raw[i];
+    const next = raw[i + 1];
+    if (inStr) {
+      out += ch;
+      if (escape) {
+        escape = false;
+      } else if (ch === '\\') {
+        escape = true;
+      } else if (ch === '"') {
+        inStr = false;
+      }
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      i += 2;
+      while (i < raw.length && raw[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < raw.length && !(raw[i] === '*' && raw[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out.replace(/,\s*([}\]])/g, '$1');
+}
+
 /**
- * Discover workspace JS/TS packages (`package.json` with a `name`) and Python
- * package roots (`pyproject.toml`, `setup.py`, `setup.cfg`) up to depth 3
- * inside a root directory.
+ * Discover workspace JS/TS packages (`package.json` with a `name`), `tsconfig.json`
+ * `paths` aliases, and Python package roots (`pyproject.toml`, `setup.py`, `setup.cfg`)
+ * up to depth 3 inside a root directory.
  *
- * Used by graph.js to resolve workspace aliases like `@scope/pkg` and Python
- * package imports under single-repo or multi-repo roots.
+ * Used by graph.js to resolve workspace aliases like `@scope/pkg`, custom tsconfig
+ * paths, and Python package imports under single-repo or multi-repo roots.
  */
 export async function discoverRootMetadata(rootDir, prefix = '') {
   const workspacePackages = [];
   const pythonRoots = [];
+  const tsPathMappings = [];
   const prefixNorm = prefix ? prefix.replace(/\\/g, '/').replace(/\/+$/, '') : '';
 
   if (prefixNorm) {
@@ -241,12 +285,14 @@ export async function discoverRootMetadata(rootDir, prefix = '') {
     }
 
     let hasPackageJson = false;
+    let hasTsConfig = false;
     let hasPyProject = false;
     const subdirs = [];
 
     for (const entry of entries) {
       if (entry.isFile()) {
         if (entry.name === 'package.json') hasPackageJson = true;
+        else if (entry.name === 'tsconfig.json') hasTsConfig = true;
         else if (entry.name === 'pyproject.toml' || entry.name === 'setup.py' || entry.name === 'setup.cfg') {
           hasPyProject = true;
         }
@@ -263,7 +309,8 @@ export async function discoverRootMetadata(rootDir, prefix = '') {
       pythonRoots.push(fullRelDir);
     }
 
-    if (hasPackageJson && relDir) {
+    // Register root-level package.json too (critical for repeatable --root packages/a --root apps/b)
+    if (hasPackageJson) {
       try {
         const pkg = JSON.parse(await readFile(join(absDir, 'package.json'), 'utf-8'));
         if (pkg.name && typeof pkg.name === 'string') {
@@ -279,13 +326,32 @@ export async function discoverRootMetadata(rootDir, prefix = '') {
       }
     }
 
+    if (hasTsConfig) {
+      try {
+        const raw = await readFile(join(absDir, 'tsconfig.json'), 'utf-8');
+        const tsconfig = JSON.parse(stripJsonCommentsAndTrailingCommas(raw));
+        const paths = tsconfig?.compilerOptions?.paths;
+        if (paths && typeof paths === 'object' && Object.keys(paths).length > 0) {
+          tsPathMappings.push({
+            dir: fullRelDir,
+            baseUrl: typeof tsconfig.compilerOptions.baseUrl === 'string'
+              ? tsconfig.compilerOptions.baseUrl
+              : '.',
+            paths,
+          });
+        }
+      } catch {
+        // ignore invalid tsconfig.json
+      }
+    }
+
     if (subdirs.length > 0) {
       await Promise.all(subdirs.map(([abs, rel]) => scan(abs, rel, depth + 1)));
     }
   }
 
   await scan(rootDir, '', 0);
-  return { workspacePackages, pythonRoots };
+  return { workspacePackages, pythonRoots, tsPathMappings };
 }
 
 function isPidAlive(pid) {

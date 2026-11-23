@@ -591,7 +591,7 @@ class CodeIndex {
    * @param {boolean} [opts.count] - If true, return only { total }
    * @returns {Array<{file, sites?}>|{total: number}}
    */
-  async callers({ symbol, file, offset, limit, count = false, context = 0 }) {
+  async callers({ symbol, file, offset, limit, count = false, context = 0, noTests = false }) {
     await this._ensureReady();
     const graph = this.cache.getGraph();
     if (!graph) return count ? { total: 0 } : [];
@@ -614,6 +614,7 @@ class CodeIndex {
         if (attrs.type !== 'REFERENCES') return;
         const sourceAttrs = graph.getNodeAttributes(source);
         const callerFile = sourceAttrs.file || source;
+        if (noTests && isTestFile(callerFile)) return;
         if (!callerSet.has(callerFile)) {
           callerSet.add(callerFile);
           results.push({ file: callerFile, _score: fileScores.get(callerFile) || 0 });
@@ -635,17 +636,20 @@ class CodeIndex {
       const memberPattern = new RegExp(`\\.\\s*${escaped}\\b`);
       const bracketPattern = new RegExp(`\\[\\s*['"\`]${escaped}['"\`]\\s*\\]`);
       const importPattern = new RegExp(`(?:import|from)\\s.*\\b${escaped}\\b`);
+      const typeAnnotPattern = new RegExp(`(?::|->|\\[|,|\\|)\\s*${escaped}(?![a-zA-Z0-9_])`);
       const identPattern = new RegExp(`(?<![a-zA-Z0-9_])${escaped}(?![a-zA-Z0-9_])`);
 
       // Collect the target symbol's own definition ranges & kinds
       const defRanges = [];
       let isNonCallableTarget = false;
+      let isClassTarget = false;
       for (const tk of targetKeys) {
         try {
           const attrs = graph.getNodeAttributes(tk);
           if (attrs.type === 'symbol') {
             defRanges.push({ file: attrs.file, start: attrs.lineStart, end: attrs.lineEnd });
             if (attrs.kind === 'variable' || attrs.kind === 'type') isNonCallableTarget = true;
+            if (attrs.kind === 'class') isClassTarget = true;
           }
         } catch { /* skip */ }
       }
@@ -669,6 +673,7 @@ class CodeIndex {
               memberPattern.test(line) ||
               bracketPattern.test(line) ||
               importPattern.test(line) ||
+              (isClassTarget && typeAnnotPattern.test(line)) ||
               (isNonCallableTarget && identPattern.test(line));
             if (!matched) continue;
 
@@ -1166,23 +1171,26 @@ class CodeIndex {
       // Unparseable target — return empty usedSymbols rather than noisy regex matches
     }
 
-    const referenceNames = new Set();
+    const usedSymbolByName = new Map();
     for (const name of scopedLocalRefs) {
       if (!name || name.length < 3) continue;
       if (CONTEXT_NOISE_NAMES.has(name)) continue;
       if (localBindings.has(name)) continue;
       const defs = allSymbols.get(name);
       if (!defs || defs.length === 0) continue;
-      // Only include same-file or import-reachable definitions (or unique property/type)
-      if (defs[0].hop > 4 && defs[0].kind !== 'property') continue;
-      referenceNames.add(name);
+      // Require same-file, barrel-import reachability, or a verified graph REFERENCES edge
+      // (so plain property reads like `doc.reasonCodes` never leak unrelated router properties).
+      if (defs[0].hop <= 4) {
+        usedSymbolByName.set(name, defs[0]);
+      } else {
+        const verified = defs.find(d => graph.hasEdge(target.file, d.key));
+        if (verified) usedSymbolByName.set(name, verified);
+      }
     }
 
     const usedSymbols = [];
-    for (const name of referenceNames) {
-      const defs = allSymbols.get(name);
-      if (!defs || defs.length === 0) continue;
-      usedSymbols.push({ name, ...defs[0] });
+    for (const [name, def] of usedSymbolByName) {
+      usedSymbols.push({ name, ...def });
     }
     usedSymbols.sort((a, b) => (CONTEXT_KIND_ORDER[a.kind] ?? 9) - (CONTEXT_KIND_ORDER[b.kind] ?? 9) || a.name.localeCompare(b.name));
 
@@ -1217,15 +1225,14 @@ class CodeIndex {
       }
     }
 
-    // Get callers (external files only) — union across ALL same-name nodes
-    // to handle ambiguous graph resolution (same name in different files)
+    // Get callers (including same-file callers so `context` stays consistent with `callers`)
     const callerFiles = new Set();
     for (const c of candidates) {
       graph.forEachInEdge(c.key, (_edge, attrs, src) => {
         if (attrs.type !== 'REFERENCES') return;
         const srcAttrs = graph.getNodeAttributes(src);
         const sf = srcAttrs.file || src;
-        if (sf !== target.file) callerFiles.add(sf);
+        callerFiles.add(sf);
       });
     }
 

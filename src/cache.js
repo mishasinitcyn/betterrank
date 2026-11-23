@@ -16,6 +16,8 @@ import {
   rankedSymbols,
   saveGraph,
   loadGraph,
+  saveParseCache,
+  loadParseCache,
 } from './graph.js';
 
 function getPlatformCacheDir() {
@@ -153,7 +155,12 @@ function cachePathForRoot(projectRootOrRoots) {
     ? [...projectRootOrRoots].map(r => resolve(r)).sort()
     : [resolve(projectRootOrRoots)];
   const hash = createHash('sha256').update(list.join('\0')).digest('hex').slice(0, 12);
-  return join(CACHE_DIR, `${hash}.br.gz`);
+  return join(getPlatformCacheDir(), `${hash}.br.gz`);
+}
+
+function parseCachePathForRoot(rootPath) {
+  const hash = createHash('sha256').update(resolve(rootPath)).digest('hex').slice(0, 12);
+  return join(getPlatformCacheDir(), `${hash}.parse.br.gz`);
 }
 
 class CodeIndexCache {
@@ -161,6 +168,7 @@ class CodeIndexCache {
     this.roots = normalizeRoots(projectRootOrRoots);
     this.projectRoot = this.roots[0].path;
     this.isMultiRoot = this.roots.length > 1;
+    this._customCachePath = !!opts.cachePath;
     this.cachePath = opts.cachePath
       ? join(this.projectRoot, opts.cachePath)
       : cachePathForRoot(this.roots.map(r => r.path));
@@ -172,6 +180,13 @@ class CodeIndexCache {
     this.skipCacheLoadOnce = false;
     this.extensions = opts.extensions || SUPPORTED_EXTENSIONS;
     this.ignorePatterns = [...IGNORE_PATTERNS, ...(opts.ignore || [])];
+  }
+
+  _parseCachePathFor(rootObj) {
+    if (this._customCachePath) {
+      return `${this.cachePath}.${rootObj.prefix || 'root'}.parse.gz`;
+    }
+    return parseCachePathForRoot(rootObj.path);
   }
 
   /**
@@ -248,7 +263,7 @@ class CodeIndexCache {
         this._discoverResolverContext(),
         this._parseFiles(changed),
       ]);
-      const { parsed: newSymbols, skippedCount } = parseOut;
+      const { parsed: newSymbols, skippedCount, reusedCount } = parseOut;
 
       if (!this.graph) {
         this.graph = buildGraph(newSymbols, resolverCtx);
@@ -276,10 +291,11 @@ class CodeIndexCache {
         let symbols = 0;
         this.graph.forEachNode((_n, attrs) => { if (attrs.type === 'symbol') symbols++; });
         const skippedNote = skippedCount > 0 ? `, skipped ${skippedCount} minified/generated` : '';
-        process.stderr.write(`Indexed ${newSymbols.length} files (${symbols} symbols, ${this.graph.size} edges${skippedNote}) in ${elapsed}s\n`);
+        const cacheNote = reusedCount > 0 ? `, ${reusedCount} cached` : '';
+        process.stderr.write(`Indexed ${newSymbols.length} files (${symbols} symbols, ${this.graph.size} edges${cacheNote}${skippedNote}) in ${elapsed}s\n`);
       }
 
-      return { changed: changed.length, deleted: deleted.length, totalScanned };
+      return { changed: changed.length, deleted: deleted.length, totalScanned, reused: reusedCount };
     } finally {
       await lock.release();
     }
@@ -291,13 +307,15 @@ class CodeIndexCache {
     );
     const workspacePackages = [];
     const pythonRoots = [];
+    const tsPathMappings = [];
     for (const m of metas) {
       workspacePackages.push(...m.workspacePackages);
+      if (m.tsPathMappings) tsPathMappings.push(...m.tsPathMappings);
       for (const pr of m.pythonRoots) {
         if (!pythonRoots.includes(pr)) pythonRoots.push(pr);
       }
     }
-    return { workspacePackages, pythonRoots };
+    return { workspacePackages, pythonRoots, tsPathMappings };
   }
 
   async _loadConfig() {
@@ -320,11 +338,10 @@ class CodeIndexCache {
     this.initialized = false;
     this.skipCacheLoadOnce = true;
 
-    try {
-      await unlink(this.cachePath);
-    } catch {
-      // doesn't exist
-    }
+    await unlink(this.cachePath).catch(() => {});
+    await Promise.all(
+      this.roots.map(r => unlink(this._parseCachePathFor(r)).catch(() => {})),
+    );
 
     return this.ensure();
   }
@@ -370,41 +387,108 @@ class CodeIndexCache {
     return { changed, deleted, totalScanned };
   }
 
+  _splitRootAndRelPath(graphPath) {
+    if (!this.isMultiRoot) {
+      return { rootObj: this.roots[0], relPath: graphPath };
+    }
+    for (const r of this.roots) {
+      const pfx = `${r.prefix}/`;
+      if (graphPath.startsWith(pfx)) {
+        return { rootObj: r, relPath: graphPath.slice(pfx.length) };
+      }
+    }
+    return { rootObj: this.roots[0], relPath: graphPath };
+  }
+
   async _parseFiles(graphPaths) {
     const parsed = [];
     let skippedCount = 0;
+    let reusedCount = 0;
+
+    // Group files by owning root so each root reuses its per-root parse cache
+    // across single-root and multi-root combinations.
+    const byRoot = new Map();
+    for (const graphPath of graphPaths) {
+      const { rootObj, relPath } = this._splitRootAndRelPath(graphPath);
+      if (!byRoot.has(rootObj)) byRoot.set(rootObj, []);
+      byRoot.get(rootObj).push({ graphPath, relPath });
+    }
 
     const BATCH_SIZE = 32;
-    for (let i = 0; i < graphPaths.length; i += BATCH_SIZE) {
-      const batch = graphPaths.slice(i, i + BATCH_SIZE);
-      const sources = await Promise.all(
-        batch.map(async graphPath => {
-          try {
-            const source = await readFile(this.resolveAbsPath(graphPath), 'utf-8');
-            return { graphPath, source };
-          } catch {
-            return null;
-          }
-        }),
-      );
 
-      for (const item of sources) {
-        if (!item) continue;
-        const { graphPath, source } = item;
-        if (isMinifiedSource(source, graphPath)) {
-          skippedCount++;
-          continue;
+    for (const [rootObj, items] of byRoot) {
+      const parseCachePath = this._parseCachePathFor(rootObj);
+      const rootCache = await loadParseCache(parseCachePath);
+      const toParse = [];
+      let cacheDirty = false;
+
+      for (const { graphPath, relPath } of items) {
+        const currentMtime = this.mtimes.get(graphPath) || 0;
+        const cached = rootCache.get(relPath);
+        if (cached && cached.mtimeMs === currentMtime) {
+          reusedCount++;
+          if (cached.skipped) {
+            skippedCount++;
+          } else {
+            parsed.push({
+              file: graphPath,
+              definitions: cached.definitions.map(d => ({ ...d, file: graphPath })),
+              references: cached.references,
+              imports: cached.imports,
+            });
+          }
+        } else {
+          toParse.push({ graphPath, relPath, currentMtime });
         }
-        try {
-          const result = parseFile(graphPath, source);
-          if (result) parsed.push(result);
-        } catch {
-          // skip unparseable files
+      }
+
+      for (let i = 0; i < toParse.length; i += BATCH_SIZE) {
+        const batch = toParse.slice(i, i + BATCH_SIZE);
+        const sources = await Promise.all(
+          batch.map(async entry => {
+            try {
+              const source = await readFile(join(rootObj.path, entry.relPath), 'utf-8');
+              return { ...entry, source };
+            } catch {
+              return null;
+            }
+          }),
+        );
+
+        for (const item of sources) {
+          if (!item) continue;
+          const { graphPath, relPath, currentMtime, source } = item;
+          if (isMinifiedSource(source, graphPath)) {
+            skippedCount++;
+            rootCache.set(relPath, { mtimeMs: currentMtime, skipped: true });
+            cacheDirty = true;
+            continue;
+          }
+          try {
+            const result = parseFile(graphPath, source);
+            if (result) {
+              parsed.push(result);
+              rootCache.set(relPath, {
+                mtimeMs: currentMtime,
+                skipped: false,
+                definitions: result.definitions,
+                references: result.references,
+                imports: result.imports,
+              });
+              cacheDirty = true;
+            }
+          } catch {
+            // skip unparseable files
+          }
         }
+      }
+
+      if (cacheDirty) {
+        await saveParseCache(parseCachePath, rootCache).catch(() => {});
       }
     }
 
-    return { parsed, skippedCount };
+    return { parsed, skippedCount, reusedCount };
   }
 
   getGraph() {
@@ -420,4 +504,4 @@ class CodeIndexCache {
   }
 }
 
-export { CodeIndexCache, CACHE_DIR, cachePathForRoot };
+export { CodeIndexCache, CACHE_DIR, cachePathForRoot, parseCachePathForRoot };

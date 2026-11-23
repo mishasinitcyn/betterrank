@@ -63,13 +63,15 @@ Examples:
   betterrank outline src/giant.tsx --lines 100-220
   betterrank outline src/auth.py --annotate --root ./backend`,
 
-  map: `betterrank map [--focus file1,file2] [--root <path>]
+  map: `betterrank map [--focus file1,file2] [--include-tests] [--root <path>]
 
 Aider-style repo map: the most structurally important definitions ranked by PageRank.
+Excludes test files by default; pass --include-tests to include them.
 
 Options:
   --focus <files>   Comma-separated files to strongly bias ranking toward the
                     local import neighborhood of those files
+  --include-tests   Include test/spec files and test fixtures in the map
   --count           Return total symbol count only
   --offset N        Skip first N symbols
   --limit N         Max symbols to return (default: ${DEFAULT_LIMIT})
@@ -77,6 +79,7 @@ Options:
 Examples:
   betterrank map --root ./backend
   betterrank map --root ./frontend --limit 100
+  betterrank map --root ./backend --include-tests
   betterrank map --root ./backend --focus src/auth/handlers.ts,src/api/login.ts`,
 
   search: `betterrank search <query> [--kind type] [--root <path>]
@@ -128,7 +131,7 @@ Examples:
   betterrank symbols --kind class --root . --limit 20
   betterrank symbols --file src/server/api/routers/project.ts --kind property --root .`,
 
-  callers: `betterrank callers <symbol> [--file path] [--context [N]] [--root <path>]
+  callers: `betterrank callers <symbol> [--file path] [--context [N]] [--no-tests] [--root <path>]
 
 Find all files that reference a symbol. Ranked by file-level PageRank.
 
@@ -138,12 +141,14 @@ property access sites like api.project.getTeamStatistics.useQuery().
 Options:
   --file <path>    Disambiguate when multiple symbols share a name
   --context [N]    Show N lines of context around each call site (default: 2)
+  --no-tests       Exclude test/spec files from caller results
   --count          Return count only
   --offset N       Skip first N results
   --limit N        Max results (default: ${DEFAULT_LIMIT})
 
 Examples:
   betterrank callers authenticateUser --root ./backend
+  betterrank callers authenticateUser --root ./backend --no-tests
   betterrank callers authenticateUser --root ./backend --context
   betterrank callers resolve --file src/utils.ts --root . --context 3`,
 
@@ -488,19 +493,45 @@ async function main() {
     const roots = flags._roots && flags._roots.length > 0
       ? flags._roots.map(r => resolve(r))
       : [flags.root ? resolve(flags.root) : process.cwd()];
-    const root = roots[0];
-    const absPath = isAbsolute(filePath) ? filePath : resolve(root, filePath);
+    let matchedRoot = roots[0];
+    let absPath = isAbsolute(filePath) ? filePath : resolve(matchedRoot, filePath);
 
     let source;
-    try {
-      source = await readFile(absPath, 'utf-8');
-    } catch (err) {
+    let readErr = null;
+    const candidates = isAbsolute(filePath)
+      ? [{ abs: filePath, root: matchedRoot }]
+      : [
+          { abs: resolve(matchedRoot, filePath), root: matchedRoot },
+          // Fallback: cwd-relative path (prevents doubled paths when user passes
+          // `packages/foo/src/x.ts --root packages/foo`)
+          { abs: resolve(process.cwd(), filePath), root: matchedRoot },
+          ...roots.slice(1).map(r => ({ abs: resolve(r, filePath), root: r })),
+        ];
+
+    for (const cand of candidates) {
+      try {
+        source = await readFile(cand.abs, 'utf-8');
+        absPath = cand.abs;
+        // Pick the root containing absPath if one matches
+        const owning = roots.find(r => {
+          const rel = relative(r, absPath);
+          return !rel.startsWith('..') && !isAbsolute(rel);
+        });
+        matchedRoot = owning || cand.root;
+        readErr = null;
+        break;
+      } catch (err) {
+        if (!readErr) readErr = err;
+      }
+    }
+
+    if (source === undefined) {
       console.error(`Cannot read file: ${absPath}`);
-      console.error(err.message);
+      console.error(readErr ? readErr.message : 'File not found');
       process.exit(1);
     }
 
-    const relPath = relative(root, absPath);
+    const relPath = relative(matchedRoot, absPath);
     const { buildOutline, parseLineRange } = await import('./outline.js');
     const lineRange = flags.lines ? parseLineRange(flags.lines) : null;
     if (flags.lines && !lineRange) {
@@ -510,8 +541,12 @@ async function main() {
 
     let callerCounts;
     if (annotate) {
-      const idx = new CodeIndex(roots.length > 1 ? roots : root);
-      const graphPath = roots.length > 1 ? `${idx.roots[0].prefix}/${relPath}` : relPath;
+      const idx = new CodeIndex(roots.length > 1 ? roots : matchedRoot);
+      let graphPath = relPath;
+      if (roots.length > 1) {
+        const rootEntry = idx.roots.find(r => r.path === matchedRoot) || idx.roots[0];
+        graphPath = `${rootEntry.prefix}/${relPath}`;
+      }
       callerCounts = await idx.getCallerCounts(graphPath);
     }
 
@@ -692,7 +727,8 @@ async function main() {
       if (!symbol) { console.error('Usage: betterrank callers <symbol> [--file path]'); process.exit(1); }
       const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
       const contextLines = flags.context === true ? 2 : (flags.context ? parseInt(flags.context, 10) : 0);
-      const result = await idx.callers({ symbol, file: normalizeFilePath(flags.file), count: countMode, offset, limit: effectiveLimit, context: contextLines });
+      const noTests = flags['no-tests'] === true;
+      const result = await idx.callers({ symbol, file: normalizeFilePath(flags.file), count: countMode, offset, limit: effectiveLimit, context: contextLines, noTests });
       if (countMode) {
         console.log(`total: ${result.total}`);
       } else if (contextLines > 0) {
@@ -783,7 +819,7 @@ async function main() {
       if (result.callers.length > 0) {
         console.log(`Callers (${result.callers.length} file${result.callers.length === 1 ? '' : 's'}):`);
         for (const f of result.callers) {
-          console.log(`  ${f}`);
+          console.log(f === def.file ? `  ${f} (same file)` : `  ${f}`);
         }
       } else {
         console.log('Callers: (none detected)');
