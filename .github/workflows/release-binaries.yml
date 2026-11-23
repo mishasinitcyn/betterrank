@@ -20,11 +20,11 @@ jobs:
             target: x86_64-unknown-linux-musl
             asset: betterrank-linux-x64
             musl: true
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             asset: betterrank-darwin-arm64
             musl: false
-          - os: macos-14
+          - os: macos-latest
             target: x86_64-apple-darwin
             asset: betterrank-darwin-x64
             musl: false
