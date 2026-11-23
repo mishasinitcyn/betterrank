@@ -266,6 +266,109 @@ pub fn is_schema_or_idl_extension(rel_path: &str) -> bool {
         || lower.ends_with(".proto")
 }
 
+/// Non-config documentation and structured data/fixture files surfaced by `betterrank files`
+/// (kept separate from `is_noncode_config_file` so `.gz` archives and `.csv` dumps never pollute
+/// automatic non-code mention scans).
+pub fn is_doc_or_data_file(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    lower.ends_with(".md")
+        || lower.ends_with(".mdx")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".rst")
+        || lower.ends_with(".jsonl")
+        || lower.ends_with(".ndjson")
+        || lower.ends_with(".jsonl.gz")
+        || lower.ends_with(".json.gz")
+        || lower.ends_with(".csv")
+        || lower.ends_with(".tsv")
+}
+
+fn compile_glob_regex(pat: &str) -> Option<regex::Regex> {
+    let p = pat.trim();
+    if p.is_empty() {
+        return None;
+    }
+    let has_slash = p.contains('/');
+    let mut re_s = if has_slash {
+        String::from("^")
+    } else {
+        String::from("(^|/)")
+    };
+    let chars: Vec<char> = p.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    re_s.push_str(".*");
+                    i += 2;
+                    if i < chars.len() && chars[i] == '/' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                re_s.push_str("[^/]*");
+            }
+            '?' => re_s.push_str("[^/]"),
+            other => re_s.push_str(&regex::escape(&other.to_string())),
+        }
+        i += 1;
+    }
+    re_s.push('$');
+    regex::RegexBuilder::new(&re_s)
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
+fn matches_glob_filters(
+    rel_path: &str,
+    pos_globs: &[regex::Regex],
+    neg_globs: &[regex::Regex],
+) -> bool {
+    if neg_globs.iter().any(|re| re.is_match(rel_path)) {
+        return false;
+    }
+    if pos_globs.is_empty() {
+        return true;
+    }
+    pos_globs.iter().any(|re| re.is_match(rel_path))
+}
+
+fn detect_python_docstring_lines(abs_path: &Path) -> FxHashSet<u64> {
+    let mut skipped = FxHashSet::default();
+    let Ok(source) = std::fs::read_to_string(abs_path) else {
+        return skipped;
+    };
+    let mut in_quote: Option<&str> = None;
+    for (i, line) in source.split('\n').enumerate() {
+        let ln = i as u64 + 1;
+        let trimmed = line.trim();
+        if let Some(q) = in_quote {
+            skipped.insert(ln);
+            if trimmed.contains(q) {
+                in_quote = None;
+            }
+        } else {
+            for q in &["\"\"\"", "'''"] {
+                if let Some(pos) = trimmed.find(q) {
+                    // Only treat standalone docstring/triple-quoted comment lines (not inline string assignments like `x = """..."""`)
+                    let before = trimmed[..pos].trim();
+                    if before.is_empty() || before == "r" || before == "f" || before == "rf" || before == "fr" {
+                        skipped.insert(ln);
+                        let rest = &trimmed[pos + 3..];
+                        if !rest.contains(q) {
+                            in_quote = Some(q);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    skipped
+}
+
 #[derive(Debug, Clone)]
 pub struct TextFileHits {
     pub file: String,
@@ -475,10 +578,13 @@ pub fn find_noncode_mentions_with_pattern(
     let candidates: Vec<(String, PathBuf)> = if let Some(g) = graph {
         g.noncode_files
             .iter()
-            .map(|p| {
-                let gp = p.as_str().to_string();
-                let abs = resolve_graph_abs_path(roots, &gp);
-                (gp, abs)
+            .filter_map(|p| {
+                let gp = p.as_str();
+                if !is_noncode_config_file(gp) {
+                    return None;
+                }
+                let abs = resolve_graph_abs_path(roots, gp);
+                Some((gp.to_string(), abs))
             })
             .collect()
     } else {
@@ -638,6 +744,8 @@ pub struct GrepOpts {
     pub exclude_paths: Vec<String>,
     pub exts: Vec<String>,
     pub types: Vec<String>,
+    pub globs: Vec<String>,
+    pub and_patterns: Vec<String>,
     pub extra_patterns: Vec<String>,
 }
 
@@ -648,6 +756,8 @@ pub struct GrepResult {
     pub total_hits: usize,
     pub hidden_test_files: usize,
     pub hidden_test_hits: usize,
+    pub hidden_test_file_paths: Vec<String>,
+    pub auto_included_tests: bool,
     pub path_matched_zero: bool,
     pub branch_counts: Vec<(String, usize)>,
     /// Per-branch counts split across `(branch_label, code_files, noncode_files, test_files)`
@@ -671,6 +781,7 @@ struct GrepSink<'a> {
     captured_noncomment: usize,
     no_imports: bool,
     no_comments: bool,
+    skip_lines: Option<&'a FxHashSet<u64>>,
     collect_inventory_syms: bool,
     branch_regexes: &'a [(String, regex::Regex)],
     seen_branches: Vec<bool>,
@@ -687,6 +798,13 @@ impl<'a> Sink for GrepSink<'a> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let lnum = mat.line_number().unwrap_or(0);
+        if let Some(skip) = self.skip_lines {
+            if skip.contains(&lnum) {
+                self.last_matched_captured = false;
+                return Ok(true);
+            }
+        }
         let text = String::from_utf8_lossy(mat.bytes());
         if self.no_imports && is_import_only_line(&text) {
             self.last_matched_captured = false;
@@ -716,7 +834,6 @@ impl<'a> Sink for GrepSink<'a> {
             }
         }
 
-        let lnum = mat.line_number().unwrap_or(0);
         let want_capture = self.max_matches > 0
             && (self.captured_matches < self.buffer_cap
                 || (!is_comment && self.captured_noncomment < self.max_matches)
@@ -969,6 +1086,33 @@ pub fn ranked_grep(
         })
         .collect();
 
+    // Compile optional `--and <regex>` co-occurrence matchers (every matched file must match all)
+    let mut and_matchers: Vec<grep_regex::RegexMatcher> = Vec::with_capacity(opts.and_patterns.len());
+    for ap in &opts.and_patterns {
+        let mut ab = RegexMatcherBuilder::new();
+        ab.case_insensitive(opts.case_insensitive);
+        ab.fixed_strings(opts.fixed_strings);
+        ab.word(opts.word_regexp);
+        let m = ab
+            .build(ap)
+            .map_err(|e| format!("Invalid --and pattern \"{ap}\": {e}"))?;
+        and_matchers.push(m);
+    }
+
+    // Compile positive & negative `--glob` patterns (e.g. `*Dockerfile*`, `*.yml`, `!*.test.ts`)
+    let mut pos_globs: Vec<regex::Regex> = Vec::new();
+    let mut neg_globs: Vec<regex::Regex> = Vec::new();
+    for g in &opts.globs {
+        let trimmed = g.trim();
+        if let Some(neg) = trimmed.strip_prefix('!') {
+            if let Some(re) = compile_glob_regex(neg) {
+                neg_globs.push(re);
+            }
+        } else if let Some(re) = compile_glob_regex(trimmed) {
+            pos_globs.push(re);
+        }
+    }
+
     // Map file -> (file_idx, PageRank score) from zero-copy mmap graph (if available)
     let mut file_meta: FxHashMap<&str, (u32, f32)> = FxHashMap::default();
     if let Some(g) = graph {
@@ -980,7 +1124,11 @@ pub fn ranked_grep(
 
     let noncode_only = opts.noncode_only;
     let code_only = opts.code_only;
-    let include_data = opts.include_data || noncode_only || !opts.types.is_empty() || !opts.exts.is_empty();
+    let include_data = opts.include_data
+        || noncode_only
+        || !opts.types.is_empty()
+        || !opts.exts.is_empty()
+        || !pos_globs.is_empty();
     let effective_include_tests =
         opts.include_tests || (!opts.no_tests_explicit && path_explicitly_targets_tests(&opts.path_filters));
     let path_filters = opts.path_filters.clone();
@@ -994,7 +1142,13 @@ pub fn ranked_grep(
             .iter()
             .filter_map(|p| {
                 let gp = p.as_str();
-                if !matches_ext_filter(gp, &exts) || !matches_type_filter(gp, &types) {
+                if !is_noncode_config_file(gp) {
+                    return None;
+                }
+                if !matches_ext_filter(gp, &exts)
+                    || !matches_type_filter(gp, &types)
+                    || !matches_glob_filters(gp, &pos_globs, &neg_globs)
+                {
                     return None;
                 }
                 if !path_filters.is_empty()
@@ -1016,6 +1170,8 @@ pub fn ranked_grep(
                 .copied()
                 .collect::<FxHashSet<&'static str>>(),
         );
+        let pos_globs_arc = std::sync::Arc::new(pos_globs);
+        let neg_globs_arc = std::sync::Arc::new(neg_globs);
         roots
             .par_iter()
             .flat_map(|r| {
@@ -1023,6 +1179,8 @@ pub fn ranked_grep(
                 let eps = exclude_paths.clone();
                 let exts_c = exts.clone();
                 let types_c = types.clone();
+                let pg = std::sync::Arc::clone(&pos_globs_arc);
+                let ng = std::sync::Arc::clone(&neg_globs_arc);
                 walk_root_parallel(r, &skip_set, 4 * 1024 * 1024, move |rel_str, graph_path| {
                     let base = rel_str.rsplit('/').next().unwrap_or(rel_str);
                     if NONCODE_SKIP_FILES
@@ -1040,7 +1198,9 @@ pub fn ranked_grep(
                     {
                         return false;
                     }
-                    if !matches_ext_filter(rel_str, &exts_c) || !matches_type_filter(rel_str, &types_c)
+                    if !matches_ext_filter(rel_str, &exts_c)
+                        || !matches_type_filter(rel_str, &types_c)
+                        || !matches_glob_filters(rel_str, &pg, &ng)
                     {
                         return false;
                     }
@@ -1130,6 +1290,13 @@ pub fn ranked_grep(
                 }
             };
 
+            // When `--no-comments` is active on a `.py` file, strip Python triple-quoted docstrings too
+            let py_skip = if no_comments && graph_path.to_ascii_lowercase().ends_with(".py") {
+                Some(detect_python_docstring_lines(&abs))
+            } else {
+                None
+            };
+
             let mut sink = GrepSink {
                 max_matches: effective_max_per_file,
                 buffer_cap,
@@ -1139,6 +1306,7 @@ pub fn ranked_grep(
                 captured_noncomment: 0,
                 no_imports,
                 no_comments,
+                skip_lines: py_skip.as_ref(),
                 collect_inventory_syms,
                 branch_regexes: &branch_regexes,
                 seen_branches: vec![false; num_branches],
@@ -1153,6 +1321,35 @@ pub fn ranked_grep(
             let _ = searcher.search_path(&matcher, &abs, &mut sink);
             if sink.total_matches == 0 {
                 return None;
+            }
+
+            // Enforce `--and <regex>` same-file co-occurrence (runs ONLY on files that matched primary pattern!)
+            if !and_matchers.is_empty() {
+                let mut and_searcher = SearcherBuilder::new()
+                    .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
+                    .build();
+                for am in &and_matchers {
+                    let mut found = false;
+                    let _ = and_searcher.search_path(
+                        am,
+                        &abs,
+                        UTF8(|lnum, line| {
+                            if let Some(ref skip) = py_skip {
+                                if skip.contains(&lnum) {
+                                    return Ok(true);
+                                }
+                            }
+                            if no_comments && is_comment_only_line(line) {
+                                return Ok(true);
+                            }
+                            found = true;
+                            Ok(false)
+                        }),
+                    );
+                    if !found {
+                        return None;
+                    }
+                }
             }
 
             let mut matched_branches = Vec::new();
@@ -1251,19 +1448,36 @@ pub fn ranked_grep(
         }
     }
 
-    // Separate prod vs test/fixture unless `--include-tests` (or `--path` explicitly targets tests)
+    // Separate prod vs test/fixture unless `--include-tests` (or `--path` explicitly targets tests).
+    // If prod has 0 matches and tests DO match (and `--no-tests` was not passed), automatically
+    // promote test matches into the main output so test-only searches never return an empty body!
     let mut prod: Vec<ScoredMatch> = Vec::new();
-    let mut hidden_test_files = 0usize;
-    let mut hidden_test_hits = 0usize;
+    let mut hidden_tests: Vec<ScoredMatch> = Vec::new();
 
     for item in all_scored {
         if !effective_include_tests && item.is_test_or_fix {
-            hidden_test_files += 1;
-            hidden_test_hits += item.file_hits.total_hits_in_file;
+            hidden_tests.push(item);
         } else {
             prod.push(item);
         }
     }
+
+    let mut auto_included_tests = false;
+    if prod.is_empty() && !hidden_tests.is_empty() && !opts.no_tests_explicit {
+        prod = std::mem::take(&mut hidden_tests);
+        auto_included_tests = true;
+    }
+
+    let hidden_test_files = hidden_tests.len();
+    let hidden_test_hits: usize = hidden_tests
+        .iter()
+        .map(|m| m.file_hits.total_hits_in_file)
+        .sum();
+    let hidden_test_file_paths: Vec<String> = hidden_tests
+        .iter()
+        .take(15)
+        .map(|m| m.file_hits.file.clone())
+        .collect();
 
     // Compute per-branch file counts over the displayed pool (prod, or all if --include-tests)
     let mut branch_counts: Vec<(String, usize)> = Vec::new();
@@ -1441,6 +1655,8 @@ pub fn ranked_grep(
         total_hits,
         hidden_test_files,
         hidden_test_hits,
+        hidden_test_file_paths,
+        auto_included_tests,
         path_matched_zero: false,
         branch_counts,
         branch_scope_counts,

@@ -1359,3 +1359,271 @@ fn v053_fair_outline_schema_files_and_quotas() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn v054_universal_fixes_and_grep_outline_upgrades() {
+    let base = temp_dir("v054-suite");
+    let cache_dir = base.join("cache");
+    fs::create_dir_all(base.join("apps/web/src/app/(dashboard)/item/[id]")).unwrap();
+    fs::create_dir_all(base.join("packages/core/src")).unwrap();
+    fs::create_dir_all(base.join("tests/fixtures")).unwrap();
+    fs::create_dir_all(base.join(".github/workflows")).unwrap();
+
+    // 1. Next.js route-group path with `(dashboard)` and `[id]` (> 120 lines)
+    let mut route_src = String::from("export function ItemPage() {\n");
+    for i in 1..=120 {
+        route_src.push_str(&format!(
+            "  const row_{i:03} = 'route_payload_value_{i:03}_extra_padding';\n"
+        ));
+    }
+    route_src.push_str("  return row_001;\n}\n");
+    fs::write(
+        base.join("apps/web/src/app/(dashboard)/item/[id]/page.tsx"),
+        &route_src,
+    )
+    .unwrap();
+
+    // 2. Import-redirect & self-recursive caller & space-separated callers
+    fs::write(
+        base.join("packages/core/src/helper.ts"),
+        "export function helperAlpha(n: number): number {\n  if (n <= 0) return 0;\n  return helperAlpha(n - 1) + 1;\n}\nexport function helperBeta() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        base.join("apps/web/src/consumer.ts"),
+        "import { helperAlpha, helperBeta } from '../../../packages/core/src/helper';\nexport function runBoth() {\n  const x = 'CO_OCCUR_A';\n  const y = 'CO_OCCUR_B';\n  return helperAlpha(2) + helperBeta() + x.length + y.length;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        base.join("packages/core/src/only_a.ts"),
+        "export const onlyA = 'CO_OCCUR_A';\n",
+    )
+    .unwrap();
+
+    // 3. Prisma schema with models & enums
+    fs::write(
+        base.join("schema.prisma"),
+        "model DemoOrder {\n  id String @id\n  status String\n}\n\nenum OrderState {\n  OPEN\n  CLOSED\n}\n",
+    )
+    .unwrap();
+
+    // 4. Python file with triple-quoted docstring mentioning token vs real code
+    fs::write(
+        base.join("packages/core/src/mod.py"),
+        "def compute():\n    \"\"\"\n    DOCSTRING_ONLY_TOKEN inside triple quotes\n    \"\"\"\n    # hash comment\n    return 'REAL_PY_CODE'\n",
+    )
+    .unwrap();
+
+    // 5. Test-only term + `.txt` + `.jsonl.gz` fixture files + Dockerfile + CI yml
+    fs::write(
+        base.join("tests/only_in_tests.test.ts"),
+        "export function testOnly() { return 'TEST_ONLY_AUTOPROMOTE_TOKEN'; }\n",
+    )
+    .unwrap();
+    fs::write(base.join("tests/fixtures/notes.txt"), "sample notes\n").unwrap();
+    fs::write(base.join("tests/fixtures/samples.jsonl.gz"), b"fake-gz-bytes").unwrap();
+    fs::write(base.join("worker.Dockerfile"), "FROM python:3.11\nENV GLOB_TOKEN=1\n").unwrap();
+    fs::write(
+        base.join(".github/workflows/ci.yml"),
+        "name: ci\nenv:\n  GLOB_TOKEN: 1\n",
+    )
+    .unwrap();
+
+    // Warm index
+    let warm = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["stats", "--root", base.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(warm.status.success());
+
+    // A. Paren-path `(dashboard)` resume hint must NOT strip `(dashboard)` and MUST shell-quote!
+    let paren = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/web/src/app/(dashboard)/item/[id]/page.tsx:1-120",
+            "--max-chars",
+            "800",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let ps = String::from_utf8_lossy(&paren.stdout);
+    assert!(
+        ps.contains("next: betterrank outline 'apps/web/src/app/(dashboard)/item/[id]/page.tsx:L"),
+        "expected intact quoted route-group path in resume hint, got:\n{ps}"
+    );
+
+    // B. `:ALL --full-under 50` on 122-line file falls back to compact skeleton!
+    let fu = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/web/src/app/(dashboard)/item/[id]/page.tsx:ALL",
+            "--full-under",
+            "50",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let fus = String::from_utf8_lossy(&fu.stdout);
+    assert!(
+        fus.contains("[function]") && !fus.contains("row_050"),
+        ":ALL --full-under 50 on 122-line file should return compact skeleton, got:\n{fus}"
+    );
+
+    // C. `.prisma` block slicing + `--around` asymmetric `-B 0 -A 2` + import-redirect hint
+    let pr = Command::new(bin_path())
+        .args(["outline", "schema.prisma:DemoOrder", "--root", base.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let prs = String::from_utf8_lossy(&pr.stdout);
+    assert!(prs.contains("model DemoOrder") && !prs.contains("enum OrderState"), "got:\n{prs}");
+
+    let redir = Command::new(bin_path())
+        .args(["outline", "apps/web/src/consumer.ts:helperAlpha", "--root", base.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let rds = String::from_utf8_lossy(&redir.stdout);
+    assert!(
+        rds.contains("imported at L1") && rds.contains("packages/core/src/helper"),
+        "expected import-redirect hint, got:\n{rds}"
+    );
+
+    let asym = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/web/src/app/(dashboard)/item/[id]/page.tsx",
+            "--around",
+            "row_010",
+            "-B",
+            "0",
+            "-A",
+            "2",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let asys = String::from_utf8_lossy(&asym.stdout);
+    assert!(asys.contains("row_010") && asys.contains("row_012") && !asys.contains("row_009"), "got:\n{asys}");
+
+    // D. `outline file.py:ALL --no-comments` strips Python docstring + `#` comments
+    let py_nc = Command::new(bin_path())
+        .args(["outline", "packages/core/src/mod.py:ALL", "--no-comments", "--root", base.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let pncs = String::from_utf8_lossy(&py_nc.stdout);
+    assert!(pncs.contains("REAL_PY_CODE") && !pncs.contains("DOCSTRING_ONLY_TOKEN") && !pncs.contains("hash comment"), "got:\n{pncs}");
+
+    // E. Space-separated `callers helperAlpha helperBeta` + self-recursive call in `callers helperAlpha --context 1`
+    let c_space = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "callers",
+            "helperAlpha",
+            "helperBeta",
+            "--no-noncode",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let css = String::from_utf8_lossy(&c_space.stdout);
+    assert!(css.contains("=== callers: helperAlpha ===") && css.contains("=== callers: helperBeta ==="), "got:\n{css}");
+
+    let c_rec = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "callers",
+            "helperAlpha",
+            "--context",
+            "1",
+            "--no-noncode",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let cres = String::from_utf8_lossy(&c_rec.stdout);
+    assert!(cres.contains("return helperAlpha(n - 1)"), "self-recursive call must appear in callers --context:\n{cres}");
+
+    // F. `grep`: auto-include tests when 0 prod hits, Python docstring stripping under `--no-comments`,
+    // repeatable `--glob`, `--and`, and `--group-by-package`!
+    let g_auto = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["grep", "TEST_ONLY_AUTOPROMOTE_TOKEN", "--root", base.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let gas = String::from_utf8_lossy(&g_auto.stdout);
+    assert!(
+        gas.contains("showing test/fixture matches automatically") && gas.contains("only_in_tests.test.ts"),
+        "expected auto-promoted test matches when prod=0, got:\n{gas}"
+    );
+
+    let g_pydoc = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["grep", "DOCSTRING_ONLY_TOKEN", "--no-comments", "--root", base.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let gpds = String::from_utf8_lossy(&g_pydoc.stdout);
+    assert!(gpds.contains("(no matches"), "--no-comments must strip Python triple-quoted docstrings:\n{gpds}");
+
+    let g_glob = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "GLOB_TOKEN",
+            "--glob",
+            "*Dockerfile*",
+            "--glob",
+            "*.yml",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let ggs = String::from_utf8_lossy(&g_glob.stdout);
+    assert!(ggs.contains("worker.Dockerfile") && ggs.contains(".github/workflows/ci.yml"), "got:\n{ggs}");
+
+    let g_and = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "CO_OCCUR_A",
+            "--and",
+            "CO_OCCUR_B",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gands = String::from_utf8_lossy(&g_and.stdout);
+    assert!(gands.contains("apps/web/src/consumer.ts") && !gands.contains("only_a.ts"), "--and co-occurrence failed:\n{gands}");
+
+    let g_pkg = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "CO_OCCUR_A",
+            "--group-by-package",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gpkgs = String::from_utf8_lossy(&g_pkg.stdout);
+    assert!(gpkgs.contains("apps/web (1 file") && gpkgs.contains("packages/core (1 file"), "--group-by-package failed:\n{gpkgs}");
+
+    // G. `files` includes `.txt` and `.jsonl.gz` fixture files!
+    let f_fix = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["files", "tests/fixtures", "--root", base.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let ffs = String::from_utf8_lossy(&f_fix.stdout);
+    assert!(ffs.contains("notes.txt") && ffs.contains("samples.jsonl.gz"), "files should list .txt and .jsonl.gz:\n{ffs}");
+
+    let _ = fs::remove_dir_all(&base);
+}

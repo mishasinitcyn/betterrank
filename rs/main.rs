@@ -71,6 +71,8 @@ struct Flags {
     roots: Vec<String>,
     paths: Vec<String>,
     exclude_paths: Vec<String>,
+    globs: Vec<String>,
+    and_patterns: Vec<String>,
     extra_patterns: Vec<String>,
     values: FxHashMap<String, String>,
     bools: rustc_hash::FxHashSet<String>,
@@ -167,6 +169,14 @@ fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "-g" => {
+                if i + 1 < args.len() {
+                    f.globs.push(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             s if s.starts_with("--") => {
                 let raw = &s[2..];
                 if let Some((k, v)) = raw.split_once('=') {
@@ -176,6 +186,10 @@ fn parse_flags(args: &[String]) -> Flags {
                         f.paths.push(v.to_string());
                     } else if k == "exclude-path" {
                         f.exclude_paths.push(v.to_string());
+                    } else if k == "glob" {
+                        f.globs.push(v.to_string());
+                    } else if k == "and" {
+                        f.and_patterns.push(v.to_string());
                     }
                     f.values.insert(k.to_string(), v.to_string());
                     i += 1;
@@ -188,6 +202,7 @@ fn parse_flags(args: &[String]) -> Flags {
                     "count"
                         | "annotate"
                         | "no-comments"
+                        | "collapse-comments"
                         | "collapse-imports"
                         | "show-imports"
                         | "with-imports"
@@ -203,6 +218,7 @@ fn parse_flags(args: &[String]) -> Flags {
                         | "code"
                         | "files-only"
                         | "inventory"
+                        | "group-by-package"
                         | "compact"
                         | "dirs"
                         | "all"
@@ -225,6 +241,10 @@ fn parse_flags(args: &[String]) -> Flags {
                         f.paths.push(val.clone());
                     } else if key == "exclude-path" {
                         f.exclude_paths.push(val.clone());
+                    } else if key == "glob" {
+                        f.globs.push(val.clone());
+                    } else if key == "and" {
+                        f.and_patterns.push(val.clone());
                     }
                     f.values.insert(key.to_string(), val);
                     i += 2;
@@ -390,13 +410,21 @@ fn main() {
             process::exit(1);
         }
         let annotate = flags.has("annotate");
-        let no_comments = flags.has("no-comments");
+        let no_comments = flags.has("no-comments") || flags.has("collapse-comments");
         let collapse_imports = flags.has("collapse-imports");
         let explicit_depth = flags.get("depth").is_some();
         let depth = flags.get_usize("depth").unwrap_or(1) as u32;
         let filter_pat = flags.get("filter");
         let around_pat = flags.get("around");
         let around_ctx = flags.get_usize("context").unwrap_or(15);
+        let around_before = flags
+            .get_usize("before-context")
+            .or_else(|| flags.get_usize("before"))
+            .unwrap_or(around_ctx);
+        let around_after = flags
+            .get_usize("after-context")
+            .or_else(|| flags.get_usize("after"))
+            .unwrap_or(around_ctx);
         let full_under = flags.get_usize("full-under");
         let max_chars = effective_max_chars(&flags);
         let line_range = match flags.get("lines") {
@@ -562,7 +590,8 @@ fn main() {
                     full_skeleton: flags.has("full"),
                     filter: filter_pat,
                     around: around_pat,
-                    around_context: around_ctx,
+                    around_before,
+                    around_after,
                     full_under,
                     // For multi-target batches, apply fair water-filling allocation below instead
                     // of letting target #1 greedily starve trailing targets to 0 lines!
@@ -811,6 +840,7 @@ fn main() {
         let no_tests_explicit = flags.has("no-tests");
         let all_scopes = flags.has("all-scopes");
         let include_tests = (flags.has("include-tests") || all_scopes) && !no_tests_explicit;
+        let group_by_package = flags.has("group-by-package");
         let files_only = flags.has("files-only") || flags.has("inventory");
         let max_chars = effective_max_chars(&flags);
         let opts = GrepOpts {
@@ -824,9 +854,9 @@ fn main() {
             no_tests_explicit,
             no_imports: flags.has("no-imports"),
             no_comments: flags.has("no-comments"),
-            files_only,
+            files_only: files_only || group_by_package,
             compact: flags.has("compact"),
-            limit_files: user_limit.unwrap_or(if files_only { 200 } else { 30 }),
+            limit_files: user_limit.unwrap_or(if files_only || group_by_package { 200 } else { 30 }),
             max_per_file: flags.get_usize("max-per-file").unwrap_or(5),
             user_max_per_file: flags.get("max-per-file").is_some(),
             before_context: before_ctx,
@@ -835,6 +865,8 @@ fn main() {
             exclude_paths: norm_exclude_paths,
             exts,
             types,
+            globs: flags.globs.clone(),
+            and_patterns: flags.and_patterns.clone(),
             extra_patterns: flags.extra_patterns.clone(),
         };
         match ranked_grep(&idx.roots, pattern, warm.as_ref().map(|m| m.archived()), &opts) {
@@ -904,6 +936,53 @@ fn main() {
                     println!("(no matches for \"{pattern}\")");
                     return;
                 }
+                if res.auto_included_tests {
+                    println!("(no non-test matches — showing test/fixture matches automatically)");
+                }
+                if group_by_package {
+                    let mut by_pkg: std::collections::BTreeMap<String, Vec<&betterrank::noncode::TextFileHits>> =
+                        std::collections::BTreeMap::new();
+                    for fh in &res.hits {
+                        let parts: Vec<&str> = fh.file.split('/').collect();
+                        let pkg = if parts.len() >= 3
+                            && matches!(parts[0], "apps" | "packages" | "services" | "libs" | "crates")
+                        {
+                            format!("{}/{}", parts[0], parts[1])
+                        } else if parts.len() >= 4
+                            && matches!(parts[1], "apps" | "packages" | "services" | "libs" | "crates")
+                        {
+                            format!("{}/{}/{}", parts[0], parts[1], parts[2])
+                        } else if parts.len() >= 2 {
+                            parts[0].to_string()
+                        } else {
+                            "(root)".to_string()
+                        };
+                        by_pkg.entry(pkg).or_default().push(fh);
+                    }
+                    let mut groups: Vec<(String, Vec<&betterrank::noncode::TextFileHits>)> =
+                        by_pkg.into_iter().collect();
+                    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+                    for (pkg, files) in groups {
+                        let hits_sum: usize = files.iter().map(|f| f.total_hits_in_file).sum();
+                        println!(
+                            "{pkg} ({} {}, {hits_sum} matches):",
+                            files.len(),
+                            if files.len() == 1 { "file" } else { "files" }
+                        );
+                        for fh in files {
+                            if !fh.enclosing_syms.is_empty() {
+                                println!(
+                                    "  {} ({}): {}",
+                                    fh.file,
+                                    fh.total_hits_in_file,
+                                    fh.enclosing_syms.join(", ")
+                                );
+                            } else {
+                                println!("  {} ({})", fh.file, fh.total_hits_in_file);
+                            }
+                        }
+                    }
+                } else {
                 let has_ctx = opts.before_context > 0 || opts.after_context > 0;
                 let mut shown_files = 0usize;
                 let mut stopped_at_cap = false;
@@ -1006,13 +1085,25 @@ fn main() {
                         res.total_hits
                     );
                 }
-                if res.hidden_test_files > 0 {
+                }
+                if res.hidden_test_files > 0 && !no_tests_explicit {
                     println!(
-                        "(+ {} matches in {} test/fixture {} hidden — pass --include-tests to expand)",
-                        res.hidden_test_hits,
+                        "\nTests ({} {}, {} matches):",
                         res.hidden_test_files,
-                        if res.hidden_test_files == 1 { "file" } else { "files" }
+                        if res.hidden_test_files == 1 { "file" } else { "files" },
+                        res.hidden_test_hits
                     );
+                    for tp in &res.hidden_test_file_paths {
+                        println!("  {tp}");
+                    }
+                    if res.hidden_test_files > res.hidden_test_file_paths.len() {
+                        println!(
+                            "  ... (+{} more — pass --include-tests to expand)",
+                            res.hidden_test_files - res.hidden_test_file_paths.len()
+                        );
+                    } else {
+                        println!("  (pass --include-tests to expand matches)");
+                    }
                 }
             }
             Err(e) => {
@@ -1145,10 +1236,10 @@ fn main() {
             );
         }
         "callers" => {
-            let Some(sym_arg) = flags.positional.first() else {
-                eprintln!("Usage: betterrank callers <sym1[,sym2,...]> [--file|--defined-in path] [--path sub ...] [--include-tests|--no-tests]");
+            if flags.positional.is_empty() {
+                eprintln!("Usage: betterrank callers <sym1 [sym2 ...] | sym1,sym2> [--file|--defined-in path] [--path sub ...] [--include-tests|--no-tests]");
                 process::exit(1);
-            };
+            }
             let f_arg = flags
                 .get("file")
                 .or_else(|| flags.get("defined-in"))
@@ -1162,8 +1253,10 @@ fn main() {
             };
             let no_tests_explicit = flags.has("no-tests");
             let include_tests = flags.has("include-tests") && !no_tests_explicit;
-            let syms: Vec<&str> = sym_arg
-                .split(',')
+            let syms: Vec<&str> = flags
+                .positional
+                .iter()
+                .flat_map(|arg| arg.split(','))
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .collect();

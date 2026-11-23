@@ -324,7 +324,9 @@ pub fn walk_root_files(root: &Path, extra_ignores: &[String]) -> WalkResult {
                         }
                     } else if let Ok(rel) = entry.path().strip_prefix(&*root_buf) {
                         let rel_str = normalize_slashes(&rel.to_string_lossy());
-                        if crate::noncode::is_noncode_config_file(&rel_str) {
+                        if crate::noncode::is_noncode_config_file(&rel_str)
+                            || crate::noncode::is_doc_or_data_file(&rel_str)
+                        {
                             if entry.metadata().map_or(false, |m| m.len() <= 4 * 1024 * 1024) {
                                 flusher.local_nc.push(rel_str);
                             }

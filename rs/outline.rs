@@ -31,12 +31,24 @@ pub struct OutlineOpts<'a> {
     pub full_skeleton: bool,
     pub filter: Option<&'a str>,
     pub around: Option<&'a str>,
-    pub around_context: usize,
+    pub around_before: usize,
+    pub around_after: usize,
     pub full_under: Option<usize>,
     pub max_chars: Option<usize>,
     /// When true (default in budgeted non-TTY output), cap individual ultra-long lines (>500 chars)
     /// so a single 10 KB comment line cannot consume the entire output budget.
     pub cap_long_lines: bool,
+}
+
+fn shell_quote_path_spec(spec: &str) -> String {
+    if spec
+        .chars()
+        .any(|c| matches!(c, '(' | ')' | '[' | ']' | ' ' | '$' | '&' | ';' | '\''))
+    {
+        format!("'{}'", spec.replace('\'', "'\\''"))
+    } else {
+        spec.to_string()
+    }
 }
 
 fn format_source_line(line: &str, cap_long_lines: bool) -> std::borrow::Cow<'_, str> {
@@ -57,9 +69,15 @@ fn format_source_line(line: &str, cap_long_lines: bool) -> std::borrow::Cow<'_, 
 
 fn parse_header_end_line(line: &str) -> Option<(String, u32)> {
     // Matches `── file.ts:10-900 ──` or `── sym (file.ts:10-900) ──`
+    // Careful: Next.js route-group paths like `app/(dashboard)/page.tsx:10-900` contain `(`!
+    // Only unwrap `sym (...)` when the header actually ends with `)`.
     let inner = line.strip_prefix("── ")?.strip_suffix(" ──")?;
-    let loc = if let Some(paren_start) = inner.rfind('(') {
-        inner[paren_start + 1..].trim_end_matches(')')
+    let loc = if let Some(no_trail) = inner.strip_suffix(')') {
+        if let Some(paren_start) = no_trail.rfind(" (") {
+            &no_trail[paren_start + 2..]
+        } else {
+            inner
+        }
     } else {
         inner
     };
@@ -93,14 +111,16 @@ pub fn apply_max_chars(s: String, file_path: &str, max_chars: Option<usize>) -> 
             let omitted = total_lines.saturating_sub(emitted_lines);
             let resume = match (active_header, last_line_num) {
                 (Some((f, end_ln)), Some(cur)) if cur < end_ln => {
-                    format!(" — next: betterrank outline {f}:L{}-{end_ln}", cur + 1)
+                    let arg = shell_quote_path_spec(&format!("{f}:L{}-{end_ln}", cur + 1));
+                    format!(" — next: betterrank outline {arg}")
                 }
                 (None, Some(cur)) => {
-                    format!(
-                        " — next: betterrank outline {file_path}:L{}-{} (or --max-chars 0)",
+                    let arg = shell_quote_path_spec(&format!(
+                        "{file_path}:L{}-{}",
                         cur + 1,
                         cur + 300
-                    )
+                    ));
+                    format!(" — next: betterrank outline {arg} (or --max-chars 0)")
                 }
                 _ => " — pass --max-chars 0 to uncap".to_string(),
             };
@@ -124,11 +144,13 @@ pub fn apply_max_chars(s: String, file_path: &str, max_chars: Option<usize>) -> 
     kept
 }
 
+#[allow(clippy::too_many_arguments)]
 fn around_mode(
     lines: &[&str],
     file_path: &str,
     pat: &str,
-    ctx: usize,
+    before_ctx: usize,
+    after_ctx: usize,
     bounds: Option<(u32, u32)>,
     pad: usize,
     no_comments: bool,
@@ -173,8 +195,8 @@ fn around_mode(
 
     let mut hunks: Vec<(usize, usize)> = Vec::new();
     for &m in &matched {
-        let s = m.saturating_sub(ctx).max(lo);
-        let e = (m + ctx).min(hi);
+        let s = m.saturating_sub(before_ctx).max(lo);
+        let e = (m + after_ctx).min(hi);
         if let Some(last) = hunks.last_mut() {
             if s <= last.1 + 1 {
                 last.1 = last.1.max(e);
@@ -198,6 +220,63 @@ fn around_mode(
         }
     }
     out.join("\n")
+}
+
+/// Lightweight block parser for `.prisma` schemas (`model`, `enum`, `type`, `view`) so
+/// `outline schema.prisma` produces a clean skeleton and `outline schema.prisma:ModelName`
+/// extracts the exact block!
+fn parse_prisma_defs(lines: &[&str]) -> Vec<ParsedDef> {
+    let mut defs = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        let kw_opt = trimmed
+            .strip_prefix("model ")
+            .map(|r| (SymbolKind::Class, "model", r))
+            .or_else(|| trimmed.strip_prefix("enum ").map(|r| (SymbolKind::Type, "enum", r)))
+            .or_else(|| trimmed.strip_prefix("type ").map(|r| (SymbolKind::Type, "type", r)))
+            .or_else(|| trimmed.strip_prefix("view ").map(|r| (SymbolKind::Class, "view", r)));
+        if let Some((kind, kw, rest)) = kw_opt {
+            let name = rest
+                .split(|c: char| c.is_whitespace() || c == '{')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !name.is_empty() && trimmed.contains('{') {
+                let start = i as u32 + 1;
+                let mut depth = 0i32;
+                let mut end = start;
+                let mut j = i;
+                while j < lines.len() {
+                    for b in lines[j].bytes() {
+                        if b == b'{' {
+                            depth += 1;
+                        } else if b == b'}' {
+                            depth -= 1;
+                        }
+                    }
+                    end = j as u32 + 1;
+                    if depth <= 0 {
+                        break;
+                    }
+                    j += 1;
+                }
+                defs.push(ParsedDef {
+                    name: name.to_string(),
+                    kind: kind as u8,
+                    signature: format!("{kw} {name}"),
+                    line_start: start,
+                    line_end: end,
+                    body_start_line: start + 1,
+                    exported: true,
+                });
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    defs
 }
 
 fn structured_config_outline(
@@ -394,29 +473,41 @@ fn build_outline_inner(
     let depth = if opts.depth == 0 { 1 } else { opts.depth };
     let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
 
-    // Support `file:ALL` to explicitly expand the entire file cleanly on any file type
-    if expand_symbols.len() == 1 && expand_symbols[0].eq_ignore_ascii_case("ALL") {
-        if let Some(pat) = opts.around {
-            return around_mode(
+    // Support `file:ALL` to explicitly expand the entire file cleanly on any file type.
+    // If `--full-under N` was ALSO passed and the file exceeds N lines, fall through to the
+    // compact/structured skeleton instead of dumping thousands of lines!
+    let mut eff_expand: Vec<String> = expand_symbols.to_vec();
+    if eff_expand.len() == 1 && eff_expand[0].eq_ignore_ascii_case("ALL") {
+        let within_full_under = opts.full_under.map_or(true, |n| lines.len() <= n);
+        if within_full_under {
+            if let Some(pat) = opts.around {
+                return around_mode(
+                    &lines,
+                    file_path,
+                    pat,
+                    opts.around_before,
+                    opts.around_after,
+                    None,
+                    pad,
+                    opts.no_comments,
+                    ext,
+                );
+            }
+            return raw_view(
                 &lines,
                 file_path,
-                pat,
-                opts.around_context,
-                None,
                 pad,
+                opts.line_range,
                 opts.no_comments,
+                opts.show_imports,
+                opts.cap_long_lines,
                 ext,
             );
+        } else {
+            eff_expand.clear();
         }
-        return raw_view(
-            &lines,
-            file_path,
-            pad,
-            opts.line_range,
-            opts.show_imports,
-            opts.cap_long_lines,
-        );
     }
+    let expand_symbols = &eff_expand;
 
     // Fast path: if all expand targets are explicit line ranges (e.g. `outline schema.prisma 100-140,800-830`),
     // work cleanly on ANY file (including Prisma, YAML, JSON, Dockerfiles) without AST parsing!
@@ -446,7 +537,8 @@ fn build_outline_inner(
                 &lines,
                 file_path,
                 pat,
-                opts.around_context,
+                opts.around_before,
+                opts.around_after,
                 opts.line_range,
                 pad,
                 opts.no_comments,
@@ -463,8 +555,10 @@ fn build_outline_inner(
                 file_path,
                 pad,
                 opts.line_range,
+                opts.no_comments,
                 opts.show_imports,
                 opts.cap_long_lines,
+                ext,
             );
         }
     }
@@ -484,12 +578,16 @@ fn build_outline_inner(
             file_path,
             pad,
             opts.line_range,
+            opts.no_comments,
             opts.show_imports,
             opts.cap_long_lines,
+            ext,
         );
     }
 
-    if !is_supported_extension(file_path) {
+    // Support `.prisma` schema models/enums/types/views as first-class outline blocks!
+    let is_prisma = ext.eq_ignore_ascii_case(".prisma");
+    if !is_supported_extension(file_path) && !is_prisma {
         if expand_symbols.is_empty()
             && !opts.full_skeleton
             && opts.line_range.is_none()
@@ -511,30 +609,51 @@ fn build_outline_inner(
             file_path,
             pad,
             opts.line_range,
+            opts.no_comments,
             opts.show_imports,
             opts.cap_long_lines,
+            ext,
         );
     }
 
-    let parsed = match parse_file(
-        file_path,
-        source,
-        ParseOptions {
-            include_outline_defs: true,
-            include_local_refs: false,
-            dedupe: false,
-        },
-    ) {
-        Some(p) if !p.definitions.is_empty() => p,
-        _ => {
+    let raw_defs: Vec<ParsedDef> = if is_prisma {
+        let pdefs = parse_prisma_defs(&lines);
+        if pdefs.is_empty() {
             return raw_view(
                 &lines,
                 file_path,
                 pad,
                 opts.line_range,
+                opts.no_comments,
                 opts.show_imports,
                 opts.cap_long_lines,
-            )
+                ext,
+            );
+        }
+        pdefs
+    } else {
+        match parse_file(
+            file_path,
+            source,
+            ParseOptions {
+                include_outline_defs: true,
+                include_local_refs: false,
+                dedupe: false,
+            },
+        ) {
+            Some(p) if !p.definitions.is_empty() => p.definitions,
+            _ => {
+                return raw_view(
+                    &lines,
+                    file_path,
+                    pad,
+                    opts.line_range,
+                    opts.no_comments,
+                    opts.show_imports,
+                    opts.cap_long_lines,
+                    ext,
+                )
+            }
         }
     };
 
@@ -550,7 +669,7 @@ fn build_outline_inner(
     };
 
     let mut by_line: FxHashMap<u32, ParsedDef> = FxHashMap::default();
-    for d in parsed.definitions {
+    for d in raw_defs {
         let replace = by_line
             .get(&d.line_start)
             .map_or(true, |ex| kind_priority(d.kind) > kind_priority(ex.kind));
@@ -571,7 +690,8 @@ fn build_outline_inner(
                         &lines,
                         file_path,
                         pat,
-                        opts.around_context,
+                        opts.around_before,
+                        opts.around_after,
                         Some((rs, re)),
                         pad,
                         opts.no_comments,
@@ -588,7 +708,8 @@ fn build_outline_inner(
                             &lines,
                             file_path,
                             pat,
-                            opts.around_context,
+                            opts.around_before,
+                            opts.around_after,
                             Some((d.line_start, d.line_end)),
                             pad,
                             opts.no_comments,
@@ -882,13 +1003,16 @@ fn emit_line_range(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn raw_view(
     lines: &[&str],
     file_path: &str,
     pad: usize,
     line_range: Option<(u32, u32)>,
+    no_comments: bool,
     show_imports: bool,
     cap_long_lines: bool,
+    ext: &str,
 ) -> String {
     let start = line_range.map_or(1, |(s, _)| s.max(1)) as usize;
     let end = line_range
@@ -896,19 +1020,63 @@ fn raw_view(
         .min(lines.len());
     let mut out = Vec::with_capacity(end.saturating_sub(start) + 2);
     out.push(format!("── {file_path}:{start}-{end} ──"));
-    let empty_comments = FxHashSet::default();
+    let comment_lines = if no_comments {
+        detect_comment_lines(lines, ext)
+    } else {
+        FxHashSet::default()
+    };
     emit_line_range(
         &mut out,
         lines,
         start,
         end,
         pad,
-        false,
-        &empty_comments,
+        no_comments,
+        &comment_lines,
         show_imports,
         cap_long_lines,
     );
     out.join("\n")
+}
+
+fn find_import_redirect_hint(lines: &[&str], sym: &str) -> Option<(usize, String)> {
+    let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(sym))).ok()?;
+    let mut in_import = false;
+    let mut imp_start = 0usize;
+    let mut imp_buf = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if !in_import {
+            if trimmed.starts_with("import ")
+                || trimmed.starts_with("from ")
+                || (trimmed.starts_with("export ") && trimmed.contains(" from "))
+            {
+                imp_start = i + 1;
+                imp_buf.clear();
+                imp_buf.push_str(trimmed);
+                if trimmed.contains(" from ")
+                    || trimmed.starts_with("from ")
+                    || trimmed.ends_with(';')
+                {
+                    if re.is_match(&imp_buf) {
+                        return Some((imp_start, imp_buf.clone()));
+                    }
+                } else {
+                    in_import = true;
+                }
+            }
+        } else {
+            imp_buf.push(' ');
+            imp_buf.push_str(trimmed);
+            if trimmed.contains(" from ") || trimmed.ends_with(';') || trimmed.ends_with(')') {
+                in_import = false;
+                if re.is_match(&imp_buf) {
+                    return Some((imp_start, imp_buf.clone()));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -979,6 +1147,17 @@ fn expand_mode(
 
         let matches: Vec<&ParsedDef> = defs.iter().filter(|d| d.name == *target).collect();
         if matches.is_empty() {
+            if let Some((ln, imp_text)) = find_import_redirect_hint(lines, target) {
+                let preview = if imp_text.len() > 140 {
+                    format!("{}...", &imp_text[..140])
+                } else {
+                    imp_text
+                };
+                out.push(format!(
+                    "Symbol \"{target}\" is not defined in {file_path} — imported at L{ln}: {preview}"
+                ));
+                continue;
+            }
             out.push(format!("Symbol \"{target}\" not found in {file_path}"));
             let lower = target.to_ascii_lowercase();
             let mut similar: Vec<&str> = Vec::new();
@@ -1115,7 +1294,10 @@ fn detect_import_block(lines: &[&str]) -> Option<CollapseRange> {
 
 fn detect_comment_lines(lines: &[&str], ext: &str) -> FxHashSet<u32> {
     let mut skipped = FxHashSet::default();
-    if ext == ".py" {
+    if matches!(
+        ext.to_ascii_lowercase().as_str(),
+        ".py" | ".yml" | ".yaml" | ".toml" | ".sh" | ".bash" | ".dockerfile" | ".env" | ".cfg" | ".ini" | ""
+    ) {
         let mut in_quote: Option<&str> = None;
         for (i, line) in lines.iter().enumerate() {
             let ln = i as u32 + 1;

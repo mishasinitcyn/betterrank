@@ -2,7 +2,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 pub const GRAPH_CACHE_MAGIC: [u8; 8] = *b"BRG00001";
 pub const PARSE_CACHE_MAGIC: [u8; 8] = *b"BRP00001";
-pub const CACHE_FORMAT_VERSION: u32 = 3;
+pub const CACHE_FORMAT_VERSION: u32 = 4;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]

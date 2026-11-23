@@ -1169,9 +1169,10 @@ pub fn cmd_callers(
             let mut matched_indices: Vec<usize> = Vec::new();
             for (i, line) in lines.iter().enumerate() {
                 let lnum = i as u32 + 1;
+                // Skip only the declaration line (`lnum == ds`) so recursive self-calls inside the body still show!
                 if def_ranges
                     .iter()
-                    .any(|&(dfi, ds, de)| dfi == fi && lnum >= ds && lnum <= de)
+                    .any(|&(dfi, ds, _de)| dfi == fi && lnum == ds)
                 {
                     continue;
                 }

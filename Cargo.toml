@@ -1,6 +1,6 @@
 [package]
 name = "betterrank"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "Structural code index with PageRank-ranked repo maps, symbol search, call-graph queries, and ripgrep-backed non-code awareness."
 license = "MIT"
