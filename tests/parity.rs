@@ -1627,3 +1627,137 @@ fn v054_universal_fixes_and_grep_outline_upgrades() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn v055_bugfixes_around_ranges_path_boundaries_and_inventory_branches() {
+    let base = temp_dir("v055-suite");
+    let cache_dir = base.join("cache");
+    fs::create_dir_all(base.join("apps/qa/src")).unwrap();
+    fs::create_dir_all(base.join("apps/qa-triage/src")).unwrap();
+
+    let mut big = String::new();
+    for i in 1..=120 {
+        if i == 75 {
+            big.push_str("export const target_75 = 'AROUND_RANGE_NEEDLE';\n");
+        } else {
+            big.push_str(&format!(
+                "export const line_{i:03} = 'filler_text_value_for_line_{i:03}_padding';\n"
+            ));
+        }
+    }
+    fs::write(base.join("apps/qa/src/big.ts"), &big).unwrap();
+    fs::write(
+        base.join("apps/qa/src/alpha.ts"),
+        "export function runAlpha() { return 'BRANCH_ALPHA'; }\n",
+    )
+    .unwrap();
+    fs::write(
+        base.join("apps/qa-triage/src/triage.ts"),
+        "export function runTriage() { return 'BRANCH_ALPHA'; }\n",
+    )
+    .unwrap();
+
+    // Warm index
+    let warm = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["stats", "--root", base.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(warm.status.success());
+
+    // 1a. `outline file:L50-100 --around AROUND_RANGE_NEEDLE -C 1` filters inside L50-100 (does NOT dump L50..L73)
+    let ar = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/qa/src/big.ts:L50-100",
+            "--around",
+            "AROUND_RANGE_NEEDLE",
+            "-C",
+            "1",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let ars = String::from_utf8_lossy(&ar.stdout);
+    assert!(
+        ars.contains("AROUND_RANGE_NEEDLE") && !ars.contains("line_055"),
+        "outline file:L50-100 --around must filter inside range, got:\n{ars}"
+    );
+
+    // 1b. Multi-range truncation preserves trailing ranges in `next:` AND omits `--max-chars 0` bait
+    let mr = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/qa/src/big.ts:L1-40,L50-80,L100-115",
+            "--max-chars",
+            "700",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let mrs = String::from_utf8_lossy(&mr.stdout);
+    assert!(
+        mrs.contains("L50-80") && mrs.contains("L100-115") && !mrs.contains("--max-chars 0"),
+        "multi-range next: must preserve trailing ranges without --max-chars 0 bait, got:\n{mrs}"
+    );
+
+    // 2a. `grep --path apps/qa` must NOT leak `apps/qa-triage/src/triage.ts`
+    let gp = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "BRANCH_ALPHA",
+            "--path",
+            "apps/qa",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gps = String::from_utf8_lossy(&gp.stdout);
+    assert!(
+        gps.contains("apps/qa/src/alpha.ts") && !gps.contains("qa-triage"),
+        "grep --path apps/qa must not leak apps/qa-triage, got:\n{gps}"
+    );
+
+    // 2b. `files /abs/root/apps/qa --root /abs/root` lists files cleanly
+    let fabs = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "files",
+            base.join("apps/qa").to_str().unwrap(),
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let fabss = String::from_utf8_lossy(&fabs.stdout);
+    assert!(
+        fabss.contains("apps/qa/src/alpha.ts") && !fabss.contains("qa-triage"),
+        "files /abs/sub --root /abs/root must work, got:\n{fabss}"
+    );
+
+    // 3. `grep -l` / `--inventory` includes matched alternation branch tags + enclosing symbol
+    let ginv = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "BRANCH_ALPHA|AROUND_RANGE_NEEDLE",
+            "--inventory",
+            "--path",
+            "apps/qa",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let ginvs = String::from_utf8_lossy(&ginv.stdout);
+    assert!(
+        ginvs.contains("apps/qa/src/alpha.ts (1) [BRANCH_ALPHA]: runAlpha"),
+        "inventory should include branch tag + enclosing symbol, got:\n{ginvs}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}

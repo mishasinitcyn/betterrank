@@ -321,6 +321,30 @@ fn compile_glob_regex(pat: &str) -> Option<regex::Regex> {
         .ok()
 }
 
+fn matches_path_filter(graph_path: &str, raw_pf: &str) -> bool {
+    let pf = raw_pf.trim_start_matches("./").trim_end_matches('/');
+    if pf.is_empty() {
+        return true;
+    }
+    // Check directory/path segment boundaries so `--path apps/qa` matches `apps/qa/...`
+    // and `repo/apps/qa/...` without leaking sibling dirs like `apps/qa-triage/...`!
+    let mut start = 0usize;
+    while let Some(rel_idx) = graph_path[start..].find(pf) {
+        let idx = start + rel_idx;
+        let left_ok = idx == 0 || graph_path.as_bytes()[idx - 1] == b'/';
+        let end = idx + pf.len();
+        let right_ok = end == graph_path.len() || graph_path.as_bytes()[end] == b'/';
+        if left_ok && right_ok {
+            return true;
+        }
+        start = idx + 1;
+        if start >= graph_path.len() {
+            break;
+        }
+    }
+    false
+}
+
 fn matches_glob_filters(
     rel_path: &str,
     pos_globs: &[regex::Regex],
@@ -1152,11 +1176,11 @@ pub fn ranked_grep(
                     return None;
                 }
                 if !path_filters.is_empty()
-                    && !path_filters.iter().any(|pf| gp.contains(pf.as_str()))
+                    && !path_filters.iter().any(|pf| matches_path_filter(gp, pf))
                 {
                     return None;
                 }
-                if exclude_paths.iter().any(|ep| gp.contains(ep.as_str())) {
+                if exclude_paths.iter().any(|ep| matches_path_filter(gp, ep)) {
                     return None;
                 }
                 let abs = resolve_graph_abs_path(roots, gp);
@@ -1204,10 +1228,12 @@ pub fn ranked_grep(
                     {
                         return false;
                     }
-                    if !pfs.is_empty() && !pfs.iter().any(|pf| graph_path.contains(pf.as_str())) {
+                    if !pfs.is_empty()
+                        && !pfs.iter().any(|pf| matches_path_filter(graph_path, pf))
+                    {
                         return false;
                     }
-                    if eps.iter().any(|ep| graph_path.contains(ep.as_str())) {
+                    if eps.iter().any(|ep| matches_path_filter(graph_path, ep)) {
                         return false;
                     }
                     true

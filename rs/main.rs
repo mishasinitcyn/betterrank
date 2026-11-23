@@ -990,17 +990,23 @@ fn main() {
                 for fh in &res.hits {
                     let mut block = String::new();
                     if opts.files_only {
+                        let br_tag = if !fh.matched_branches.is_empty() {
+                            format!(" [{}]", fh.matched_branches.join(", "))
+                        } else {
+                            String::new()
+                        };
                         if !fh.enclosing_syms.is_empty() {
                             block.push_str(&format!(
-                                "{} ({}): {}\n",
+                                "{} ({}){}: {}\n",
                                 fh.file,
                                 fh.total_hits_in_file,
+                                br_tag,
                                 fh.enclosing_syms.join(", ")
                             ));
                         } else {
                             block.push_str(&format!(
-                                "{} ({})\n",
-                                fh.file, fh.total_hits_in_file
+                                "{} ({}){}\n",
+                                fh.file, fh.total_hits_in_file, br_tag
                             ));
                         }
                     } else if opts.compact {
@@ -1074,7 +1080,7 @@ fn main() {
                 if stopped_at_cap {
                     let cap_val = max_chars.unwrap_or(DEFAULT_NON_TTY_MAX_CHARS);
                     println!(
-                        "\n... (stopped at --max-chars {cap_val} after {shown_files} of {} files; {} total matches — narrow with --path / --compact or pass --max-chars 0)",
+                        "\n... (stopped at --max-chars {cap_val} after {shown_files} of {} files; {} total matches — narrow with --path, --compact, or --inventory)",
                         res.total_files, res.total_hits
                     );
                 } else if res.total_files > res.hits.len() {
@@ -1178,12 +1184,40 @@ fn main() {
         }
         "files" => {
             let files_limit = user_limit.unwrap_or(200);
-            let pats = files_positional_override
-                .as_deref()
-                .unwrap_or(&flags.positional);
+            let normalized_pats: Vec<String> = match files_positional_override {
+                Some(ref ov) => ov.clone(),
+                None => flags
+                    .positional
+                    .iter()
+                    .filter_map(|raw| {
+                        let p = Path::new(raw);
+                        if p.is_absolute() && p.exists() {
+                            if let Ok(abs) = fs::canonicalize(p) {
+                                for r in &idx.roots {
+                                    if abs == r.path {
+                                        if idx.is_multi_root() {
+                                            return Some(r.prefix.clone());
+                                        }
+                                        return None;
+                                    }
+                                    if let Ok(rel) = abs.strip_prefix(&r.path) {
+                                        let rel_s = normalize_slashes(&rel.to_string_lossy());
+                                        return Some(if idx.is_multi_root() {
+                                            format!("{}/{rel_s}", r.prefix)
+                                        } else {
+                                            rel_s
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Some(raw.clone())
+                    })
+                    .collect(),
+            };
             cmd_files(
                 g,
-                pats,
+                &normalized_pats,
                 flags.get("filter"),
                 flags.has("code"),
                 flags.has("non-code"),

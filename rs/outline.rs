@@ -62,12 +62,12 @@ fn format_source_line(line: &str, cap_long_lines: bool) -> std::borrow::Cow<'_, 
     }
     let prefix: String = line.chars().take(MAX_LINE_CHARS).collect();
     std::borrow::Cow::Owned(format!(
-        "{prefix}... (+{} chars truncated — pass --max-chars 0 for full line)",
+        "{prefix}... (+{} chars truncated)",
         char_count - MAX_LINE_CHARS
     ))
 }
 
-fn parse_header_end_line(line: &str) -> Option<(String, u32)> {
+fn parse_header_range(line: &str) -> Option<(String, u32, u32)> {
     // Matches `── file.ts:10-900 ──` or `── sym (file.ts:10-900) ──`
     // Careful: Next.js route-group paths like `app/(dashboard)/page.tsx:10-900` contain `(`!
     // Only unwrap `sym (...)` when the header actually ends with `)`.
@@ -82,9 +82,10 @@ fn parse_header_end_line(line: &str) -> Option<(String, u32)> {
         inner
     };
     let (file, range) = loc.rsplit_once(':')?;
-    let (_, end_s) = range.split_once('-')?;
+    let (start_s, end_s) = range.split_once('-')?;
+    let start_num: u32 = start_s.parse().ok()?;
     let end_num: u32 = end_s.parse().ok()?;
-    Some((file.to_string(), end_num))
+    Some((file.to_string(), start_num, end_num))
 }
 
 fn parse_numbered_line(line: &str) -> Option<u32> {
@@ -99,37 +100,64 @@ pub fn apply_max_chars(s: String, file_path: &str, max_chars: Option<usize>) -> 
     if limit == 0 || s.len() <= limit {
         return s;
     }
-    let mut kept = String::with_capacity(limit + 140);
-    let mut emitted_lines = 0usize;
-    let total_lines = s.lines().count();
-    let mut active_header: Option<(String, u32)> = None;
+    let all_lines: Vec<&str> = s.lines().collect();
+    let total_lines = all_lines.len();
+    let mut kept = String::with_capacity(limit + 180);
+    let mut active_header: Option<(String, u32, u32)> = None;
     let mut last_line_num: Option<u32> = None;
 
-    for line in s.lines() {
+    for (idx, &line) in all_lines.iter().enumerate() {
         let add_len = line.len() + if kept.is_empty() { 0 } else { 1 };
         if !kept.is_empty() && kept.len() + add_len > limit {
-            let omitted = total_lines.saturating_sub(emitted_lines);
-            let resume = match (active_header, last_line_num) {
-                (Some((f, end_ln)), Some(cur)) if cur < end_ln => {
-                    let arg = shell_quote_path_spec(&format!("{f}:L{}-{end_ln}", cur + 1));
-                    format!(" — next: betterrank outline {arg}")
+            let omitted = total_lines.saturating_sub(idx);
+            // Collect remaining range of the interrupted slice PLUS any trailing slices from the same file!
+            let mut next_ranges: Vec<String> = Vec::new();
+            let mut target_file = file_path.to_string();
+            if let Some((ref f, start_ln, end_ln)) = active_header {
+                target_file = f.clone();
+                let next_start = match last_line_num {
+                    Some(cur) if cur < end_ln => Some(cur + 1),
+                    None => Some(start_ln),
+                    _ => None,
+                };
+                if let Some(ns) = next_start {
+                    next_ranges.push(format!("L{ns}-{end_ln}"));
                 }
-                (None, Some(cur)) => {
-                    let arg = shell_quote_path_spec(&format!(
-                        "{file_path}:L{}-{}",
-                        cur + 1,
-                        cur + 300
-                    ));
-                    format!(" — next: betterrank outline {arg} (or --max-chars 0)")
+            } else if let Some(cur) = last_line_num {
+                next_ranges.push(format!("L{}-{}", cur + 1, cur + 300));
+            }
+            for &rem_line in &all_lines[idx..] {
+                if let Some((rf, rs, re)) = parse_header_range(rem_line) {
+                    if rf == target_file {
+                        let tag = format!("L{rs}-{re}");
+                        if !next_ranges.contains(&tag) {
+                            next_ranges.push(tag);
+                        }
+                    }
                 }
-                _ => " — pass --max-chars 0 to uncap".to_string(),
+            }
+            let resume = if !next_ranges.is_empty() {
+                let shown_ranges: Vec<&str> =
+                    next_ranges.iter().take(6).map(|r| r.as_str()).collect();
+                let extra = if next_ranges.len() > 6 {
+                    format!(" (+{} more hunks)", next_ranges.len() - 6)
+                } else {
+                    String::new()
+                };
+                let arg = shell_quote_path_spec(&format!(
+                    "{target_file}:{}",
+                    shown_ranges.join(",")
+                ));
+                format!(" — next: betterrank outline {arg}{extra}")
+            } else {
+                " — narrow with --filter <regex> or --around <regex>".to_string()
             };
             kept.push_str(&format!(
                 "\n... (truncated at --max-chars {limit}; {omitted} more lines omitted{resume})"
             ));
             return kept;
         }
-        if let Some(hdr) = parse_header_end_line(line) {
+        if let Some(hdr) = parse_header_range(line) {
             active_header = Some(hdr);
             last_line_num = None;
         } else if let Some(ln) = parse_numbered_line(line) {
@@ -139,7 +167,6 @@ pub fn apply_max_chars(s: String, file_path: &str, max_chars: Option<usize>) -> 
             kept.push('\n');
         }
         kept.push_str(line);
-        emitted_lines += 1;
     }
     kept
 }
@@ -511,11 +538,34 @@ fn build_outline_inner(
 
     // Fast path: if all expand targets are explicit line ranges (e.g. `outline schema.prisma 100-140,800-830`),
     // work cleanly on ANY file (including Prisma, YAML, JSON, Dockerfiles) without AST parsing!
+    // If `--around <regex>` is ALSO passed, run `around_mode` inside each requested line range!
     if !expand_symbols.is_empty()
         && expand_symbols
             .iter()
             .all(|s| parse_line_range(s).is_some() || s.eq_ignore_ascii_case("ALL"))
     {
+        if let Some(pat) = opts.around {
+            let mut chunks = Vec::new();
+            for target in expand_symbols {
+                let bounds = if target.eq_ignore_ascii_case("ALL") {
+                    None
+                } else {
+                    parse_line_range(target)
+                };
+                chunks.push(around_mode(
+                    &lines,
+                    file_path,
+                    pat,
+                    opts.around_before,
+                    opts.around_after,
+                    bounds,
+                    pad,
+                    opts.no_comments,
+                    ext,
+                ));
+            }
+            return chunks.join("\n\n");
+        }
         return expand_mode(
             &lines,
             &[],
@@ -947,7 +997,7 @@ fn compact_outline_mode(
         }
         if shown_rows < total_rows {
             out.push(format!(
-                "  ... (+{} more symbols — use --filter <regex>, --depth 1, or --max-chars 0)",
+                "  ... (+{} more symbols — use --filter <regex> or --depth 1)",
                 total_rows - shown_rows
             ));
         }
