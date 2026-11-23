@@ -144,6 +144,7 @@ impl CodeIndex {
 
         // Parse changed/uncached files per root in parallel via rayon, reusing per-root .parse.brbin caches!
         let mut all_records: Vec<ParsedFileRecord> = Vec::with_capacity(total_files);
+        let mut pending_parse_caches: Vec<(PathBuf, ParseCacheData)> = Vec::new();
         let mut total_reused = 0usize;
         let mut total_skipped = 0usize;
 
@@ -167,6 +168,9 @@ impl CodeIndex {
                 }
                 misses.push(wf);
             }
+
+            // Schedule largest files first (LPT) so huge files never become rayon tail stragglers
+            misses.sort_unstable_by(|a, b| b.size.cmp(&a.size));
 
             let newly_parsed: Vec<ParsedFileRecord> = misses
                 .par_iter()
@@ -203,28 +207,25 @@ impl CodeIndex {
                 })
                 .collect();
 
+            for rec in &newly_parsed {
+                if rec.skipped {
+                    total_skipped += 1;
+                }
+            }
+
             let cache_dirty = !newly_parsed.is_empty() || root_cache.len() != walked.len();
             if cache_dirty {
                 let mut next_cache_files: Vec<ParsedFileRecord> =
                     Vec::with_capacity(hits.len() + newly_parsed.len());
                 next_cache_files.extend(hits.iter().cloned());
-                for rec in &newly_parsed {
-                    if rec.skipped {
-                        total_skipped += 1;
-                    }
-                    next_cache_files.push(rec.clone());
-                }
-                let pdata = ParseCacheData {
-                    version: CACHE_FORMAT_VERSION,
-                    files: next_cache_files,
-                };
-                let _ = save_parse_cache(&pdata, &pcache_path);
-            } else {
-                for rec in &newly_parsed {
-                    if rec.skipped {
-                        total_skipped += 1;
-                    }
-                }
+                next_cache_files.extend(newly_parsed.iter().cloned());
+                pending_parse_caches.push((
+                    pcache_path,
+                    ParseCacheData {
+                        version: CACHE_FORMAT_VERSION,
+                        files: next_cache_files,
+                    },
+                ));
             }
             drop(root_cache);
 
@@ -237,7 +238,15 @@ impl CodeIndex {
             }
         }
 
-        let graph_data = build_graph_cache(&all_records, &resolver_ctx);
+        // Overlap `.parse.brbin` disk serialization concurrently with `build_graph_cache`!
+        let (graph_data, ()) = rayon::join(
+            || build_graph_cache(&all_records, &resolver_ctx),
+            || {
+                pending_parse_caches.par_iter().for_each(|(path, pdata)| {
+                    let _ = save_parse_cache(pdata, path);
+                });
+            },
+        );
         let sym_count = graph_data.symbols.len();
         let edge_count = graph_data.total_edges;
         let indexed_files = all_records.iter().filter(|r| !r.skipped).count();

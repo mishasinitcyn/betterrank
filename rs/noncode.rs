@@ -6,7 +6,6 @@ use grep_searcher::SearcherBuilder;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::fs;
 use std::path::PathBuf;
 
 const NONCODE_SKIP_DIRS: &[&str] = &[
@@ -112,6 +111,99 @@ fn truncate_line(s: &str, max_chars: usize) -> String {
     }
 }
 
+fn walk_root_parallel<F>(
+    r: &RootEntry,
+    skip_set: &std::sync::Arc<FxHashSet<&'static str>>,
+    max_bytes: u64,
+    accept: F,
+) -> Vec<(String, PathBuf)>
+where
+    F: Fn(&str, &str) -> bool + Send + Sync + 'static,
+{
+    use ignore::WalkState;
+    use std::sync::{Arc, Mutex};
+
+    let root_path = Arc::new(r.path.clone());
+    let prefix = Arc::new(r.prefix.clone());
+    let accept = Arc::new(accept);
+    let out: Arc<Mutex<Vec<(String, PathBuf)>>> = Arc::new(Mutex::new(Vec::with_capacity(512)));
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 12))
+        .unwrap_or(4);
+
+    let skip_for_filter = Arc::clone(skip_set);
+    let walker = WalkBuilder::new(&r.path)
+        .standard_filters(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false)
+        .hidden(false) // IMPORTANT: include `.github/workflows/*.yml`!
+        .threads(threads)
+        .filter_entry(move |e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                return !skip_for_filter.contains(name.as_ref());
+            }
+            true
+        })
+        .build_parallel();
+
+    walker.run(|| {
+        let root_path = Arc::clone(&root_path);
+        let prefix = Arc::clone(&prefix);
+        let accept = Arc::clone(&accept);
+        let out = Arc::clone(&out);
+
+        struct Flusher {
+            local: Vec<(String, PathBuf)>,
+            out: Arc<Mutex<Vec<(String, PathBuf)>>>,
+        }
+        impl Drop for Flusher {
+            fn drop(&mut self) {
+                if !self.local.is_empty() {
+                    if let Ok(mut guard) = self.out.lock() {
+                        guard.append(&mut self.local);
+                    }
+                }
+            }
+        }
+        let mut flusher = Flusher {
+            local: Vec::with_capacity(128),
+            out,
+        };
+
+        Box::new(move |res| {
+            if let Ok(entry) = res {
+                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    let abs = entry.path();
+                    if let Ok(rel) = abs.strip_prefix(&*root_path) {
+                        let rel_str = normalize_slashes(&rel.to_string_lossy());
+                        let graph_path = if prefix.is_empty() {
+                            rel_str.clone()
+                        } else {
+                            format!("{}/{rel_str}", *prefix)
+                        };
+                        if accept(&rel_str, &graph_path) {
+                            if entry.metadata().map_or(false, |m| m.len() <= max_bytes) {
+                                flusher.local.push((graph_path, abs.to_path_buf()));
+                            }
+                        }
+                    }
+                }
+            }
+            WalkState::Continue
+        })
+    });
+
+    match Arc::try_unwrap(out) {
+        Ok(m) => m.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().map(|g| g.clone()).unwrap_or_default(),
+    }
+}
+
 /// Fast parallel ripgrep-crate scan over non-code/config files for a symbol or file stem.
 /// Used automatically by `callers`, `dependents`, and `search` so agents never miss
 /// Dockerfiles, CI workflows, Prisma schemas, SQL, or JSON contracts.
@@ -131,53 +223,20 @@ pub fn find_noncode_mentions(
         Err(_) => return (Vec::new(), 0),
     };
 
-    let skip_set: FxHashSet<&'static str> = NONCODE_SKIP_DIRS.iter().copied().collect();
-    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
-
-    for r in roots {
-        let skip_ref = skip_set.clone();
-        let walker = WalkBuilder::new(&r.path)
-            .standard_filters(false)
-            .git_ignore(true)
-            .git_global(false)
-            .git_exclude(false)
-            .hidden(false) // IMPORTANT: include `.github/workflows/*.yml`!
-            .filter_entry(move |e| {
-                if e.depth() == 0 {
-                    return true;
-                }
-                let name = e.file_name().to_string_lossy();
-                if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    return !skip_ref.contains(name.as_ref());
-                }
-                true
+    let skip_set = std::sync::Arc::new(
+        NONCODE_SKIP_DIRS
+            .iter()
+            .copied()
+            .collect::<FxHashSet<&'static str>>(),
+    );
+    let candidates: Vec<(String, PathBuf)> = roots
+        .par_iter()
+        .flat_map(|r| {
+            walk_root_parallel(r, &skip_set, 512 * 1024, |rel_str, _| {
+                is_noncode_config_file(rel_str)
             })
-            .build();
-
-        for entry in walker.flatten() {
-            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let abs = entry.path();
-            let Ok(rel) = abs.strip_prefix(&r.path) else {
-                continue;
-            };
-            let rel_str = normalize_slashes(&rel.to_string_lossy());
-            if !is_noncode_config_file(&rel_str) {
-                continue;
-            }
-            // Skip oversized JSON data dumps (> 512 KB)
-            if fs::metadata(abs).map_or(true, |m| m.len() > 512 * 1024) {
-                continue;
-            }
-            let graph_path = if r.prefix.is_empty() {
-                rel_str
-            } else {
-                format!("{}/{rel_str}", r.prefix)
-            };
-            candidates.push((graph_path, abs.to_path_buf()));
-        }
-    }
+        })
+        .collect();
 
     let mut matched: Vec<TextFileHits> = candidates
         .into_par_iter()
@@ -276,68 +335,43 @@ pub fn ranked_grep(
         }
     }
 
-    let skip_set: FxHashSet<&'static str> = NONCODE_SKIP_DIRS.iter().copied().collect();
-    let mut candidates: Vec<(String, PathBuf)> = Vec::with_capacity(4096);
+    let skip_set = std::sync::Arc::new(
+        NONCODE_SKIP_DIRS
+            .iter()
+            .copied()
+            .collect::<FxHashSet<&'static str>>(),
+    );
+    let noncode_only = opts.noncode_only;
+    let no_tests = opts.no_tests;
+    let path_filter = opts.path_filter.clone();
 
-    for r in roots {
-        let skip_ref = skip_set.clone();
-        let walker = WalkBuilder::new(&r.path)
-            .standard_filters(false)
-            .git_ignore(true)
-            .git_global(false)
-            .git_exclude(false)
-            .hidden(false)
-            .filter_entry(move |e| {
-                if e.depth() == 0 {
-                    return true;
+    let candidates: Vec<(String, PathBuf)> = roots
+        .par_iter()
+        .flat_map(|r| {
+            let pf_opt = path_filter.clone();
+            walk_root_parallel(r, &skip_set, 2 * 1024 * 1024, move |rel_str, graph_path| {
+                let base = rel_str.rsplit('/').next().unwrap_or(rel_str);
+                if NONCODE_SKIP_FILES
+                    .iter()
+                    .any(|&s| base.eq_ignore_ascii_case(s))
+                {
+                    return false;
                 }
-                let name = e.file_name().to_string_lossy();
-                if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    return !skip_ref.contains(name.as_ref());
+                if noncode_only && !is_noncode_config_file(rel_str) {
+                    return false;
+                }
+                if no_tests && is_test_file(graph_path) {
+                    return false;
+                }
+                if let Some(ref pf) = pf_opt {
+                    if !graph_path.contains(pf.as_str()) {
+                        return false;
+                    }
                 }
                 true
             })
-            .build();
-
-        for entry in walker.flatten() {
-            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let abs = entry.path();
-            let Ok(rel) = abs.strip_prefix(&r.path) else {
-                continue;
-            };
-            let rel_str = normalize_slashes(&rel.to_string_lossy());
-            let base = rel_str.rsplit('/').next().unwrap_or(&rel_str);
-            if NONCODE_SKIP_FILES
-                .iter()
-                .any(|&s| base.eq_ignore_ascii_case(s))
-            {
-                continue;
-            }
-            if opts.noncode_only && !is_noncode_config_file(&rel_str) {
-                continue;
-            }
-            let graph_path = if r.prefix.is_empty() {
-                rel_str
-            } else {
-                format!("{}/{rel_str}", r.prefix)
-            };
-            if opts.no_tests && is_test_file(&graph_path) {
-                continue;
-            }
-            if let Some(ref pf) = opts.path_filter {
-                if !graph_path.contains(pf.as_str()) {
-                    continue;
-                }
-            }
-            // Skip binary/huge files (> 2 MB)
-            if fs::metadata(abs).map_or(true, |m| m.len() > 2 * 1024 * 1024) {
-                continue;
-            }
-            candidates.push((graph_path, abs.to_path_buf()));
-        }
-    }
+        })
+        .collect();
 
     let max_per_file = if opts.files_only {
         0

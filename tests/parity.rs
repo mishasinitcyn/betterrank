@@ -252,3 +252,45 @@ fn outline_depth_lines_and_b2_b4_precision() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn global_flags_before_subcommand_and_multiword_search() {
+    let base = temp_dir("cli-flags-search");
+    let cache_dir = base.join("cache");
+    fs::create_dir_all(base.join("src/review")).unwrap();
+    fs::write(
+        base.join("src/review/user-management.ts"),
+        "export function listReviewUsers() { return []; }\nexport const USER_MANAGEMENT_ROLES = ['admin'];\n",
+    )
+    .unwrap();
+
+    // Global `--root` BEFORE subcommand
+    let out = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["--root", base.to_str().unwrap(), "map", "--limit", "10"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let map_out = String::from_utf8_lossy(&out.stdout);
+    assert!(map_out.contains("listReviewUsers"), "got:\n{map_out}");
+
+    // `--root=<path>` equals form + multi-word `search`
+    let search_out = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            &format!("--root={}", base.to_str().unwrap()),
+            "search",
+            "user management review",
+            "--no-noncode",
+        ])
+        .output()
+        .unwrap();
+    assert!(search_out.status.success());
+    let s = String::from_utf8_lossy(&search_out.stdout);
+    assert!(
+        s.contains("USER_MANAGEMENT_ROLES"),
+        "expected multi-word tokenized search match, got:\n{s}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}

@@ -5,6 +5,7 @@ use crate::model::{
 };
 use crate::parser::is_method_noise;
 use memmap2::Mmap;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -326,19 +327,6 @@ fn resolve_import_target_idx(
     None
 }
 
-fn is_source_independent_spec(spec: &str, is_py: bool) -> bool {
-    if spec.is_empty() || spec.starts_with('.') {
-        return false;
-    }
-    if is_py {
-        return true;
-    }
-    !(spec.starts_with("~/")
-        || spec.starts_with("@/")
-        || spec.starts_with('/')
-        || spec.starts_with("src/"))
-}
-
 struct SymDesc {
     sym_idx: u32,
     file_idx: u32,
@@ -520,50 +508,45 @@ pub fn build_graph_cache(
         });
     }
 
-    // Pass 1: Explicit AST IMPORTS edges only
-    let mut imp_out: Vec<Vec<(u32, bool)>> = vec![Vec::new(); num_files];
-    let mut imp_in: Vec<Vec<u32>> = vec![Vec::new(); num_files];
-    let mut spec_cache: FxHashMap<(bool, String), Option<u32>> = FxHashMap::default();
-    let has_ts_paths = !ctx.ts_path_mappings.is_empty();
-
-    for (f_idx_u, rec) in records.iter().enumerate() {
-        if rec.skipped || rec.imports.is_empty() {
-            continue;
-        }
-        let f_idx = f_idx_u as u32;
-        let is_py = file_families[f_idx_u] == LangFamily::Python;
-        let can_cache_js = !has_ts_paths && file_families[f_idx_u] == LangFamily::Js;
-
-        let mut seen_targets: FxHashMap<u32, usize> = FxHashMap::default();
-        for imp in &rec.imports {
-            let target = if (is_py || can_cache_js) && is_source_independent_spec(&imp.path, is_py)
-            {
-                let key = (is_py, imp.path.clone());
-                if let Some(&cached) = spec_cache.get(&key) {
-                    cached
+    // Pass 1: Explicit AST IMPORTS edges only (parallelized per file)
+    let imp_out: Vec<Vec<(u32, bool)>> = records
+        .par_iter()
+        .enumerate()
+        .map(|(f_idx_u, rec)| {
+            if rec.skipped || rec.imports.is_empty() {
+                return Vec::new();
+            }
+            let f_idx = f_idx_u as u32;
+            let mut out: Vec<(u32, bool)> = Vec::with_capacity(rec.imports.len());
+            let mut seen_targets: FxHashMap<u32, usize> = FxHashMap::default();
+            for imp in &rec.imports {
+                let Some(dst) =
+                    resolve_import_target_idx(&rec.rel_path, &imp.path, &file_lookup, ctx)
+                else {
+                    continue;
+                };
+                if dst == f_idx {
+                    continue;
+                }
+                if let Some(&pos) = seen_targets.get(&dst) {
+                    if imp.is_reexport {
+                        out[pos].1 = true;
+                    }
                 } else {
-                    let res = resolve_import_target_idx(&rec.rel_path, &imp.path, &file_lookup, ctx);
-                    spec_cache.insert(key, res);
-                    res
+                    let pos = out.len();
+                    seen_targets.insert(dst, pos);
+                    out.push((dst, imp.is_reexport));
                 }
-            } else {
-                resolve_import_target_idx(&rec.rel_path, &imp.path, &file_lookup, ctx)
-            };
+            }
+            out
+        })
+        .collect();
 
-            let Some(dst) = target else { continue };
-            if dst == f_idx {
-                continue;
-            }
-            if let Some(&pos) = seen_targets.get(&dst) {
-                if imp.is_reexport {
-                    imp_out[f_idx_u][pos].1 = true;
-                }
-            } else {
-                let pos = imp_out[f_idx_u].len();
-                seen_targets.insert(dst, pos);
-                imp_out[f_idx_u].push((dst, imp.is_reexport));
-                imp_in[dst as usize].push(f_idx);
-            }
+    let mut imp_in: Vec<Vec<u32>> = vec![Vec::new(); num_files];
+    for (f_idx_u, adj) in imp_out.iter().enumerate() {
+        let f_idx = f_idx_u as u32;
+        for &(dst, _) in adj {
+            imp_in[dst as usize].push(f_idx);
         }
     }
 
@@ -578,190 +561,258 @@ pub fn build_graph_cache(
         }
     }
 
-    // Cached barrel-only BFS reachability (up to 4 hops)
-    let mut reach_cache: FxHashMap<u32, FxHashMap<u32, u8>> = FxHashMap::default();
-    fn get_reachable<'a>(
+    fn compute_reachable(
         file_idx: u32,
         max_hops: u8,
         imp_out: &[Vec<(u32, bool)>],
         reexport_adj: &[Vec<u32>],
-        reach_cache: &'a mut FxHashMap<u32, FxHashMap<u32, u8>>,
-    ) -> Option<&'a FxHashMap<u32, u8>> {
+    ) -> Option<FxHashMap<u32, u8>> {
         if imp_out[file_idx as usize].is_empty() {
             return None;
         }
-        if !reach_cache.contains_key(&file_idx) {
-            let mut dist = FxHashMap::default();
-            let mut queue = VecDeque::new();
-            for &(dst, _) in &imp_out[file_idx as usize] {
-                dist.insert(dst, 1u8);
-                queue.push_back(dst);
+        let mut dist = FxHashMap::default();
+        let mut queue = VecDeque::new();
+        for &(dst, _) in &imp_out[file_idx as usize] {
+            dist.insert(dst, 1u8);
+            queue.push_back(dst);
+        }
+        while let Some(cur) = queue.pop_front() {
+            let d = dist[&cur];
+            if d >= max_hops {
+                continue;
             }
-            while let Some(cur) = queue.pop_front() {
-                let d = dist[&cur];
-                if d >= max_hops {
+            for &nxt in &reexport_adj[cur as usize] {
+                if nxt == file_idx || dist.contains_key(&nxt) {
                     continue;
                 }
-                for &nxt in &reexport_adj[cur as usize] {
-                    if nxt == file_idx || dist.contains_key(&nxt) {
-                        continue;
-                    }
-                    dist.insert(nxt, d + 1);
-                    queue.push_back(nxt);
-                }
+                dist.insert(nxt, d + 1);
+                queue.push_back(nxt);
             }
-            reach_cache.insert(file_idx, dist);
         }
-        reach_cache.get(&file_idx)
+        Some(dist)
     }
 
-    // Pass 2: Import-scoped symbol REFERENCES edges
-    let mut ref_out: Vec<Vec<u32>> = vec![Vec::new(); num_files];
-    let mut ref_in: Vec<Vec<u32>> = vec![Vec::new(); symbols.len()];
-    let mut mod_resolve_cache: FxHashMap<(u32, String), Option<u32>> = FxHashMap::default();
-
-    for (f_idx_u, rec) in records.iter().enumerate() {
-        if rec.skipped || rec.references.is_empty() {
-            continue;
-        }
-        let f_idx = f_idx_u as u32;
-        let src_family = file_families[f_idx_u];
-        let is_py = src_family == LangFamily::Python;
-        let is_js = src_family == LangFamily::Js;
-        let mut added_for_file: FxHashSet<u32> = FxHashSet::default();
-
-        for r in &rec.references {
-            if r.kind == RefKind::Method as u8 && (is_method_noise(&r.name) || r.name.len() < 3) {
-                continue;
+    // Pass 2: Import-scoped symbol REFERENCES edges (parallelized per file)
+    let ref_out: Vec<Vec<u32>> = records
+        .par_iter()
+        .enumerate()
+        .map(|(f_idx_u, rec)| {
+            if rec.skipped || rec.references.is_empty() {
+                return Vec::new();
             }
-            let Some(bucket) = def_index.get(r.name.as_str()) else {
-                continue;
-            };
-            if r.kind == RefKind::Property as u8
-                && r.receiver_module.is_none()
-                && !bucket.has_property
-            {
-                continue;
-            }
-            if r.kind == RefKind::Method as u8 && !bucket.has_method_or_py_callable {
-                continue;
-            }
+            let f_idx = f_idx_u as u32;
+            let src_family = file_families[f_idx_u];
+            let is_py = src_family == LangFamily::Python;
+            let is_js = src_family == LangFamily::Js;
 
-            // Filter to same-file or (same language family + exported)
-            let mut targets: Vec<&SymDesc> = Vec::new();
-            for desc in &bucket.items {
-                if desc.file_idx == f_idx {
-                    targets.push(desc);
-                } else if desc.family == src_family && desc.exported {
-                    targets.push(desc);
+            let mut out: Vec<u32> = Vec::new();
+            let mut added_for_file: FxHashSet<u32> = FxHashSet::default();
+            let mut self_reach_computed = false;
+            let mut self_reach: Option<FxHashMap<u32, u8>> = None;
+            let mut mod_resolve_cache: FxHashMap<&str, Option<u32>> = FxHashMap::default();
+            let mut mod_reach_cache: FxHashMap<u32, Option<FxHashMap<u32, u8>>> =
+                FxHashMap::default();
+
+            for r in &rec.references {
+                if r.kind == RefKind::Method as u8 && (is_method_noise(&r.name) || r.name.len() < 3)
+                {
+                    continue;
                 }
-            }
-            if targets.is_empty() {
-                continue;
-            }
-
-            let mut resolved: Vec<&SymDesc> = Vec::new();
-
-            if r.kind == RefKind::Method as u8 {
-                let eligible: Vec<&SymDesc> = targets
-                    .into_iter()
-                    .filter(|t| {
-                        t.kind == SymbolKind::Method as u8
-                            || (is_py
-                                && (t.kind == SymbolKind::Function as u8
-                                    || t.kind == SymbolKind::Class as u8))
-                    })
-                    .collect();
-                if eligible.is_empty() {
+                let Some(bucket) = def_index.get(r.name.as_str()) else {
+                    continue;
+                };
+                if r.kind == RefKind::Property as u8
+                    && r.receiver_module.is_none()
+                    && !bucket.has_property
+                {
+                    continue;
+                }
+                if r.kind == RefKind::Method as u8 && !bucket.has_method_or_py_callable {
                     continue;
                 }
 
-                let mut recv_mod_matched_file = false;
-                if let Some(ref mod_spec) = r.receiver_module {
-                    let mk = (f_idx, mod_spec.clone());
-                    let mod_file = *mod_resolve_cache.entry(mk).or_insert_with(|| {
-                        resolve_import_target_idx(&rec.rel_path, mod_spec, &file_lookup, ctx)
-                    });
-                    if let Some(mf) = mod_file {
-                        recv_mod_matched_file = true;
-                        let direct: Vec<&SymDesc> =
-                            eligible.iter().copied().filter(|t| t.file_idx == mf).collect();
-                        if !direct.is_empty() {
-                            resolved = direct;
-                        } else if let Some(mod_reach) =
-                            get_reachable(mf, 2, &imp_out, &reexport_adj, &mut reach_cache)
-                        {
-                            resolved = eligible
-                                .iter()
-                                .copied()
-                                .filter(|t| mod_reach.contains_key(&t.file_idx))
-                                .collect();
-                        }
+                let mut targets: Vec<&SymDesc> = Vec::new();
+                for desc in &bucket.items {
+                    if desc.file_idx == f_idx {
+                        targets.push(desc);
+                    } else if desc.family == src_family && desc.exported {
+                        targets.push(desc);
                     }
+                }
+                if targets.is_empty() {
+                    continue;
                 }
 
-                if resolved.is_empty() && !recv_mod_matched_file {
-                    let same: Vec<&SymDesc> = eligible
-                        .iter()
-                        .copied()
-                        .filter(|t| t.file_idx == f_idx)
-                        .collect();
-                    if !same.is_empty() {
-                        resolved = same;
-                    } else if let Some(dist_map) =
-                        get_reachable(f_idx, 4, &imp_out, &reexport_adj, &mut reach_cache)
-                    {
-                        resolved = filter_closest_reachable(&eligible, dist_map);
-                    }
-                }
-            } else if r.kind == RefKind::Property as u8 {
-                let mut recv_mod_matched_file = false;
-                if let Some(ref mod_spec) = r.receiver_module {
-                    let mk = (f_idx, mod_spec.clone());
-                    let mod_file = *mod_resolve_cache.entry(mk).or_insert_with(|| {
-                        resolve_import_target_idx(&rec.rel_path, mod_spec, &file_lookup, ctx)
-                    });
-                    if let Some(mf) = mod_file {
-                        recv_mod_matched_file = true;
-                        let pool: Vec<&SymDesc> = if is_py {
-                            targets.clone()
-                        } else {
-                            targets
-                                .iter()
-                                .copied()
-                                .filter(|t| {
-                                    t.kind == SymbolKind::Property as u8
-                                        || t.kind == SymbolKind::Function as u8
-                                        || t.kind == SymbolKind::Variable as u8
-                                        || t.kind == SymbolKind::Class as u8
-                                })
-                                .collect()
-                        };
-                        let direct: Vec<&SymDesc> =
-                            pool.iter().copied().filter(|t| t.file_idx == mf).collect();
-                        if !direct.is_empty() {
-                            resolved = direct;
-                        } else if let Some(mod_reach) =
-                            get_reachable(mf, 2, &imp_out, &reexport_adj, &mut reach_cache)
-                        {
-                            resolved = pool
-                                .iter()
-                                .copied()
-                                .filter(|t| mod_reach.contains_key(&t.file_idx))
-                                .collect();
-                        }
-                    }
-                }
+                let mut resolved: Vec<&SymDesc> = Vec::new();
 
-                if resolved.is_empty() && !recv_mod_matched_file {
-                    let prop_targets: Vec<&SymDesc> = targets
+                if r.kind == RefKind::Method as u8 {
+                    let eligible: Vec<&SymDesc> = targets
                         .into_iter()
-                        .filter(|t| t.kind == SymbolKind::Property as u8)
+                        .filter(|t| {
+                            t.kind == SymbolKind::Method as u8
+                                || (is_py
+                                    && (t.kind == SymbolKind::Function as u8
+                                        || t.kind == SymbolKind::Class as u8))
+                        })
                         .collect();
-                    if prop_targets.is_empty() {
+                    if eligible.is_empty() {
                         continue;
                     }
-                    let same: Vec<&SymDesc> = prop_targets
+
+                    let mut recv_mod_matched_file = false;
+                    if let Some(ref mod_spec) = r.receiver_module {
+                        let mod_file = *mod_resolve_cache
+                            .entry(mod_spec.as_str())
+                            .or_insert_with(|| {
+                                resolve_import_target_idx(
+                                    &rec.rel_path,
+                                    mod_spec,
+                                    &file_lookup,
+                                    ctx,
+                                )
+                            });
+                        if let Some(mf) = mod_file {
+                            recv_mod_matched_file = true;
+                            let direct: Vec<&SymDesc> = eligible
+                                .iter()
+                                .copied()
+                                .filter(|t| t.file_idx == mf)
+                                .collect();
+                            if !direct.is_empty() {
+                                resolved = direct;
+                            } else {
+                                let mr = mod_reach_cache.entry(mf).or_insert_with(|| {
+                                    compute_reachable(mf, 2, &imp_out, &reexport_adj)
+                                });
+                                if let Some(mod_reach) = mr.as_ref() {
+                                    resolved = eligible
+                                        .iter()
+                                        .copied()
+                                        .filter(|t| mod_reach.contains_key(&t.file_idx))
+                                        .collect();
+                                }
+                            }
+                        }
+                    }
+
+                    if resolved.is_empty() && !recv_mod_matched_file {
+                        let same: Vec<&SymDesc> = eligible
+                            .iter()
+                            .copied()
+                            .filter(|t| t.file_idx == f_idx)
+                            .collect();
+                        if !same.is_empty() {
+                            resolved = same;
+                        } else {
+                            if !self_reach_computed {
+                                self_reach =
+                                    compute_reachable(f_idx, 4, &imp_out, &reexport_adj);
+                                self_reach_computed = true;
+                            }
+                            if let Some(dist_map) = self_reach.as_ref() {
+                                resolved = filter_closest_reachable(&eligible, dist_map);
+                            }
+                        }
+                    }
+                } else if r.kind == RefKind::Property as u8 {
+                    let mut recv_mod_matched_file = false;
+                    if let Some(ref mod_spec) = r.receiver_module {
+                        let mod_file = *mod_resolve_cache
+                            .entry(mod_spec.as_str())
+                            .or_insert_with(|| {
+                                resolve_import_target_idx(
+                                    &rec.rel_path,
+                                    mod_spec,
+                                    &file_lookup,
+                                    ctx,
+                                )
+                            });
+                        if let Some(mf) = mod_file {
+                            recv_mod_matched_file = true;
+                            let pool: Vec<&SymDesc> = if is_py {
+                                targets.clone()
+                            } else {
+                                targets
+                                    .iter()
+                                    .copied()
+                                    .filter(|t| {
+                                        t.kind == SymbolKind::Property as u8
+                                            || t.kind == SymbolKind::Function as u8
+                                            || t.kind == SymbolKind::Variable as u8
+                                            || t.kind == SymbolKind::Class as u8
+                                    })
+                                    .collect()
+                            };
+                            let direct: Vec<&SymDesc> = pool
+                                .iter()
+                                .copied()
+                                .filter(|t| t.file_idx == mf)
+                                .collect();
+                            if !direct.is_empty() {
+                                resolved = direct;
+                            } else {
+                                let mr = mod_reach_cache.entry(mf).or_insert_with(|| {
+                                    compute_reachable(mf, 2, &imp_out, &reexport_adj)
+                                });
+                                if let Some(mod_reach) = mr.as_ref() {
+                                    resolved = pool
+                                        .iter()
+                                        .copied()
+                                        .filter(|t| mod_reach.contains_key(&t.file_idx))
+                                        .collect();
+                                }
+                            }
+                        }
+                    }
+
+                    if resolved.is_empty() && !recv_mod_matched_file {
+                        let prop_targets: Vec<&SymDesc> = targets
+                            .into_iter()
+                            .filter(|t| t.kind == SymbolKind::Property as u8)
+                            .collect();
+                        if prop_targets.is_empty() {
+                            continue;
+                        }
+                        let same: Vec<&SymDesc> = prop_targets
+                            .iter()
+                            .copied()
+                            .filter(|t| t.file_idx == f_idx)
+                            .collect();
+                        if !same.is_empty() {
+                            resolved = same;
+                        } else {
+                            let recv_matches = match_property_targets_by_receiver(
+                                &prop_targets,
+                                r.receiver.as_deref(),
+                            );
+                            if !recv_matches.is_empty() {
+                                resolved = recv_matches;
+                            } else if r.is_rpc_chain || !is_method_noise(&r.name) {
+                                if !self_reach_computed {
+                                    self_reach =
+                                        compute_reachable(f_idx, 4, &imp_out, &reexport_adj);
+                                    self_reach_computed = true;
+                                }
+                                if let Some(dist_map) = self_reach.as_ref() {
+                                    resolved = filter_closest_reachable(&prop_targets, dist_map);
+                                }
+                                if resolved.is_empty() && r.is_rpc_chain && prop_targets.len() <= 2
+                                {
+                                    resolved = prop_targets;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Lane C: bare symbol references
+                    let non_method: Vec<&SymDesc> = targets
+                        .into_iter()
+                        .filter(|t| t.kind != SymbolKind::Method as u8)
+                        .collect();
+                    if non_method.is_empty() {
+                        continue;
+                    }
+                    let same: Vec<&SymDesc> = non_method
                         .iter()
                         .copied()
                         .filter(|t| t.file_idx == f_idx)
@@ -769,68 +820,46 @@ pub fn build_graph_cache(
                     if !same.is_empty() {
                         resolved = same;
                     } else {
-                        let recv_matches = match_property_targets_by_receiver(
-                            &prop_targets,
-                            r.receiver.as_deref(),
-                        );
-                        if !recv_matches.is_empty() {
-                            resolved = recv_matches;
-                        } else if r.is_rpc_chain || !is_method_noise(&r.name) {
-                            if let Some(dist_map) =
-                                get_reachable(f_idx, 4, &imp_out, &reexport_adj, &mut reach_cache)
-                            {
-                                resolved = filter_closest_reachable(&prop_targets, dist_map);
-                            }
-                            if resolved.is_empty() && r.is_rpc_chain && prop_targets.len() <= 2 {
-                                resolved = prop_targets;
+                        if !self_reach_computed {
+                            self_reach = compute_reachable(f_idx, 4, &imp_out, &reexport_adj);
+                            self_reach_computed = true;
+                        }
+                        if let Some(dist_map) = self_reach.as_ref() {
+                            resolved = filter_closest_reachable(&non_method, dist_map);
+                        }
+                        if resolved.is_empty() && !is_js && !is_py {
+                            let src_dir = posix_dirname(&rec.rel_path);
+                            let same_dir: Vec<&SymDesc> = non_method
+                                .iter()
+                                .copied()
+                                .filter(|t| {
+                                    posix_dirname(&files[t.file_idx as usize].path) == src_dir
+                                })
+                                .collect();
+                            if !same_dir.is_empty() {
+                                resolved = same_dir;
+                            } else if non_method.len() <= AMBIGUITY_CAP {
+                                resolved = non_method;
                             }
                         }
                     }
                 }
-            } else {
-                // Lane C: bare symbol references
-                let non_method: Vec<&SymDesc> = targets
-                    .into_iter()
-                    .filter(|t| t.kind != SymbolKind::Method as u8)
-                    .collect();
-                if non_method.is_empty() {
-                    continue;
-                }
-                let same: Vec<&SymDesc> = non_method
-                    .iter()
-                    .copied()
-                    .filter(|t| t.file_idx == f_idx)
-                    .collect();
-                if !same.is_empty() {
-                    resolved = same;
-                } else {
-                    if let Some(dist_map) =
-                        get_reachable(f_idx, 4, &imp_out, &reexport_adj, &mut reach_cache)
-                    {
-                        resolved = filter_closest_reachable(&non_method, dist_map);
-                    }
-                    if resolved.is_empty() && !is_js && !is_py {
-                        let src_dir = posix_dirname(&rec.rel_path);
-                        let same_dir: Vec<&SymDesc> = non_method
-                            .iter()
-                            .copied()
-                            .filter(|t| posix_dirname(&files[t.file_idx as usize].path) == src_dir)
-                            .collect();
-                        if !same_dir.is_empty() {
-                            resolved = same_dir;
-                        } else if non_method.len() <= AMBIGUITY_CAP {
-                            resolved = non_method;
-                        }
-                    }
-                }
-            }
 
-            for t in resolved {
-                if added_for_file.insert(t.sym_idx) {
-                    ref_out[f_idx_u].push(t.sym_idx);
-                    ref_in[t.sym_idx as usize].push(f_idx);
+                for t in resolved {
+                    if added_for_file.insert(t.sym_idx) {
+                        out.push(t.sym_idx);
+                    }
                 }
             }
+            out
+        })
+        .collect();
+
+    let mut ref_in: Vec<Vec<u32>> = vec![Vec::new(); symbols.len()];
+    for (f_idx_u, syms) in ref_out.iter().enumerate() {
+        let f_idx = f_idx_u as u32;
+        for &si in syms {
+            ref_in[si as usize].push(f_idx);
         }
     }
 

@@ -1490,11 +1490,41 @@ pub struct ParseOptions {
     pub dedupe: bool,
 }
 
+pub(crate) fn create_definition_pub(
+    name: String,
+    node: Node,
+    lang: Lang,
+    src: &[u8],
+    explicit_kind: Option<SymbolKind>,
+    explicit_exported: Option<bool>,
+    explicit_body_start: Option<u32>,
+) -> ParsedDef {
+    create_definition(
+        name,
+        node,
+        lang,
+        src,
+        explicit_kind,
+        explicit_exported,
+        explicit_body_start,
+    )
+}
+
+pub(crate) fn extract_callee_leaf_name_pub<'a>(node: Node<'a>, src: &'a [u8]) -> Option<&'a str> {
+    extract_callee_leaf_name(node, src)
+}
+
 pub fn parse_file(file_path: &str, source: &str, opts: ParseOptions) -> Option<ParseOutput> {
     let lang = Lang::from_path(file_path)?;
+    if lang.is_js() && !opts.include_outline_defs && !opts.include_local_refs && opts.dedupe {
+        return crate::oxc_index::parse_js_index_oxc(file_path, source, lang);
+    }
     let src = source.as_bytes();
     let tree = with_parser(lang, |p| p.parse(src, None))?;
     let root = tree.root_node();
+    if lang == Lang::Python && !opts.include_outline_defs && !opts.include_local_refs && opts.dedupe {
+        return Some(crate::py_index::parse_python_index(root, src));
+    }
     let q = queries_for(lang);
 
     let js_bottom_exports = if lang.is_js() {

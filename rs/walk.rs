@@ -1,6 +1,5 @@
 use crate::model::{is_supported_extension, ResolverCtx, RootEntry, TsPathMapping, WorkspacePackage};
 use ignore::WalkBuilder;
-use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
@@ -214,25 +213,33 @@ pub fn load_root_extra_ignores(root: &Path) -> Vec<String> {
 /// Fast parallel file walker using ripgrep's `ignore` crate (respects `.gitignore`,
 /// skips hidden/build/vendor directories before descending, filters to supported extensions).
 pub fn walk_source_files(root: &Path, extra_ignores: &[String]) -> Vec<WalkedFile> {
-    let prune_set: FxHashSet<&'static str> = FAST_PRUNE_DIRS.iter().copied().collect();
-    let root_buf = root.to_path_buf();
-    let extra_owned = extra_ignores.to_vec();
+    use ignore::WalkState;
+    use std::sync::{Arc, Mutex};
 
-    // Collect candidate relative paths with ignore's parallel walker or fast single walker + rayon stat
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(2048);
+    let prune_set: Arc<FxHashSet<&'static str>> = Arc::new(FAST_PRUNE_DIRS.iter().copied().collect());
+    let root_buf = Arc::new(root.to_path_buf());
+    let extra_owned = Arc::new(extra_ignores.to_vec());
+    let out: Arc<Mutex<Vec<WalkedFile>>> = Arc::new(Mutex::new(Vec::with_capacity(2048)));
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 12))
+        .unwrap_or(4);
+
+    let prune_for_filter = Arc::clone(&prune_set);
     let walker = WalkBuilder::new(root)
         .standard_filters(false)
         .git_ignore(true)
         .git_global(false)
         .git_exclude(false)
         .hidden(false)
+        .threads(threads)
         .filter_entry(move |entry| {
             if entry.depth() == 0 {
                 return true;
             }
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                if prune_set.contains(name.as_ref()) {
+                if prune_for_filter.contains(name.as_ref()) {
                     return false;
                 }
                 if name.starts_with("cmake-build-")
@@ -248,42 +255,66 @@ pub fn walk_source_files(root: &Path, extra_ignores: &[String]) -> Vec<WalkedFil
             }
             true
         })
-        .build();
+        .build_parallel();
 
-    for entry in walker.flatten() {
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy();
-        if !is_supported_extension(&name) {
-            continue;
-        }
-        paths.push(path.to_path_buf());
-    }
+    walker.run(|| {
+        let root_buf = Arc::clone(&root_buf);
+        let extra_owned = Arc::clone(&extra_owned);
+        let out = Arc::clone(&out);
+        let mut local: Vec<WalkedFile> = Vec::with_capacity(256);
 
-    paths
-        .into_par_iter()
-        .filter_map(|abs| {
-            let rel = abs.strip_prefix(&root_buf).ok()?;
-            let rel_str = normalize_slashes(&rel.to_string_lossy());
-            if should_ignore_rel_path(&rel_str, &extra_owned) {
-                return None;
+        struct Flusher {
+            local: Vec<WalkedFile>,
+            out: Arc<Mutex<Vec<WalkedFile>>>,
+        }
+        impl Drop for Flusher {
+            fn drop(&mut self) {
+                if !self.local.is_empty() {
+                    if let Ok(mut guard) = self.out.lock() {
+                        guard.append(&mut self.local);
+                    }
+                }
             }
-            let meta = fs::metadata(&abs).ok()?;
-            let mtime_ms = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            Some(WalkedFile {
-                rel_path: rel_str,
-                mtime_ms,
-                size: meta.len(),
-            })
+        }
+        let mut flusher = Flusher {
+            local: std::mem::take(&mut local),
+            out,
+        };
+
+        Box::new(move |res| {
+            if let Ok(entry) = res {
+                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    let name = entry.file_name().to_string_lossy();
+                    if is_supported_extension(&name) {
+                        if let Ok(rel) = entry.path().strip_prefix(&*root_buf) {
+                            let rel_str = normalize_slashes(&rel.to_string_lossy());
+                            if !should_ignore_rel_path(&rel_str, &extra_owned) {
+                                if let Ok(meta) = entry.metadata() {
+                                    let mtime_ms = meta
+                                        .modified()
+                                        .ok()
+                                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    flusher.local.push(WalkedFile {
+                                        rel_path: rel_str,
+                                        mtime_ms,
+                                        size: meta.len(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            WalkState::Continue
         })
-        .collect()
+    });
+
+    match Arc::try_unwrap(out) {
+        Ok(m) => m.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().map(|g| g.clone()).unwrap_or_default(),
+    }
 }
 
 /// Detect minified / bundled / generated source files that waste parser time.

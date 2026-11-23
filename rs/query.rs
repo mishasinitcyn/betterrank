@@ -360,25 +360,70 @@ pub fn cmd_search(
     include_noncode: bool,
 ) {
     let q_lower = query.to_ascii_lowercase();
-    let matches: Vec<u32> = g
-        .ranked_syms
-        .iter()
-        .map(|r| r.to_native())
-        .filter(|&si| {
+    let tokens: Vec<&str> = q_lower.split_whitespace().collect();
+    let matches: Vec<u32> = if tokens.len() <= 1 {
+        g.ranked_syms
+            .iter()
+            .map(|r| r.to_native())
+            .filter(|&si| {
+                let sym = &g.symbols[si as usize];
+                if let Some(k) = kind {
+                    if !SymbolKind::from_u8(sym.kind).matches_filter(k) {
+                        return false;
+                    }
+                }
+                sym.name.as_str().to_ascii_lowercase().contains(&q_lower)
+                    || sym
+                        .signature
+                        .as_str()
+                        .to_ascii_lowercase()
+                        .contains(&q_lower)
+            })
+            .collect()
+    } else {
+        // Multi-word queries: require every token to match across name, signature, or file path,
+        // prioritizing symbols where more tokens match the symbol name itself (preserving PageRank within tiers).
+        let mut tier_name_all: Vec<u32> = Vec::new();
+        let mut tier_name_some: Vec<u32> = Vec::new();
+        let mut tier_other: Vec<u32> = Vec::new();
+        for &si_r in g.ranked_syms.iter() {
+            let si = si_r.to_native();
             let sym = &g.symbols[si as usize];
             if let Some(k) = kind {
                 if !SymbolKind::from_u8(sym.kind).matches_filter(k) {
-                    return false;
+                    continue;
                 }
             }
-            sym.name.as_str().to_ascii_lowercase().contains(&q_lower)
-                || sym
-                    .signature
-                    .as_str()
-                    .to_ascii_lowercase()
-                    .contains(&q_lower)
-        })
-        .collect();
+            let name_l = sym.name.as_str().to_ascii_lowercase();
+            let sig_l = sym.signature.as_str().to_ascii_lowercase();
+            let file_l = g.files[sym.file_idx.to_native() as usize]
+                .path
+                .as_str()
+                .to_ascii_lowercase();
+            let mut all_ok = true;
+            let mut name_hits = 0usize;
+            for tok in &tokens {
+                if name_l.contains(tok) {
+                    name_hits += 1;
+                } else if !sig_l.contains(tok) && !file_l.contains(tok) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if all_ok {
+                if name_hits == tokens.len() {
+                    tier_name_all.push(si);
+                } else if name_hits > 0 {
+                    tier_name_some.push(si);
+                } else {
+                    tier_other.push(si);
+                }
+            }
+        }
+        tier_name_all.extend(tier_name_some);
+        tier_name_all.extend(tier_other);
+        tier_name_all
+    };
 
     if count_only {
         println!("total: {}", matches.len());

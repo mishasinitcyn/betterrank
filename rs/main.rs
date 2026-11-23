@@ -99,7 +99,16 @@ fn parse_flags(args: &[String]) -> Flags {
                 i += 1;
             }
             s if s.starts_with("--") => {
-                let key = &s[2..];
+                let raw = &s[2..];
+                if let Some((k, v)) = raw.split_once('=') {
+                    if k == "root" {
+                        f.roots.push(v.to_string());
+                    }
+                    f.values.insert(k.to_string(), v.to_string());
+                    i += 1;
+                    continue;
+                }
+                let key = raw;
                 // Known boolean-only flags never consume the next positional argument
                 let is_bool_flag = matches!(
                     key,
@@ -191,17 +200,25 @@ fn print_command_help(cmd: &str) {
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
+    if args.is_empty() {
         println!("{USAGE}");
         return;
     }
-    if args[0] == "--version" || args[0] == "-v" {
+
+    // Parse flags across all arguments so global flags (e.g. `--root <path>`)
+    // work both before and after the subcommand.
+    let mut flags = parse_flags(&args);
+    if flags.has("version") && flags.positional.is_empty() {
         println!("{}", betterrank::version());
         return;
     }
+    if flags.positional.is_empty() {
+        println!("{USAGE}");
+        return;
+    }
 
-    let command = args[0].as_str();
-    let flags = parse_flags(&args[1..]);
+    let command_owned = flags.positional.remove(0);
+    let command = command_owned.as_str();
 
     if flags.has("help") {
         print_command_help(command);
@@ -453,14 +470,15 @@ fn main() {
             cmd_structure(g, depth, explicit);
         }
         "search" => {
-            let Some(q) = flags.positional.first() else {
+            if flags.positional.is_empty() {
                 eprintln!("Usage: betterrank search <query> [--kind type]");
                 process::exit(1);
-            };
+            }
+            let q = flags.positional.join(" ");
             cmd_search(
                 &idx,
                 g,
-                q,
+                &q,
                 flags.get("kind"),
                 count_only,
                 offset,
