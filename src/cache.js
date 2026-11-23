@@ -1,9 +1,9 @@
 import { createHash } from 'crypto';
-import { stat, readFile } from 'fs/promises';
-import { glob } from 'glob';
+import { readFile, unlink } from 'fs/promises';
 import { homedir, platform } from 'os';
-import { join, relative } from 'path';
+import { join } from 'path';
 import { parseFile, SUPPORTED_EXTENSIONS } from './parser.js';
+import { walkFiles, statFilesBatched, isMinifiedSource } from './walk.js';
 import {
   buildGraph,
   updateGraphFiles,
@@ -31,7 +31,11 @@ const IGNORE_PATTERNS = [
   '**/.pnp.*',
   '**/bower_components/**',
   '**/*.min.js',
+  '**/*.min.mjs',
+  '**/*.min.cjs',
   '**/*.bundle.js',
+  '**/*.bundle.mjs',
+  '**/*.chunk.js',
   '**/*.map',
 
   // ── Python ─────────────────────────────────────────────
@@ -103,8 +107,7 @@ const IGNORE_PATTERNS = [
 
   // ── UI component libraries ─────────────────────────────
   // shadcn, etc. — high fan-in but rarely investigation targets.
-  // To re-include, add "!**/components/ui/**" in .code-index/config.json ignore list,
-  // or pass --ignore '!**/components/ui/**' on the CLI.
+  // To re-include, add "!**/components/ui/**" in .code-index/config.json ignore list.
   '**/components/ui/**',
 
   // ── Scratch / temp ─────────────────────────────────────
@@ -115,11 +118,11 @@ const CONFIG_PATH = '.code-index/config.json';
 
 /**
  * Derive a deterministic cache filename from the project root path.
- * Uses a short hash so cache files are grouped under one central directory.
+ * Uses compact gzipped v3 format (.br.gz).
  */
 function cachePathForRoot(projectRoot) {
   const hash = createHash('sha256').update(projectRoot).digest('hex').slice(0, 12);
-  return join(CACHE_DIR, `${hash}.json`);
+  return join(CACHE_DIR, `${hash}.br.gz`);
 }
 
 class CodeIndexCache {
@@ -129,6 +132,7 @@ class CodeIndexCache {
     this.configPath = join(projectRoot, CONFIG_PATH);
     this.graph = null;
     this.mtimes = new Map();
+    this.cachedRanked = null;
     this.initialized = false;
     this.skipCacheLoadOnce = false;
     this.extensions = opts.extensions || SUPPORTED_EXTENSIONS;
@@ -148,6 +152,7 @@ class CodeIndexCache {
         if (cached) {
           this.graph = cached.graph;
           this.mtimes = cached.mtimes;
+          this.cachedRanked = cached.cachedRanked || null;
         }
       }
       this.skipCacheLoadOnce = false;
@@ -158,7 +163,6 @@ class CodeIndexCache {
 
     if (changed.length === 0 && deleted.length === 0) {
       if (!this.graph) {
-        // First run, no cache, no files — empty graph
         const graphology = await import('graphology');
         const MDG = graphology.default?.MultiDirectedGraph || graphology.MultiDirectedGraph;
         this.graph = new MDG({ allowSelfLoops: false });
@@ -172,19 +176,27 @@ class CodeIndexCache {
     }
 
     const t0 = Date.now();
-    const newSymbols = await this._parseFiles(changed);
+    const { parsed: newSymbols, skippedCount } = await this._parseFiles(changed);
 
     if (!this.graph) {
-      // Full build from scratch
       this.graph = buildGraph(newSymbols);
     } else {
-      // Incremental update
       const allRemoved = [...deleted, ...changed];
       updateGraphFiles(this.graph, allRemoved, newSymbols);
     }
 
+    // Recompute unfocused PageRank once and persist with the cache
+    this.cachedRanked = rankedSymbols(this.graph);
+
     try {
-      await saveGraph(this.graph, this.mtimes, this.cachePath);
+      await saveGraph(this.graph, this.mtimes, this.cachePath, {
+        precomputedRanked: this.cachedRanked,
+      });
+      // Clean up legacy v1/v2 .json cache if present for this project root
+      if (this.cachePath.endsWith('.br.gz')) {
+        const legacyPath = this.cachePath.slice(0, -'.br.gz'.length) + '.json';
+        await unlink(legacyPath).catch(() => {});
+      }
     } catch {
       // Cache persistence is best-effort. Keep the in-memory graph usable.
     }
@@ -193,21 +205,13 @@ class CodeIndexCache {
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       let symbols = 0;
       this.graph.forEachNode((_n, attrs) => { if (attrs.type === 'symbol') symbols++; });
-      process.stderr.write(`Indexed ${changed.length} files (${symbols} symbols, ${this.graph.size} edges) in ${elapsed}s\n`);
+      const skippedNote = skippedCount > 0 ? `, skipped ${skippedCount} minified/generated` : '';
+      process.stderr.write(`Indexed ${newSymbols.length} files (${symbols} symbols, ${this.graph.size} edges${skippedNote}) in ${elapsed}s\n`);
     }
 
     return { changed: changed.length, deleted: deleted.length, totalScanned };
   }
 
-  /**
-   * Load project-level config from .code-index/config.json.
-   * Merges extra ignore patterns with built-in defaults.
-   *
-   * Config format:
-   * {
-   *   "ignore": ["extra/pattern/**", "another/**"]
-   * }
-   */
   async _loadConfig() {
     try {
       const raw = JSON.parse(await readFile(this.configPath, 'utf-8'));
@@ -219,18 +223,14 @@ class CodeIndexCache {
     }
   }
 
-  /**
-   * Force a full reindex from scratch.
-   */
   async reindex() {
     this.graph = null;
     this.mtimes = new Map();
+    this.cachedRanked = null;
     this.initialized = false;
     this.skipCacheLoadOnce = true;
 
-    // Delete the cache file
     try {
-      const { unlink } = await import('fs/promises');
       await unlink(this.cachePath);
     } catch {
       // doesn't exist, fine
@@ -240,33 +240,26 @@ class CodeIndexCache {
   }
 
   /**
-   * Walk the project tree and find files that have changed since last parse.
+   * Walk the project tree in parallel and find files that have changed since last parse.
    */
   async _getChangedFiles() {
-    const pattern = `**/*{${this.extensions.join(',')}}`;
-    const files = await glob(pattern, {
-      cwd: this.projectRoot,
-      ignore: this.ignorePatterns,
-      absolute: true,
-      nodir: true,
+    const relPaths = await walkFiles(this.projectRoot, {
+      extensions: this.extensions,
+      ignorePatterns: this.ignorePatterns,
     });
 
+    const stats = await statFilesBatched(this.projectRoot, relPaths);
     const changed = [];
     const currentFiles = new Set();
 
-    for (const absPath of files) {
-      const relPath = relative(this.projectRoot, absPath);
+    for (const entry of stats) {
+      const { relPath, mtimeMs } = entry;
       currentFiles.add(relPath);
 
-      try {
-        const { mtimeMs } = await stat(absPath);
-        const storedMtime = this.mtimes.get(relPath);
-        if (storedMtime === undefined || storedMtime < mtimeMs) {
-          changed.push(relPath);
-          this.mtimes.set(relPath, mtimeMs);
-        }
-      } catch {
-        // file disappeared between glob and stat
+      const storedMtime = this.mtimes.get(relPath);
+      if (storedMtime === undefined || storedMtime < mtimeMs) {
+        changed.push(relPath);
+        this.mtimes.set(relPath, mtimeMs);
       }
     }
 
@@ -278,27 +271,48 @@ class CodeIndexCache {
       }
     }
 
-    return { changed, deleted, totalScanned: files.length };
+    return { changed, deleted, totalScanned: relPaths.length };
   }
 
   /**
-   * Parse a batch of files and return their symbol data.
+   * Read and parse a batch of files, skipping minified/generated files.
    */
   async _parseFiles(relPaths) {
-    const results = [];
+    const parsed = [];
+    let skippedCount = 0;
 
-    for (const relPath of relPaths) {
-      const absPath = join(this.projectRoot, relPath);
-      try {
-        const source = await readFile(absPath, 'utf-8');
-        const result = await parseFile(relPath, source);
-        if (result) results.push(result);
-      } catch {
-        // skip unparseable files
+    // Read file contents in bounded parallel batches, then parse synchronously
+    const BATCH_SIZE = 32;
+    for (let i = 0; i < relPaths.length; i += BATCH_SIZE) {
+      const batch = relPaths.slice(i, i + BATCH_SIZE);
+      const sources = await Promise.all(
+        batch.map(async relPath => {
+          try {
+            const source = await readFile(join(this.projectRoot, relPath), 'utf-8');
+            return { relPath, source };
+          } catch {
+            return null;
+          }
+        }),
+      );
+
+      for (const item of sources) {
+        if (!item) continue;
+        const { relPath, source } = item;
+        if (isMinifiedSource(source, relPath)) {
+          skippedCount++;
+          continue;
+        }
+        try {
+          const result = parseFile(relPath, source);
+          if (result) parsed.push(result);
+        } catch {
+          // skip unparseable files
+        }
       }
     }
 
-    return results;
+    return { parsed, skippedCount };
   }
 
   getGraph() {
@@ -307,6 +321,10 @@ class CodeIndexCache {
 
   getMtimes() {
     return this.mtimes;
+  }
+
+  getCachedRanked() {
+    return this.cachedRanked;
   }
 }
 

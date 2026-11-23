@@ -2,13 +2,15 @@
 
 Structural code index with PageRank-ranked repo maps, symbol search, call-graph queries, and dependency analysis. Built on [tree-sitter](https://tree-sitter.github.io/) and [graphology](https://graphology.github.io/).
 
-BetterRank parses your source files, builds a dependency graph, and ranks every symbol by structural importance using PageRank. Instead of grepping through thousands of files, ask questions like "what are the most important functions in this project?" or "who calls this function?" and get ranked, structured answers in seconds.
+BetterRank parses your source files, builds a dependency graph, and ranks every symbol by structural importance using PageRank. Instead of grepping through thousands of files, ask questions like "what are the most important functions in this project?" or "who calls this function?" and get ranked, structured answers in ~100ms.
 
 ## Install
 
 ```bash
 npm install -g @mishasinitcyn/betterrank
 ```
+
+Core install includes JavaScript, TypeScript/TSX, and Python (~57 MB). Optional language grammars (`tree-sitter-rust`, `tree-sitter-go`, `tree-sitter-ruby`, `tree-sitter-java`, `tree-sitter-c`, `tree-sitter-cpp`, `tree-sitter-c-sharp`, `tree-sitter-php`) are auto-detected if installed alongside it.
 
 ## Quick Start
 
@@ -52,10 +54,10 @@ betterrank neighborhood src/auth/handlers.ts --root /path/to/project --limit 10
 
 ## How It Works
 
-1. **Parse**: Native tree-sitter extracts definitions (functions, classes, types) and references (calls, imports) from source files
-2. **Graph**: graphology MultiDirectedGraph with typed edges (DEFINES, REFERENCES, IMPORTS)
-3. **Rank**: PageRank scores every symbol by structural importance — heavily-imported utilities rank higher than leaf files
-4. **Cache**: mtime-based incremental updates. Only re-parses changed files. Cache lives at the platform cache directory (`~/Library/Caches/code-index/` on macOS, `~/.cache/code-index/` on Linux)
+1. **Parse**: Lazy-loaded native tree-sitter with cached queries extracts definitions (functions, class methods, classes, types) and references (calls, method calls, imports), automatically skipping minified/generated bundles
+2. **Graph**: graphology MultiDirectedGraph with typed edges (`DEFINES`, `REFERENCES`, `IMPORTS`) and import-aware disambiguation
+3. **Rank**: PageRank scores every symbol by structural importance — heavily-imported utilities rank higher than leaf files; unfocused scores are persisted in the cache for instant warm queries
+4. **Cache**: Compact integer-indexed gzipped v3 index (`.br.gz`) with parallel mtime-based incremental updates in the platform cache directory (`~/Library/Caches/code-index/` on macOS, `~/.cache/code-index/` on Linux)
 
 ## Supported Languages
 
@@ -288,9 +290,12 @@ betterrank dependents src/auth.ts --root /path/to/project
 
 ### `neighborhood` — Local subgraph around a file
 
+Returns the local dependency neighborhood (files, import edges, and top-ranked symbol signatures) directly by default.
+
 ```bash
+betterrank neighborhood src/auth.ts --root /path/to/project
+betterrank neighborhood src/auth.ts --root /path/to/project --hops 2 --max-files 10
 betterrank neighborhood src/auth.ts --root /path/to/project --count
-betterrank neighborhood src/auth.ts --root /path/to/project --hops 2 --limit 10
 ```
 
 ### `orphans` — Find disconnected files/symbols

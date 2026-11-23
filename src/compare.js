@@ -1,7 +1,7 @@
 import { readFile, stat as fsStat } from 'fs/promises';
-import { glob } from 'glob';
-import { join, relative, basename } from 'path';
+import { join, basename } from 'path';
 import { parseFile, SUPPORTED_EXTENSIONS } from './parser.js';
+import { walkFiles, isMinifiedSource } from './walk.js';
 
 const IGNORE_PATTERNS = [
   '**/node_modules/**', '**/.npm/**', '**/.yarn/**', '**/.pnp.*',
@@ -44,20 +44,18 @@ const NOISE_NAMES = new Set([
 ]);
 
 async function scanAndParse(dirPath) {
-  const pattern = `**/*{${SUPPORTED_EXTENSIONS.join(',')}}`;
-  const files = await glob(pattern, {
-    cwd: dirPath,
-    ignore: IGNORE_PATTERNS,
-    absolute: true,
-    nodir: true,
+  const relPaths = await walkFiles(dirPath, {
+    extensions: SUPPORTED_EXTENSIONS,
+    ignorePatterns: IGNORE_PATTERNS,
   });
 
   const results = [];
-  for (const absPath of files) {
-    const relPath = relative(dirPath, absPath);
+  for (const relPath of relPaths) {
+    const absPath = join(dirPath, relPath);
     try {
       const source = await readFile(absPath, 'utf-8');
-      const result = parseFile(relPath, source);
+      if (isMinifiedSource(source, relPath)) continue;
+      const result = parseFile(relPath, source, { includeParamNames: true, includeLocalRefs: true });
       if (result) results.push(result);
     } catch {
       // skip unparseable files
@@ -68,7 +66,7 @@ async function scanAndParse(dirPath) {
 
 async function parseSingleFile(filePath) {
   const source = await readFile(filePath, 'utf-8');
-  const result = parseFile(basename(filePath), source);
+  const result = parseFile(basename(filePath), source, { includeParamNames: true, includeLocalRefs: true });
   return result ? [result] : [];
 }
 

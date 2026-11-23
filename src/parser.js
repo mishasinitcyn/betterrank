@@ -1,38 +1,61 @@
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
-const Parser = require('tree-sitter');
-
-function tryRequire(mod) {
-  try { return require(mod); } catch { return null; }
+// Lazy-loaded tree-sitter core + grammars so warm queries that don't parse
+// any files pay zero native module load cost.
+let _Parser = null;
+function getParserClass() {
+  if (!_Parser) _Parser = require('tree-sitter');
+  return _Parser;
 }
 
-// Core grammars (always installed)
-const tsGrammars = require('tree-sitter-typescript');
-
-const GRAMMARS = {
-  javascript: require('tree-sitter-javascript'),
-  typescript: tsGrammars.typescript,
-  tsx: tsGrammars.tsx,
-  python: require('tree-sitter-python'),
+const GRAMMAR_LOADERS = {
+  javascript: () => require('tree-sitter-javascript'),
+  typescript: () => require('tree-sitter-typescript').typescript,
+  tsx: () => require('tree-sitter-typescript').tsx,
+  python: () => require('tree-sitter-python'),
+  rust: () => require('tree-sitter-rust'),
+  go: () => require('tree-sitter-go'),
+  ruby: () => require('tree-sitter-ruby'),
+  java: () => require('tree-sitter-java'),
+  c: () => require('tree-sitter-c'),
+  cpp: () => require('tree-sitter-cpp'),
+  c_sharp: () => require('tree-sitter-c-sharp'),
+  php: () => {
+    const mod = require('tree-sitter-php');
+    return mod.php || mod;
+  },
 };
 
-// Optional grammars (install individually if needed)
-const optGrammars = [
-  ['rust', 'tree-sitter-rust'],
-  ['go', 'tree-sitter-go'],
-  ['ruby', 'tree-sitter-ruby'],
-  ['java', 'tree-sitter-java'],
-  ['c', 'tree-sitter-c'],
-  ['cpp', 'tree-sitter-cpp'],
-  ['c_sharp', 'tree-sitter-c-sharp'],
-];
-for (const [name, mod] of optGrammars) {
-  const g = tryRequire(mod);
-  if (g) GRAMMARS[name] = g;
+const CORE_LANGUAGES = new Set(['javascript', 'typescript', 'tsx', 'python']);
+const OPT_GRAMMAR_PACKAGES = {
+  rust: 'tree-sitter-rust',
+  go: 'tree-sitter-go',
+  ruby: 'tree-sitter-ruby',
+  java: 'tree-sitter-java',
+  c: 'tree-sitter-c',
+  cpp: 'tree-sitter-cpp',
+  c_sharp: 'tree-sitter-c-sharp',
+  php: 'tree-sitter-php',
+};
+
+function isPackageAvailable(pkg) {
+  try {
+    require.resolve(pkg);
+    return true;
+  } catch {
+    return false;
+  }
 }
-const phpModule = tryRequire('tree-sitter-php');
-if (phpModule) GRAMMARS.php = phpModule.php || phpModule;
+
+const AVAILABLE_LANGUAGES = new Set(CORE_LANGUAGES);
+for (const [lang, pkg] of Object.entries(OPT_GRAMMAR_PACKAGES)) {
+  if (isPackageAvailable(pkg)) AVAILABLE_LANGUAGES.add(lang);
+}
+
+const loadedGrammars = new Map();
+const parserCache = new Map();
+const queryCache = new Map();
 
 const LANG_MAP = {
   '.js': 'javascript',
@@ -56,19 +79,51 @@ const LANG_MAP = {
 };
 
 // Only include extensions for grammars that are actually installed
-const SUPPORTED_EXTENSIONS = Object.keys(LANG_MAP).filter(ext => {
-  const lang = LANG_MAP[ext];
-  return GRAMMARS[lang] != null;
-});
+const SUPPORTED_EXTENSIONS = Object.keys(LANG_MAP).filter(ext =>
+  AVAILABLE_LANGUAGES.has(LANG_MAP[ext]),
+);
 
 function getLanguage(ext) {
   const langName = LANG_MAP[ext];
-  if (!langName) return null;
-  return GRAMMARS[langName] || null;
+  if (!langName || !AVAILABLE_LANGUAGES.has(langName)) return null;
+  if (loadedGrammars.has(langName)) return loadedGrammars.get(langName);
+  try {
+    const grammar = GRAMMAR_LOADERS[langName]();
+    loadedGrammars.set(langName, grammar);
+    return grammar;
+  } catch {
+    loadedGrammars.set(langName, null);
+    return null;
+  }
 }
 
 function getLangName(ext) {
   return LANG_MAP[ext] || null;
+}
+
+function getCachedParser(langName, lang) {
+  let parser = parserCache.get(langName);
+  if (!parser) {
+    const Parser = getParserClass();
+    parser = new Parser();
+    parser.setLanguage(lang);
+    parserCache.set(langName, parser);
+  }
+  return parser;
+}
+
+function getCachedQuery(langName, kind, lang, queryStr) {
+  const key = `${langName}:${kind}`;
+  if (queryCache.has(key)) return queryCache.get(key);
+  try {
+    const Parser = getParserClass();
+    const query = new Parser.Query(lang, queryStr);
+    queryCache.set(key, query);
+    return query;
+  } catch {
+    queryCache.set(key, null);
+    return null;
+  }
 }
 
 // --- Tree-sitter query strings per language ---
@@ -175,17 +230,12 @@ const DEF_QUERIES = {
   `,
 };
 
-// TSX uses the same queries as TypeScript
 DEF_QUERIES.tsx = DEF_QUERIES.typescript;
 
 const REF_QUERIES = {
-  // NOTE: We intentionally omit obj.method() patterns (member_expression,
-  // attribute calls, selector_expression) because without type information,
-  // common method names (get, close, execute, run) create massive spurious
-  // cross-wiring. Bare function calls and imports provide the structural
-  // backbone; IMPORTS edges from import statements connect files.
   javascript: `
     (call_expression function: (identifier) @ref)
+    (call_expression function: (member_expression property: (property_identifier) @method_ref))
     (import_specifier name: (identifier) @ref)
     (import_clause (identifier) @ref)
     (member_expression property: (property_identifier) @prop_ref)
@@ -197,6 +247,7 @@ const REF_QUERIES = {
 
   typescript: `
     (call_expression function: (identifier) @ref)
+    (call_expression function: (member_expression property: (property_identifier) @method_ref))
     (import_specifier name: (identifier) @ref)
     (import_clause (identifier) @ref)
     (member_expression property: (property_identifier) @prop_ref)
@@ -205,6 +256,7 @@ const REF_QUERIES = {
 
   tsx: `
     (call_expression function: (identifier) @ref)
+    (call_expression function: (member_expression property: (property_identifier) @method_ref))
     (import_specifier name: (identifier) @ref)
     (import_clause (identifier) @ref)
     (member_expression property: (property_identifier) @prop_ref)
@@ -217,6 +269,7 @@ const REF_QUERIES = {
 
   python: `
     (call function: (identifier) @ref)
+    (call function: (attribute attribute: (identifier) @method_ref))
     (decorator (identifier) @ref)
   `,
 
@@ -261,10 +314,10 @@ const KIND_MAP = {
   function_declaration: 'function',
   function_definition: 'function',
   arrow_function: 'function',
-  method_definition: 'function',
-  method_declaration: 'function',
+  method_definition: 'method',
+  method_declaration: 'method',
   function_item: 'function',
-  singleton_method: 'function',
+  singleton_method: 'method',
   class_declaration: 'class',
   class_definition: 'class',
   class_specifier: 'class',
@@ -289,6 +342,36 @@ const KIND_MAP = {
   pair: 'property',
 };
 
+const FUNCTION_ANCESTOR_TYPES = new Set([
+  'function_declaration',
+  'function_expression',
+  'arrow_function',
+  'method_definition',
+  'method_declaration',
+  'function_definition',
+  'function_item',
+  'singleton_method',
+]);
+
+const CLASS_ANCESTOR_TYPES = new Set([
+  'class_declaration',
+  'class_definition',
+  'class_specifier',
+  'impl_item',
+  'class',
+]);
+
+const LITERAL_VALUE_TYPES = new Set([
+  'string',
+  'template_string',
+  'number',
+  'true',
+  'false',
+  'null',
+  'undefined',
+  'regex',
+]);
+
 const OUTLINE_EXTRA_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
 const INDEX_EXTRA_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
 const OUTLINE_BODY_TYPES = new Set(['statement_block', 'class_body', 'object', 'array']);
@@ -298,66 +381,37 @@ const NON_SEMANTIC_CONTAINER_NAME_RE = /(schema|shape|validator|payload|params?|
 const NON_SEMANTIC_CALLEE_NAME_RE = /^(object|array|enum|union|literal|record|tuple|pick|omit|extend|merge|intersection|partial|strictObject|looseObject)$/i;
 
 /**
- * Walk an AST subtree and count node types that reveal structural shape.
- * Returns a flat object like { if_statement: 3, for_statement: 1, call_expression: 7, ... }
- * This is intentionally coarse — we want "shape" not identity.
+ * Check whether a definition node is nested inside another function/method body
+ * (e.g., local helper arrows like `const helper = () => ...` inside a function).
  */
-const STRUCTURAL_NODE_TYPES = new Set([
-  // Control flow
-  'if_statement', 'if_expression', 'elif_clause', 'else_clause',
-  'for_statement', 'for_in_statement', 'for_expression',
-  'while_statement', 'loop_expression',
-  'match_statement', 'match_expression', 'switch_statement', 'case_clause',
-  'try_statement', 'try_expression', 'except_clause', 'catch_clause', 'finally_clause',
-  'with_statement',
-  // Returns / yields
-  'return_statement', 'yield', 'yield_expression', 'await_expression',
-  // Calls & access
-  'call_expression', 'call', 'method_call_expression',
-  'member_expression', 'attribute', 'subscript_expression', 'subscript',
-  // Assignments
-  'assignment', 'assignment_expression', 'augmented_assignment',
-  // Data structures
-  'list', 'list_comprehension', 'dictionary', 'dictionary_comprehension',
-  'array', 'object', 'tuple',
-  // Assertions / raises
-  'assert_statement', 'raise_statement', 'throw_statement',
-  // Boolean logic
-  'boolean_operator', 'binary_expression', 'comparison_operator', 'not_operator',
-  // Conditionals
-  'conditional_expression', 'ternary_expression',
-  // String operations
-  'string', 'f_string', 'template_string',
-  // Decorators
-  'decorator',
-]);
-
-function buildAstProfile(node) {
-  const profile = {};
-  let totalNodes = 0;
-
-  function walk(n) {
-    if (STRUCTURAL_NODE_TYPES.has(n.type)) {
-      profile[n.type] = (profile[n.type] || 0) + 1;
-    }
-    totalNodes++;
-    for (let i = 0; i < n.namedChildCount; i++) {
-      walk(n.namedChild(i));
-    }
+function isNestedInsideFunction(node) {
+  let cur = node.parent;
+  while (cur) {
+    if (FUNCTION_ANCESTOR_TYPES.has(cur.type)) return true;
+    cur = cur.parent;
   }
+  return false;
+}
 
-  walk(node);
-  profile._totalNodes = totalNodes;
-  return profile;
+/**
+ * Check whether a function node is directly inside a class body (e.g., Python methods).
+ */
+function isDirectClassMethod(node) {
+  let cur = node.parent;
+  while (cur) {
+    if (FUNCTION_ANCESTOR_TYPES.has(cur.type)) return false;
+    if (CLASS_ANCESTOR_TYPES.has(cur.type)) return true;
+    cur = cur.parent;
+  }
+  return false;
 }
 
 /**
  * Extract parameter names from a function's tree-sitter node.
- * Works across languages by looking for common parameter node patterns.
+ * Used by compare.js; skipped during normal indexing for speed/footprint.
  */
 function extractParamNames(node) {
   const params = [];
-  // Find the parameter list node
   const paramNodes = [];
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
@@ -365,7 +419,6 @@ function extractParamNames(node) {
         child.type === 'parameter_list') {
       paramNodes.push(child);
     }
-    // Drill into wrappers (e.g. variable_declarator -> arrow_function)
     for (let j = 0; j < child.namedChildCount; j++) {
       const gc = child.namedChild(j);
       if (gc.type === 'parameters' || gc.type === 'formal_parameters' ||
@@ -378,7 +431,6 @@ function extractParamNames(node) {
   for (const paramList of paramNodes) {
     for (let i = 0; i < paramList.namedChildCount; i++) {
       const p = paramList.namedChild(i);
-      // Try to get the identifier name from various param shapes
       const nameNode = p.childForFieldName('name') || p.childForFieldName('pattern');
       if (nameNode && nameNode.type === 'identifier') {
         params.push(nameNode.text);
@@ -390,10 +442,6 @@ function extractParamNames(node) {
   return params;
 }
 
-/**
- * Find the body/block node of a definition, drilling into wrappers like
- * lexical_declaration → variable_declarator → arrow_function → body.
- */
 function findCallArgumentBody(node, depth) {
   if (!node) return null;
   let fallback = null;
@@ -449,22 +497,45 @@ function computeBodyStartLine(node, bodyNode) {
   return bodyRow === defRow ? bodyRow + 2 : bodyRow + 1;
 }
 
-function createDefinition(name, node, filePath, langName, { bodyStartLine = null, kind } = {}) {
-  const bodyNode = bodyStartLine == null ? findBodyNode(node) : null;
-  const resolvedBodyStartLine = bodyStartLine ?? computeBodyStartLine(node, bodyNode);
-  const profileNode = bodyNode || node;
+function resolveKind(node, explicitKind) {
+  if (explicitKind) return explicitKind;
+  let kind = KIND_MAP[node.type] || 'other';
+  if (kind === 'function' && isDirectClassMethod(node)) {
+    return 'method';
+  }
+  if (node.type === 'decorated_definition') {
+    const inner = node.childForFieldName('definition');
+    if (inner?.type === 'class_definition') return 'class';
+    if (inner?.type === 'function_definition' && isDirectClassMethod(node)) return 'method';
+  }
+  return kind;
+}
 
-  return {
+function createDefinition(
+  name,
+  node,
+  filePath,
+  langName,
+  { bodyStartLine = null, kind, includeParamNames = false } = {},
+) {
+  const bodyNode = findBodyNode(node);
+  const resolvedBodyStartLine = bodyStartLine ?? computeBodyStartLine(node, bodyNode);
+
+  const def = {
     name,
-    kind: kind || nodeKind(node.type),
+    kind: resolveKind(node, kind),
     file: filePath,
     lineStart: node.startPosition.row + 1,
     lineEnd: node.endPosition.row + 1,
-    signature: extractSignature(node, langName),
+    signature: extractSignature(node, langName, bodyNode),
     bodyStartLine: resolvedBodyStartLine,
-    astProfile: buildAstProfile(profileNode),
-    paramNames: extractParamNames(node),
   };
+
+  if (includeParamNames) {
+    def.paramNames = extractParamNames(node);
+  }
+
+  return def;
 }
 
 function extractPairName(node) {
@@ -556,7 +627,7 @@ function shouldIndexSemanticObjectMembers(node) {
   return false;
 }
 
-function collectDirectPairDefinitions(node, filePath, langName) {
+function collectDirectPairDefinitions(node, filePath, langName, opts = {}) {
   if (!node || node.type !== 'object') return [];
 
   const definitions = [];
@@ -568,16 +639,21 @@ function collectDirectPairDefinitions(node, filePath, langName) {
     if (!name) continue;
     if (child.endPosition.row <= child.startPosition.row) continue;
 
+    // Skip plain literal entries (e.g. query string maps like REF_QUERIES = { default: `...` })
+    const valueNode = child.childForFieldName('value');
+    if (valueNode && LITERAL_VALUE_TYPES.has(valueNode.type)) continue;
+
     definitions.push(createDefinition(name, child, filePath, langName, {
       bodyStartLine: child.startPosition.row + 2,
       kind: 'property',
+      includeParamNames: opts.includeParamNames,
     }));
   }
 
   return definitions;
 }
 
-function collectIndexDefinitions(rootNode, filePath, langName) {
+function collectIndexDefinitions(rootNode, filePath, langName, opts = {}) {
   if (!INDEX_EXTRA_LANGUAGES.has(langName)) return [];
 
   const definitions = [];
@@ -586,7 +662,7 @@ function collectIndexDefinitions(rootNode, filePath, langName) {
     if (node.type === 'variable_declarator' && shouldIndexSemanticObjectMembers(node)) {
       const bodyNode = findBodyNode(node);
       if (bodyNode && bodyNode.type === 'object') {
-        definitions.push(...collectDirectPairDefinitions(bodyNode, filePath, langName));
+        definitions.push(...collectDirectPairDefinitions(bodyNode, filePath, langName, opts));
       }
       return;
     }
@@ -639,17 +715,9 @@ function collectOutlineDefinitions(rootNode, filePath, langName) {
   return definitions;
 }
 
-function nodeKind(nodeType) {
-  return KIND_MAP[nodeType] || 'other';
-}
-
-function extractSignature(node, langName) {
+function extractSignature(node, langName, bodyNode = null) {
   const text = node.text;
   if (langName === 'python') {
-    // Python signatures often span multiple lines. We need the colon that
-    // terminates the def/class line, NOT colons inside type annotations.
-    // Strategy: find the closing paren, then the next colon after it.
-    // For classes without parens (class Foo:), fall back to first colon.
     const parenClose = text.indexOf(')');
     let colonIdx;
     if (parenClose !== -1) {
@@ -658,19 +726,29 @@ function extractSignature(node, langName) {
       colonIdx = text.indexOf(':');
     }
     if (colonIdx !== -1) {
-      // Collapse multiline signature into a single line
       const sig = text.substring(0, colonIdx + 1).replace(/\s*\n\s*/g, ' ').trim();
       return sig.length > 300 ? sig.substring(0, 300) + '...' : sig;
     }
     const firstLine = text.split('\n')[0];
     return firstLine.trim();
   }
-  const braceIdx = text.indexOf('{');
-  let end = text.indexOf('\n');
-  if (end === -1) end = text.length;
-  if (braceIdx !== -1 && braceIdx < end) end = braceIdx;
-  const sig = text.substring(0, end).trim();
-  return sig.length > 200 ? sig.substring(0, 200) + '...' : sig;
+
+  // Use tree-sitter's bodyNode start offset for functions/methods/classes so
+  // destructured parameters like `function foo({ a, b }) {` aren't truncated at `{`.
+  if (
+    bodyNode &&
+    (bodyNode.type === 'statement_block' || bodyNode.type === 'class_body' || bodyNode.type === 'block') &&
+    bodyNode.startIndex > node.startIndex
+  ) {
+    const relEnd = bodyNode.startIndex - node.startIndex;
+    const sig = text.substring(0, relEnd).replace(/\s*\n\s*/g, ' ').trim();
+    return sig.length > 200 ? sig.substring(0, 200) + '...' : sig;
+  }
+
+  const newlineIdx = text.indexOf('\n');
+  let line = (newlineIdx === -1 ? text : text.substring(0, newlineIdx)).trim();
+  if (line.endsWith('{')) line = line.slice(0, -1).trimEnd();
+  return line.length > 200 ? line.substring(0, 200) + '...' : line;
 }
 
 function normalizeReferenceCapture(capture) {
@@ -743,7 +821,15 @@ function collectPythonImports(rootNode, filePath) {
  * Parse a single source file and extract definitions, references, and imports.
  * Returns null if the language is unsupported.
  */
-function parseFile(filePath, source, { includeOutlineDefinitions = false } = {}) {
+function parseFile(
+  filePath,
+  source,
+  {
+    includeOutlineDefinitions = false,
+    includeLocalRefs = false,
+    includeParamNames = false,
+  } = {},
+) {
   const dotIdx = filePath.lastIndexOf('.');
   if (dotIdx === -1) return null;
   const ext = filePath.substring(dotIdx);
@@ -751,8 +837,7 @@ function parseFile(filePath, source, { includeOutlineDefinitions = false } = {})
   if (!lang) return null;
   const langName = getLangName(ext);
 
-  const parser = new Parser();
-  parser.setLanguage(lang);
+  const parser = getCachedParser(langName, lang);
   const tree = parser.parse(source);
 
   const definitions = [];
@@ -761,98 +846,124 @@ function parseFile(filePath, source, { includeOutlineDefinitions = false } = {})
 
   const defQueryStr = DEF_QUERIES[langName] || null;
   if (defQueryStr) {
-    try {
-      const defQuery = new Parser.Query(lang, defQueryStr);
+    const defQuery = getCachedQuery(langName, 'def', lang, defQueryStr);
+    if (defQuery) {
+      const seenDefKeys = new Set();
       for (const match of defQuery.matches(tree.rootNode)) {
         const nameCapture = match.captures.find(c => c.name === 'name');
         const defCapture = match.captures.find(c => c.name === 'definition');
         if (!nameCapture) continue;
-        const defNode = defCapture || nameCapture;
+        const defNode = (defCapture || nameCapture).node;
 
-        definitions.push(createDefinition(nameCapture.node.text, defNode.node, filePath, langName));
+        // Skip local nested helper functions/arrows inside other function bodies
+        // when indexing the repo graph (keep them available for outline expansion).
+        if (!includeOutlineDefinitions && isNestedInsideFunction(defNode)) continue;
+
+        // Deduplicate overlapping captures (e.g. export_statement + inner function_declaration)
+        const dedupKey = `${nameCapture.node.text}:${defNode.startPosition.row}`;
+        if (seenDefKeys.has(dedupKey)) continue;
+        seenDefKeys.add(dedupKey);
+
+        definitions.push(
+          createDefinition(nameCapture.node.text, defNode, filePath, langName, {
+            includeParamNames,
+          }),
+        );
       }
-    } catch (e) {
-      // Query may fail on some grammar versions; degrade gracefully
     }
   }
 
-  definitions.push(...collectIndexDefinitions(tree.rootNode, filePath, langName));
+  definitions.push(
+    ...collectIndexDefinitions(tree.rootNode, filePath, langName, { includeParamNames }),
+  );
 
   if (includeOutlineDefinitions) {
     definitions.push(...collectOutlineDefinitions(tree.rootNode, filePath, langName));
   }
 
-  const refQueryStr = REF_QUERIES[langName] || REF_QUERIES.default;
-  if (refQueryStr) {
-    try {
-      const refQuery = new Parser.Query(lang, refQueryStr);
-      for (const match of refQuery.matches(tree.rootNode)) {
-        for (const capture of match.captures) {
-          if (capture.name !== 'ref' && capture.name !== 'jsx_ref' && capture.name !== 'prop_ref') continue;
-          const name = normalizeReferenceCapture(capture);
-          if (!name) continue;
-          references.push({
-            name,
-            kind: capture.name === 'prop_ref' ? 'property' : 'symbol',
+  // Skip reference & import queries when only generating a file outline
+  if (!includeOutlineDefinitions) {
+    const refQueryStr = REF_QUERIES[langName] || REF_QUERIES.default;
+    if (refQueryStr) {
+      const refQuery = getCachedQuery(langName, 'ref', lang, refQueryStr);
+      if (refQuery) {
+        for (const match of refQuery.matches(tree.rootNode)) {
+          for (const capture of match.captures) {
+            if (
+              capture.name !== 'ref' &&
+              capture.name !== 'jsx_ref' &&
+              capture.name !== 'prop_ref' &&
+              capture.name !== 'method_ref'
+            ) continue;
+            const name = normalizeReferenceCapture(capture);
+            if (!name) continue;
+            const kind = capture.name === 'method_ref'
+              ? 'method'
+              : capture.name === 'prop_ref'
+                ? 'property'
+                : 'symbol';
+            references.push({
+              name,
+              kind,
+              file: filePath,
+              line: capture.node.startPosition.row + 1,
+            });
+          }
+        }
+      }
+    }
+
+    const importQueryStr = IMPORT_QUERIES[langName] || null;
+    if (importQueryStr) {
+      const importQuery = getCachedQuery(langName, 'import', lang, importQueryStr);
+      if (importQuery) {
+        for (const match of importQuery.matches(tree.rootNode)) {
+          const requireCapture = match.captures.find(c => c.name === 'require_fn');
+          if (requireCapture && requireCapture.node.text !== 'require') continue;
+
+          const pathCapture = match.captures.find(c => c.name === 'import_path');
+          const path = normalizeImportPathCapture(pathCapture);
+          if (!path) continue;
+
+          imports.push({
+            path,
             file: filePath,
-            line: capture.node.startPosition.row + 1,
+            line: pathCapture.node.startPosition.row + 1,
           });
         }
       }
-    } catch (e) {
-      // Degrade gracefully
+    }
+
+    if (langName === 'python') {
+      imports.push(...collectPythonImports(tree.rootNode, filePath));
     }
   }
 
-  const importQueryStr = IMPORT_QUERIES[langName] || null;
-  if (importQueryStr) {
-    try {
-      const importQuery = new Parser.Query(lang, importQueryStr);
-      for (const match of importQuery.matches(tree.rootNode)) {
-        const requireCapture = match.captures.find(c => c.name === 'require_fn');
-        if (requireCapture && requireCapture.node.text !== 'require') continue;
-
-        const pathCapture = match.captures.find(c => c.name === 'import_path');
-        const path = normalizeImportPathCapture(pathCapture);
-        if (!path) continue;
-
-        imports.push({
-          path,
-          file: filePath,
-          line: pathCapture.node.startPosition.row + 1,
-        });
+  if (includeLocalRefs && references.length > 0 && definitions.length > 0) {
+    const sortedDefs = [...definitions].sort((a, b) => a.lineStart - b.lineStart);
+    const localRefSets = new Map();
+    for (const ref of references) {
+      let enclosing = null;
+      for (const def of sortedDefs) {
+        if (ref.line >= def.lineStart && ref.line <= def.lineEnd) {
+          enclosing = def;
+        }
       }
-    } catch (e) {
-      // Degrade gracefully
-    }
-  }
-
-  if (langName === 'python') {
-    imports.push(...collectPythonImports(tree.rootNode, filePath));
-  }
-
-  // Associate each reference with its enclosing definition (by line range).
-  // This gives us per-function reference sets for similarity analysis.
-  // Sort definitions by lineStart for binary search.
-  const sortedDefs = [...definitions].sort((a, b) => a.lineStart - b.lineStart);
-  for (const ref of references) {
-    // Find the innermost enclosing definition
-    let enclosing = null;
-    for (const def of sortedDefs) {
-      if (ref.line >= def.lineStart && ref.line <= def.lineEnd) {
-        // Pick innermost (last matching, since sorted by start and nested defs start later)
-        enclosing = def;
+      if (enclosing) {
+        let set = localRefSets.get(enclosing);
+        if (!set) {
+          set = new Set();
+          localRefSets.set(enclosing, set);
+        }
+        set.add(ref.name);
       }
     }
-    if (enclosing) {
-      if (!enclosing.localRefs) enclosing.localRefs = [];
-      enclosing.localRefs.push(ref.name);
+    for (const [def, set] of localRefSets) {
+      def.localRefs = [...set];
     }
   }
-
-  // No tree.delete()/parser.delete() needed — native GC handles cleanup
 
   return { file: filePath, definitions, references, imports };
 }
 
-export { parseFile, buildAstProfile, extractParamNames, SUPPORTED_EXTENSIONS, LANG_MAP };
+export { parseFile, extractParamNames, SUPPORTED_EXTENSIONS, LANG_MAP };

@@ -6,14 +6,15 @@ const MIN_COLLAPSE_LINES = 2;
 /**
  * Build an outline view of a source file.
  *
- * Without expandSymbols: returns a skeleton with function/class bodies collapsed.
+ * Without expandSymbols: returns a skeleton with function/method bodies collapsed
+ * (classes and structural object containers stay expanded to reveal member signatures).
  * With expandSymbols: returns the full source of the specified symbols.
  *
  * @param {string} source - File contents
  * @param {string} filePath - File path (for language detection)
  * @param {string[]} expandSymbols - Symbol names to expand (empty = outline mode)
  * @param {object} [opts]
- * @param {Map<string,number>} [opts.callerCounts] - Map of symbol name → caller file count (for --annotate)
+ * @param {Map<string,number>} [opts.callerCounts] - Map of symbol name -> caller file count (for --annotate)
  * @returns {string} Formatted output with line numbers
  */
 export function buildOutline(source, filePath, expandSymbols = [], { callerCounts } = {}) {
@@ -30,15 +31,17 @@ export function buildOutline(source, filePath, expandSymbols = [], { callerCount
     return rawView(lines, pad);
   }
 
-  // Deduplicate definitions by lineStart (decorated_definition can cause dupes)
-  const seenLines = new Set();
-  const defs = parsed.definitions
-    .filter(d => {
-      if (seenLines.has(d.lineStart)) return false;
-      seenLines.add(d.lineStart);
-      return true;
-    })
-    .sort((a, b) => a.lineStart - b.lineStart);
+  // Deduplicate definitions by lineStart (decorated_definition / export_statement can cause dupes).
+  // Prefer richer kinds (class/method/function) over generic variable duplicates on the same line.
+  const kindPriority = { class: 5, namespace: 4, method: 3, function: 3, type: 2, property: 2, variable: 1, other: 0 };
+  const byLine = new Map();
+  for (const d of parsed.definitions) {
+    const existing = byLine.get(d.lineStart);
+    if (!existing || (kindPriority[d.kind] || 0) > (kindPriority[existing.kind] || 0)) {
+      byLine.set(d.lineStart, d);
+    }
+  }
+  const defs = [...byLine.values()].sort((a, b) => a.lineStart - b.lineStart);
 
   if (expandSymbols.length > 0) {
     return expandMode(lines, defs, filePath, expandSymbols, pad);
@@ -84,14 +87,11 @@ function expandMode(lines, defs, filePath, expandSymbols, pad) {
   return output.join('\n').trimEnd();
 }
 
-// Detect a contiguous block of import statements at the top of the file.
-// Returns { start, end, lineCount } (1-indexed) or null if block is < 3 lines.
-// Blank lines and leading non-import lines (e.g. "use client") are skipped over.
 function detectImportBlock(lines) {
   let braceDepth = 0;
   let inImport = false;
-  let firstImportLine = -1; // 0-indexed
-  let lastImportLine = -1;  // 0-indexed
+  let firstImportLine = -1;
+  let lastImportLine = -1;
 
   for (let i = 0; i < lines.length; i++) {
     const trimmed = lines[i].trim();
@@ -111,10 +111,8 @@ function detectImportBlock(lines) {
           lastImportLine = i;
         }
       } else if (firstImportLine !== -1) {
-        // First non-blank, non-import line after imports began
         break;
       }
-      // else: pre-import line ("use client", comments) — keep scanning
     } else {
       for (const ch of lines[i]) {
         if (ch === '{') braceDepth++;
@@ -159,87 +157,117 @@ function findImmediateParents(defs) {
   return parents;
 }
 
+/**
+ * Find container definitions whose bodies should stay open so their direct
+ * children (class methods or router object properties) are shown individually
+ * instead of collapsing the entire container into one line.
+ */
 function findDelegatingContainers(defs, parentMap) {
-  const propertyChildCounts = new Map();
+  const childCounts = new Map();
 
   for (const def of defs) {
-    if (def.kind !== 'property') continue;
     const parent = parentMap.get(def);
-    if (!parent || parent.kind !== 'variable') continue;
-    propertyChildCounts.set(parent, (propertyChildCounts.get(parent) || 0) + 1);
+    if (!parent) continue;
+
+    const isObjectRouterChild = parent.kind === 'variable' && def.kind === 'property';
+    const isClassMemberChild =
+      (parent.kind === 'class' || parent.kind === 'namespace') &&
+      (def.kind === 'method' || def.kind === 'function' || def.kind === 'property' || def.kind === 'class');
+
+    if (isObjectRouterChild || isClassMemberChild) {
+      childCounts.set(parent, (childCounts.get(parent) || 0) + 1);
+    }
   }
 
   return new Set(
-    [...propertyChildCounts.entries()]
+    [...childCounts.entries()]
       .filter(([, count]) => count > 0)
       .map(([def]) => def),
   );
 }
 
+function appendAnnotation(line, count) {
+  const annotation = count === 1 ? '← 1 caller' : `← ${count} callers`;
+  const minWidth = 60;
+  const padding = line.length < minWidth ? ' '.repeat(minWidth - line.length) : '  ';
+  return line + padding + annotation;
+}
+
 function outlineMode(lines, defs, pad, callerCounts) {
-  // Mark definitions that are nested inside another definition.
-  // Only defs nested inside opaque parents are swallowed.
-  // Some top-level variables are really structural containers, like exported
-  // procedure maps or routers. Those should delegate to their direct property
-  // children instead of collapsing the entire wrapper object.
   const parentMap = findImmediateParents(defs);
   const delegatingContainers = findDelegatingContainers(defs, parentMap);
+
+  // A definition is swallowed if ANY ancestor along its parent chain is NOT a delegating container.
   const nested = new Set();
   for (const def of defs) {
-    const parent = parentMap.get(def);
-    if (parent && !delegatingContainers.has(parent)) nested.add(def);
+    let ancestor = parentMap.get(def);
+    while (ancestor) {
+      if (!delegatingContainers.has(ancestor)) {
+        nested.add(def);
+        break;
+      }
+      ancestor = parentMap.get(ancestor);
+    }
   }
 
   const collapseRanges = [];
+  const inlineAnnotations = new Map(); // lineNum -> callerCount
 
-  // Collapse the import block first (covers the lucide/shadcn import wall in TSX)
   const importCollapse = detectImportBlock(lines);
   if (importCollapse) collapseRanges.push(importCollapse);
 
-  // Collapse all top-level definitions (functions, classes, interfaces, components)
   for (const def of defs) {
     if (nested.has(def)) continue;
-    if (delegatingContainers.has(def)) continue;
-    if (!def.bodyStartLine) continue;
-    if (def.bodyStartLine > def.lineEnd) continue;
 
-    const bodyLineCount = def.lineEnd - def.bodyStartLine + 1;
-    if (bodyLineCount < MIN_COLLAPSE_LINES) continue;
+    if (delegatingContainers.has(def)) {
+      // Annotate the class / container header line itself since its body stays open
+      if (callerCounts && callerCounts.has(def.name)) {
+        inlineAnnotations.set(def.lineStart, callerCounts.get(def.name));
+      }
+      continue;
+    }
+
+    const canCollapse =
+      def.bodyStartLine &&
+      def.bodyStartLine <= def.lineEnd &&
+      (def.lineEnd - def.bodyStartLine + 1) >= MIN_COLLAPSE_LINES;
+
+    if (!canCollapse) {
+      // Short/one-line function or method — annotate its declaration line directly
+      if (callerCounts && callerCounts.has(def.name)) {
+        inlineAnnotations.set(def.lineStart, callerCounts.get(def.name));
+      }
+      continue;
+    }
 
     collapseRanges.push({
       start: def.bodyStartLine,
       end: def.lineEnd,
-      lineCount: bodyLineCount,
+      lineCount: def.lineEnd - def.bodyStartLine + 1,
       name: def.name,
     });
   }
 
   collapseRanges.sort((a, b) => a.start - b.start);
 
-  // Walk lines, skipping collapsed ranges
   const output = [];
   let lineNum = 1;
   let rangeIdx = 0;
 
   while (lineNum <= lines.length) {
+    // Advance past any overlapping range already skipped
+    while (rangeIdx < collapseRanges.length && collapseRanges[rangeIdx].start < lineNum) {
+      rangeIdx++;
+    }
+
     if (rangeIdx < collapseRanges.length && collapseRanges[rangeIdx].start === lineNum) {
       const range = collapseRanges[rangeIdx];
       const bodyLine = lines[lineNum - 1];
       const indent = bodyLine ? bodyLine.match(/^\s*/)[0] : '';
       let marker = `${' '.repeat(pad)}│ ${indent}... (${range.lineCount} lines)`;
 
-      // Append caller annotation if available
       if (callerCounts && range.name && callerCounts.has(range.name)) {
-        const count = callerCounts.get(range.name);
-        const annotation = count === 1 ? '← 1 caller' : `← ${count} callers`;
-        // Right-pad to align annotations
-        const minWidth = 60;
-        if (marker.length < minWidth) {
-          marker += ' '.repeat(minWidth - marker.length);
-        } else {
-          marker += '  ';
-        }
-        marker += annotation;
+        marker = appendAnnotation(marker, callerCounts.get(range.name));
       }
 
       output.push(marker);
@@ -248,7 +276,11 @@ function outlineMode(lines, defs, pad, callerCounts) {
       continue;
     }
 
-    output.push(`${String(lineNum).padStart(pad)}│ ${lines[lineNum - 1]}`);
+    let rendered = `${String(lineNum).padStart(pad)}│ ${lines[lineNum - 1]}`;
+    if (inlineAnnotations.has(lineNum)) {
+      rendered = appendAnnotation(rendered, inlineAnnotations.get(lineNum));
+    }
+    output.push(rendered);
     lineNum++;
   }
 

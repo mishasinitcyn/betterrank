@@ -11,7 +11,6 @@ const USAGE = `
 betterrank <command> [options]
 
 Commands:
-  ui          [--port N]                            Launch web UI (default port: 3333)
   outline     <file> [symbol1,symbol2] [--annotate]  File skeleton (--annotate for caller counts)
   map         [--focus file1,file2]                 Repo map (ranked by PageRank)
   search      <query> [--kind type]                 Substring search on symbol names + signatures (ranked by PageRank)
@@ -248,20 +247,21 @@ Options:
 Examples:
   betterrank dependents src/auth/handlers.ts --root ./backend`,
 
-  neighborhood: `betterrank neighborhood <file> [--hops N] [--max-files N] [--root <path>]
+  neighborhood: `betterrank neighborhood <file> [--hops N] [--max-files N] [--max-symbols N] [--root <path>]
 
-Local subgraph around a file: its imports, importers, and their symbols.
+Local subgraph around a file: its imports, importers, and their top-ranked symbols.
 
 Options:
   --hops N          BFS depth for outgoing imports (default: 2)
   --max-files N     Max files to include (default: 15, direct neighbors always included)
+  --max-symbols N   Max symbols to display (default: 60)
   --count           Return counts only
   --offset N        Skip first N files
-  --limit N         Max files to return
+  --limit N         Max files to return (default: --max-files)
 
 Examples:
   betterrank neighborhood src/auth/handlers.ts --root ./backend
-  betterrank neighborhood src/api/bid.js --hops 3 --max-files 20 --root .`,
+  betterrank neighborhood src/api/bid.js --hops 3 --max-files 10 --root .`,
 
   orphans: `betterrank orphans [--level file|symbol] [--kind type] [--root <path>]
 
@@ -322,17 +322,6 @@ Show index statistics: file count, symbol count, edge count.
 
 Examples:
   betterrank stats --root .`,
-
-  ui: `betterrank ui [--port N]
-
-Launch the interactive web UI for exploring the index.
-
-Options:
-  --port N    Port to listen on (default: 3333)
-
-Examples:
-  betterrank ui
-  betterrank ui --port 8080`,
 };
 
 async function main() {
@@ -353,18 +342,6 @@ async function main() {
       console.log(USAGE);
     }
     process.exit(0);
-  }
-
-  // UI command doesn't need --root or a CodeIndex instance
-  if (command === 'ui') {
-    const { startServer } = await import('./server.js');
-    const port = parseInt(flags.port || '3333', 10);
-    startServer(port);
-    // Open browser
-    const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-    const { exec } = await import('child_process');
-    exec(`${opener} http://localhost:${port}`);
-    return; // Keep process alive (server is listening)
   }
 
   // Compare command — standalone, doesn't need CodeIndex
@@ -911,26 +888,12 @@ async function main() {
       if (!file) { console.error('Usage: betterrank neighborhood <file> [--hops N] [--max-files N]'); process.exit(1); }
       const hops = parseInt(flags.hops || '2', 10);
       const maxFilesFlag = flags['max-files'] ? parseInt(flags['max-files'], 10) : 15;
-
-      // Safety: if neither --count nor --limit/--offset was provided, force a
-      // count-first response so we never accidentally dump hundreds of files.
-      const needsSafetyCount = !countMode && offset === undefined && userLimit === undefined;
-
-      if (needsSafetyCount) {
-        const preview = await idx.neighborhood({
-          file, hops, maxFiles: maxFilesFlag, count: true,
-        });
-        if (handleFileNotFound(preview, file)) break;
-        console.log(`files: ${preview.totalFiles} (${preview.totalVisited} visited, ${preview.totalFiles} after ranking)`);
-        console.log(`symbols: ${preview.totalSymbols}`);
-        console.log(`edges: ${preview.totalEdges}`);
-        console.log(`\nUse --limit N (and --offset N) to paginate, or --count to get counts only.`);
-        break;
-      }
+      const maxSymbolsFlag = flags['max-symbols'] ? parseInt(flags['max-symbols'], 10) : 60;
+      const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : maxFilesFlag);
 
       const result = await idx.neighborhood({
         file, hops, maxFiles: maxFilesFlag,
-        count: countMode, offset, limit: userLimit,
+        count: countMode, offset, limit: effectiveLimit,
       });
       if (handleFileNotFound(result, file)) break;
 
@@ -952,9 +915,13 @@ async function main() {
         }
 
         if (result.symbols.length > 0) {
-          console.log(`\nSymbols (${result.symbols.length}):`);
+          const shownSymbols = result.symbols.slice(0, maxSymbolsFlag);
+          const symHeader = shownSymbols.length < result.symbols.length
+            ? `Symbols (top ${shownSymbols.length} of ${result.symbols.length}, ranked by PageRank):`
+            : `Symbols (${result.symbols.length}):`;
+          console.log(`\n${symHeader}`);
           const byFile = new Map();
-          for (const s of result.symbols) {
+          for (const s of shownSymbols) {
             if (!byFile.has(s.file)) byFile.set(s.file, []);
             byFile.get(s.file).push(s);
           }
@@ -963,6 +930,9 @@ async function main() {
             for (const s of syms) {
               console.log(`    ${String(s.lineStart).padStart(4)}│ ${s.signature}`);
             }
+          }
+          if (shownSymbols.length < result.symbols.length) {
+            console.log(`\n(use --max-symbols N to show more, or \`betterrank outline <file>\` for a specific file)`);
           }
         }
       }
