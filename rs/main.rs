@@ -2,9 +2,9 @@ use betterrank::cache::CodeIndex;
 use betterrank::noncode::{ranked_grep, GrepOpts};
 use betterrank::outline::{build_outline, parse_line_range, OutlineOpts};
 use betterrank::query::{
-    cmd_callees, cmd_callers, cmd_context, cmd_deps, cmd_dependents, cmd_diff, cmd_history,
-    cmd_map, cmd_neighborhood, cmd_orphans, cmd_search, cmd_stats, cmd_structure, cmd_symbols,
-    cmd_trace, get_caller_counts_for_file,
+    cmd_callees, cmd_callers, cmd_context, cmd_dependents, cmd_deps, cmd_diff, cmd_files,
+    cmd_history, cmd_map, cmd_neighborhood, cmd_orphans, cmd_search, cmd_stats, cmd_structure,
+    cmd_symbols, cmd_trace, get_caller_counts_for_file,
 };
 use betterrank::walk::{find_default_root, normalize_slashes};
 use rustc_hash::FxHashMap;
@@ -20,20 +20,21 @@ const USAGE: &str = "\
 betterrank <command> [options]
 
 Commands:
-  outline     <file> [symbol1,symbol2] [--annotate]  File skeleton (--annotate, --lines, --no-comments, --depth)
+  outline     <file> [sym1,L10-50,...] [--annotate]  Compact symbol skeleton (collapses imports); pass symbols or line ranges to expand
   map         [--focus file1,file2] [--include-tests] Repo map (ranked by PageRank, excludes tests by default)
-  search      <query> [--kind type]                 Substring search on symbols + non-code config mentions
-  grep        <pattern> [--non-code] [--no-tests]   PageRank-ranked, bounded ripgrep across ALL files (code + configs)
+  files       [dir-or-glob] [--code|--non-code]     List all indexed code + config files by path/glob
+  search      <query> [--kind type]                 Path- & token-aware search on symbols, files, + non-code mentions
+  grep        <pattern> [-C N] [--code|--non-code]  PageRank-ranked ripgrep with enclosing symbols & balanced alternations
   structure   [--depth N]                           File tree with symbol counts (default depth: 3)
   symbols     [--file path] [--kind type]           List definitions (ranked by PageRank)
-  callers     <symbol> [--file path] [--context]     All call sites + non-code config mentions (ranked)
+  callers     <sym1[,sym2]> [--file path] [--context] Ranked callers (prod first, merged context, supports file.ts:sym)
   context     <symbol> [--file path]                 Full context: source, deps, types, callers
   history     <symbol> [--file path]                Git history of a specific function
   trace       <symbol> [--depth N]                  Recursive caller chain (upward)
   callees     <symbol> [--depth N]                  Recursive callee chain (downward)
   diff        [--ref <commit>]                      Git-aware blast radius (changed symbols + callers)
   deps        <file>                                What this file imports (ranked)
-  dependents  <file>                                What imports this file + non-code config mentions (ranked)
+  dependents  <file>                                What imports this file (with import lines & symbols) + non-code mentions
   neighborhood <file> [--hops N] [--max-files N]    Local subgraph (ranked by PageRank)
   orphans     [--level file|symbol] [--kind type]   Find disconnected files/symbols
   reindex                                           Force full rebuild
@@ -52,6 +53,7 @@ Global flags:
 struct Flags {
     positional: Vec<String>,
     roots: Vec<String>,
+    extra_patterns: Vec<String>,
     values: FxHashMap<String, String>,
     bools: rustc_hash::FxHashSet<String>,
 }
@@ -98,6 +100,51 @@ fn parse_flags(args: &[String]) -> Flags {
                 f.bools.insert("files-only".to_string());
                 i += 1;
             }
+            "-C" => {
+                if i + 1 < args.len() && args[i + 1].parse::<usize>().is_ok() {
+                    f.values.insert("context".to_string(), args[i + 1].clone());
+                    i += 2;
+                } else {
+                    f.values.insert("context".to_string(), "2".to_string());
+                    i += 1;
+                }
+            }
+            s if s.starts_with("-C") && s[2..].parse::<usize>().is_ok() => {
+                f.values.insert("context".to_string(), s[2..].to_string());
+                i += 1;
+            }
+            "-A" => {
+                if i + 1 < args.len() && args[i + 1].parse::<usize>().is_ok() {
+                    f.values.insert("after-context".to_string(), args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            s if s.starts_with("-A") && s[2..].parse::<usize>().is_ok() => {
+                f.values.insert("after-context".to_string(), s[2..].to_string());
+                i += 1;
+            }
+            "-B" => {
+                if i + 1 < args.len() && args[i + 1].parse::<usize>().is_ok() {
+                    f.values.insert("before-context".to_string(), args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            s if s.starts_with("-B") && s[2..].parse::<usize>().is_ok() => {
+                f.values.insert("before-context".to_string(), s[2..].to_string());
+                i += 1;
+            }
+            "-e" => {
+                if i + 1 < args.len() {
+                    f.extra_patterns.push(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
             s if s.starts_with("--") => {
                 let raw = &s[2..];
                 if let Some((k, v)) = raw.split_once('=') {
@@ -116,11 +163,14 @@ fn parse_flags(args: &[String]) -> Flags {
                         | "annotate"
                         | "no-comments"
                         | "collapse-imports"
+                        | "show-imports"
+                        | "full"
                         | "include-tests"
                         | "no-tests"
                         | "no-source"
                         | "no-noncode"
                         | "non-code"
+                        | "code"
                         | "files-only"
                         | "case-insensitive"
                         | "fixed-strings"
@@ -191,8 +241,8 @@ fn normalize_graph_file_arg(idx: &CodeIndex, raw: &str) -> String {
 fn print_command_help(cmd: &str) {
     match cmd {
         "map" => println!("betterrank map [--focus file1,file2] [--include-tests] [--limit N] [--root <path>]\n\nOptions:\n  --focus <files>   Comma-separated files to bias ranking\n  --include-tests   Include test/spec files (excluded by default)\n  --count           Return total symbol count only\n  --offset N        Skip first N symbols\n  --limit N         Max symbols to return (default: 50)"),
-        "callers" => println!("betterrank callers <symbol> [--file path] [--context [N]] [--no-tests] [--no-noncode] [--root <path>]\n\nOptions:\n  --file <path>    Disambiguate duplicate symbol names\n  --context [N]    Show N lines of context around call sites (default: 2)\n  --no-tests       Exclude test/spec files\n  --no-noncode     Skip automatic non-code/config mention scan\n  --count          Return count only"),
-        "grep" => println!("betterrank grep <pattern> [--non-code] [--no-tests] [-l] [-i] [-F] [--path sub] [--limit N] [--max-per-file N] [--root <path>]\n\nPageRank-ranked, hard-bounded ripgrep across ALL files (code + Dockerfiles + CI YAML + Prisma + SQL + JSON).\n\nOptions:\n  --non-code         Search only non-code/config/infra/schema files\n  --no-tests         Exclude test/spec files\n  -l, --files-only   List matching file paths only\n  -i                 Case-insensitive search\n  -F                 Fixed-string literal search (no regex)\n  --path <substr>    Restrict to files whose path contains <substr>\n  --limit N          Max matching files (default: 30)\n  --max-per-file N   Max matching lines per file (default: 5)"),
+        "callers" => println!("betterrank callers <sym1[,sym2,...]> [--file path] [--context [N]] [--no-tests] [--no-noncode] [--root <path>]\n\nOptions:\n  --file <path>    Disambiguate duplicate symbol names\n  --context [N]    Show N lines of context around call sites (default: 2)\n  --no-tests       Exclude test/spec files\n  --no-noncode     Skip automatic non-code/config mention scan\n  --count          Return count only"),
+        "grep" => println!("betterrank grep <pattern> [--non-code] [--no-tests] [-C N] [-l] [-i] [-F] [--path sub] [--limit N] [--max-per-file N] [--root <path>]\n\nPageRank-ranked, hard-bounded ripgrep across ALL files (code + Dockerfiles + CI YAML + Prisma + SQL + JSON), annotated with enclosing symbol names when warm.\n\nOptions:\n  --non-code         Search only non-code/config/infra/schema files\n  --no-tests         Exclude test/spec files\n  -C N, --context N  Show N lines of surrounding context (max: 5)\n  -l, --files-only   List matching file paths only\n  -i                 Case-insensitive search\n  -F                 Fixed-string literal search (no regex)\n  --path <substr>    Restrict to files whose path contains <substr>\n  --limit N          Max matching files (default: 30)\n  --max-per-file N   Max matching lines per file (default: 5)"),
         "outline" => println!("betterrank outline <file> [symbol1,symbol2] [--annotate --lines A-B --no-comments --depth N --collapse-imports --root <path>]"),
         _ => println!("{USAGE}"),
     }
@@ -334,6 +384,8 @@ fn main() {
                 depth,
                 explicit_depth,
                 collapse_imports,
+                show_imports: flags.has("show-imports"),
+                full_skeleton: flags.has("full"),
             },
         );
         println!("{out}");
@@ -350,52 +402,139 @@ fn main() {
 
     // `grep` works even without triggering a cold index (uses warm mmap cache if present for PageRank!)
     if command == "grep" {
-        let Some(pattern) = flags.positional.first() else {
-            eprintln!("Usage: betterrank grep <pattern> [--non-code] [--no-tests] [-l] [-i] [-F] [--limit N]");
+        if flags.positional.is_empty() && flags.extra_patterns.is_empty() {
+            eprintln!("Usage: betterrank grep <pattern> [-C N] [--code|--non-code] [--ext ts,py] [--type dockerfile,ci] [--include-tests] [-l] [-i] [-F] [--limit N]");
             process::exit(1);
-        };
+        }
+        let pattern = flags
+            .positional
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("");
         let warm = betterrank::graph::MmapGraphCache::open(&idx.cache_path);
+        let ctx_lines = if let Some(n) = flags.get_usize("context") {
+            n
+        } else if flags.bools.contains("context") {
+            2
+        } else {
+            0
+        };
+        let before_ctx = flags.get_usize("before-context").unwrap_or(ctx_lines);
+        let after_ctx = flags.get_usize("after-context").unwrap_or(ctx_lines);
+        let exts: Vec<String> = flags
+            .get("ext")
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let types: Vec<String> = flags
+            .get("type")
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_ascii_lowercase())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let include_tests = flags.has("include-tests") && !flags.has("no-tests");
         let opts = GrepOpts {
             case_insensitive: flags.has("case-insensitive"),
             fixed_strings: flags.has("fixed-strings"),
             noncode_only: flags.has("non-code"),
-            no_tests: flags.has("no-tests"),
+            code_only: flags.has("code"),
+            include_tests,
             files_only: flags.has("files-only"),
             limit_files: user_limit.unwrap_or(30),
             max_per_file: flags.get_usize("max-per-file").unwrap_or(5),
+            user_max_per_file: flags.get("max-per-file").is_some(),
+            before_context: before_ctx,
+            after_context: after_ctx,
             path_filter: flags.get("path").map(|s| s.to_string()),
+            exts,
+            types,
+            extra_patterns: flags.extra_patterns.clone(),
         };
         match ranked_grep(&idx.roots, pattern, warm.as_ref().map(|m| m.archived()), &opts) {
-            Ok((hits, total_files, total_hits)) => {
-                if count_only {
-                    println!("files: {total_files}");
-                    println!("matches: {total_hits}");
+            Ok(res) => {
+                if res.path_matched_zero {
+                    let pf = opts.path_filter.as_deref().unwrap_or("");
+                    eprintln!("⚠ --path \"{pf}\" matched 0 files under the active --root(s). Use a repo-relative path or pass --root <repo>.");
                     return;
                 }
-                if hits.is_empty() {
+                if count_only {
+                    println!("files: {}", res.total_files);
+                    println!("matches: {}", res.total_hits);
+                    if res.hidden_test_files > 0 {
+                        println!(
+                            "hidden_test_files: {} (matches: {})",
+                            res.hidden_test_files, res.hidden_test_hits
+                        );
+                    }
+                    return;
+                }
+                if !res.branch_counts.is_empty() {
+                    let summary: Vec<String> = res
+                        .branch_counts
+                        .iter()
+                        .map(|(b, c)| format!("{b}: {c}"))
+                        .collect();
+                    println!("Pattern matches (files): {}", summary.join(" | "));
+                }
+                if res.hits.is_empty() && res.hidden_test_files == 0 {
                     println!("(no matches for \"{pattern}\")");
                     return;
                 }
-                for fh in &hits {
+                let has_ctx = opts.before_context > 0 || opts.after_context > 0;
+                for fh in &res.hits {
                     if opts.files_only {
                         println!("{}  ({} matches)", fh.file, fh.total_hits_in_file);
                     } else {
                         println!("{}:", fh.file);
+                        let mut prev_line: Option<u64> = None;
+                        let mut shown_matches = 0usize;
                         for h in &fh.hits {
-                            println!("  {:>5}│ {}", h.line, h.content);
+                            if let Some(pl) = prev_line {
+                                if has_ctx && h.line > pl + 1 {
+                                    println!("  --");
+                                }
+                            }
+                            if h.is_context {
+                                println!("  {:>5}- {}", h.line, h.content);
+                            } else {
+                                shown_matches += 1;
+                                if let Some(ref sym) = h.enclosing_sym {
+                                    println!("  {:>5} [{sym}]│ {}", h.line, h.content);
+                                } else {
+                                    println!("  {:>5}│ {}", h.line, h.content);
+                                }
+                            }
+                            prev_line = Some(h.line);
                         }
-                        if fh.total_hits_in_file > fh.hits.len() {
+                        if fh.total_hits_in_file > shown_matches {
                             println!(
                                 "        ... (+{} more in file)",
-                                fh.total_hits_in_file - fh.hits.len()
+                                fh.total_hits_in_file - shown_matches
                             );
                         }
                     }
                 }
-                if total_files > hits.len() {
+                if res.total_files > res.hits.len() {
                     println!(
-                        "\nShowing {} of {total_files} files ({total_hits} total matches; ranked by PageRank). Use --limit N or --path <subpath> to narrow.",
-                        hits.len()
+                        "\nShowing {} of {} files ({} total matches; ranked by PageRank). Use --limit N or --path <subpath> to narrow.",
+                        res.hits.len(),
+                        res.total_files,
+                        res.total_hits
+                    );
+                }
+                if res.hidden_test_files > 0 {
+                    println!(
+                        "(+ {} matches in {} test/fixture {} hidden — pass --include-tests to expand)",
+                        res.hidden_test_hits,
+                        res.hidden_test_files,
+                        if res.hidden_test_files == 1 { "file" } else { "files" }
                     );
                 }
             }
@@ -469,17 +608,35 @@ fn main() {
             let depth = flags.get_usize("depth").unwrap_or(DEFAULT_DEPTH);
             cmd_structure(g, depth, explicit);
         }
+        "files" => {
+            let pat = flags.positional.first().map(|s| s.as_str());
+            let files_limit = user_limit.unwrap_or(200);
+            cmd_files(
+                g,
+                pat,
+                flags.has("code"),
+                flags.has("non-code"),
+                flags.has("no-tests"),
+                count_only,
+                offset,
+                files_limit,
+            );
+        }
         "search" => {
             if flags.positional.is_empty() {
-                eprintln!("Usage: betterrank search <query> [--kind type]");
+                eprintln!("Usage: betterrank search <query> [--kind type] [--max-per-file N] [--include-tests]");
                 process::exit(1);
             }
             let q = flags.positional.join(" ");
+            let max_per_file = flags.get_usize("max-per-file").unwrap_or(5);
+            let include_tests = flags.has("include-tests") && !flags.has("no-tests");
             cmd_search(
                 &idx,
                 g,
                 &q,
                 flags.get("kind"),
+                max_per_file,
+                include_tests,
                 count_only,
                 offset,
                 limit,
@@ -502,12 +659,13 @@ fn main() {
             );
         }
         "callers" => {
-            let Some(sym) = flags.positional.first() else {
-                eprintln!("Usage: betterrank callers <symbol> [--file path]");
+            let Some(sym_arg) = flags.positional.first() else {
+                eprintln!("Usage: betterrank callers <sym1[,sym2,...]> [--file|--defined-in path] [--path sub] [--include-tests]");
                 process::exit(1);
             };
             let f_arg = flags
                 .get("file")
+                .or_else(|| flags.get("defined-in"))
                 .map(|f| normalize_graph_file_arg(&idx, f));
             let ctx_lines = if let Some(n) = flags.get_usize("context") {
                 n
@@ -516,19 +674,34 @@ fn main() {
             } else {
                 0
             };
-            cmd_callers(
-                &idx,
-                g,
-                sym,
-                f_arg.as_deref(),
-                ctx_lines,
-                flags.has("no-tests"),
-                count_only,
-                offset,
-                limit,
-                user_limit.is_some(),
-                include_noncode,
-            );
+            let include_tests = flags.has("include-tests") && !flags.has("no-tests");
+            let syms: Vec<&str> = sym_arg
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for (i, sym) in syms.iter().enumerate() {
+                if syms.len() > 1 {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("=== callers: {sym} ===");
+                }
+                cmd_callers(
+                    &idx,
+                    g,
+                    sym,
+                    f_arg.as_deref(),
+                    flags.get("path"),
+                    ctx_lines,
+                    include_tests,
+                    count_only,
+                    offset,
+                    limit,
+                    user_limit.is_some(),
+                    include_noncode,
+                );
+            }
         }
         "context" => {
             let Some(sym) = flags.positional.first() else {
@@ -595,14 +768,16 @@ fn main() {
         }
         "dependents" => {
             let Some(raw_f) = flags.positional.first() else {
-                eprintln!("Usage: betterrank dependents <file>");
+                eprintln!("Usage: betterrank dependents <file> [--include-tests]");
                 process::exit(1);
             };
             let f = normalize_graph_file_arg(&idx, raw_f);
+            let include_tests = flags.has("include-tests") && !flags.has("no-tests");
             cmd_dependents(
                 &idx,
                 g,
                 &f,
+                include_tests,
                 count_only,
                 offset,
                 limit,

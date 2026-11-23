@@ -2,7 +2,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 pub const GRAPH_CACHE_MAGIC: [u8; 8] = *b"BRG00001";
 pub const PARSE_CACHE_MAGIC: [u8; 8] = *b"BRP00001";
-pub const CACHE_FORMAT_VERSION: u32 = 1;
+pub const CACHE_FORMAT_VERSION: u32 = 2;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
@@ -192,6 +192,8 @@ pub struct GraphCacheData {
     pub ref_out_offsets: Vec<u32>,
     pub ref_out_targets: Vec<u32>,
     pub total_edges: u32,
+    /// Cached non-code/config file paths (Dockerfiles, CI YAML, Prisma, SQL, JSON, TOML, etc.)
+    pub noncode_files: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

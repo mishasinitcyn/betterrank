@@ -3,7 +3,10 @@ use crate::graph::{
     archived_barrel_reachable, archived_find_file, archived_find_symbols_by_name,
 };
 use crate::model::{language_family, ArchivedGraphCacheData, SymbolKind};
-use crate::noncode::{find_noncode_mentions, TextFileHits};
+use crate::noncode::{
+    find_noncode_mentions, find_noncode_mentions_with_pattern, is_generic_file_stem,
+    is_test_or_fixture_path, TextFileHits,
+};
 use crate::parser::{is_stdlib_receiver, parse_file, ParseOptions};
 use crate::walk::is_test_file;
 use regex::Regex;
@@ -210,7 +213,24 @@ pub fn cmd_map(
             })
             .collect();
         scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.into_iter().map(|(si, _)| si).collect()
+        // Cap per-file symbols (max 10 per file) when focusing so a single huge focus file
+        // doesn't consume all 50 slots and hide its neighborhood!
+        let per_file_cap = 10usize;
+        let mut counts: FxHashMap<u32, usize> = FxHashMap::default();
+        let mut capped: Vec<u32> = Vec::with_capacity(scored.len());
+        let mut overflow: Vec<u32> = Vec::new();
+        for (si, _) in scored {
+            let fi = g.symbols[si as usize].file_idx.to_native();
+            let c = counts.entry(fi).or_insert(0);
+            if *c < per_file_cap {
+                *c += 1;
+                capped.push(si);
+            } else {
+                overflow.push(si);
+            }
+        }
+        capped.extend(overflow);
+        capped
     };
 
     let total_symbols = ordered.len();
@@ -348,11 +368,42 @@ fn print_noncode_section(hits: &[TextFileHits], total_files: usize) {
     }
 }
 
+fn split_query_tokens(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in query.split(|c: char| !c.is_alphanumeric()) {
+        if raw.is_empty() {
+            continue;
+        }
+        // Also split camelCase tokens like `reviewPage` -> `["review", "page"]`
+        let chars: Vec<char> = raw.chars().collect();
+        let mut start = 0usize;
+        for i in 1..chars.len() {
+            let prev = chars[i - 1];
+            let cur = chars[i];
+            let next_lower = chars.get(i + 1).map_or(false, |c| c.is_lowercase());
+            if (prev.is_lowercase() && cur.is_uppercase())
+                || (prev.is_uppercase() && cur.is_uppercase() && next_lower)
+            {
+                let part: String = chars[start..i].iter().collect();
+                out.push(part.to_ascii_lowercase());
+                start = i;
+            }
+        }
+        let tail: String = chars[start..].iter().collect();
+        if !tail.is_empty() {
+            out.push(tail.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
 pub fn cmd_search(
     idx: &CodeIndex,
     g: &ArchivedGraphCacheData,
     query: &str,
     kind: Option<&str>,
+    max_per_file: usize,
+    include_tests: bool,
     count_only: bool,
     offset: usize,
     limit: usize,
@@ -360,74 +411,171 @@ pub fn cmd_search(
     include_noncode: bool,
 ) {
     let q_lower = query.to_ascii_lowercase();
-    let tokens: Vec<&str> = q_lower.split_whitespace().collect();
-    let matches: Vec<u32> = if tokens.len() <= 1 {
-        g.ranked_syms
-            .iter()
-            .map(|r| r.to_native())
-            .filter(|&si| {
-                let sym = &g.symbols[si as usize];
-                if let Some(k) = kind {
-                    if !SymbolKind::from_u8(sym.kind).matches_filter(k) {
-                        return false;
-                    }
-                }
-                sym.name.as_str().to_ascii_lowercase().contains(&q_lower)
-                    || sym
-                        .signature
-                        .as_str()
-                        .to_ascii_lowercase()
-                        .contains(&q_lower)
-            })
-            .collect()
-    } else {
-        // Multi-word queries: require every token to match across name, signature, or file path,
-        // prioritizing symbols where more tokens match the symbol name itself (preserving PageRank within tiers).
-        let mut tier_name_all: Vec<u32> = Vec::new();
-        let mut tier_name_some: Vec<u32> = Vec::new();
-        let mut tier_other: Vec<u32> = Vec::new();
-        for &si_r in g.ranked_syms.iter() {
-            let si = si_r.to_native();
-            let sym = &g.symbols[si as usize];
-            if let Some(k) = kind {
-                if !SymbolKind::from_u8(sym.kind).matches_filter(k) {
-                    continue;
-                }
+    let tokens = split_query_tokens(query);
+    let multi_token = tokens.len() > 1;
+
+    // Also match files by path (critical for Next.js routes like `user-management/page.tsx`)
+    let mut matching_files: Vec<&str> = Vec::new();
+    if kind.is_none() && offset == 0 && !count_only {
+        for &fi_r in g.file_order.iter() {
+            let f = &g.files[fi_r.to_native() as usize];
+            if f.symbol_count.to_native() < 0 {
+                continue;
             }
-            let name_l = sym.name.as_str().to_ascii_lowercase();
-            let sig_l = sym.signature.as_str().to_ascii_lowercase();
-            let file_l = g.files[sym.file_idx.to_native() as usize]
-                .path
-                .as_str()
-                .to_ascii_lowercase();
+            let p = f.path.as_str();
+            if !include_tests && is_test_file(p) {
+                continue;
+            }
+            let pl = p.to_ascii_lowercase();
+            let hit = if multi_token {
+                tokens.iter().all(|t| pl.contains(t.as_str()))
+            } else {
+                pl.contains(&q_lower)
+            };
+            if hit {
+                matching_files.push(p);
+            }
+        }
+        for p_r in g.noncode_files.iter() {
+            let p = p_r.as_str();
+            if !include_tests && is_test_file(p) {
+                continue;
+            }
+            let pl = p.to_ascii_lowercase();
+            let hit = if multi_token {
+                tokens.iter().all(|t| pl.contains(t.as_str()))
+            } else {
+                pl.contains(&q_lower)
+            };
+            if hit {
+                matching_files.push(p);
+            }
+        }
+    }
+
+    let mut tier_exact_name: Vec<u32> = Vec::new();
+    let mut tier_name_all: Vec<u32> = Vec::new();
+    let mut tier_path_and_name: Vec<u32> = Vec::new();
+    let mut tier_sig: Vec<u32> = Vec::new();
+    let mut test_sym_count = 0usize;
+
+    for &si_r in g.ranked_syms.iter() {
+        let si = si_r.to_native();
+        let sym = &g.symbols[si as usize];
+        if let Some(k) = kind {
+            if !SymbolKind::from_u8(sym.kind).matches_filter(k) {
+                continue;
+            }
+        }
+        let fi = sym.file_idx.to_native() as usize;
+        let file_path = g.files[fi].path.as_str();
+        let is_test = is_test_file(file_path);
+
+        let name_l = sym.name.as_str().to_ascii_lowercase();
+        let sig_l = sym.signature.as_str().to_ascii_lowercase();
+        let file_l = file_path.to_ascii_lowercase();
+
+        let matched_tier = if !multi_token {
+            if name_l.contains(&q_lower) {
+                Some(0u8)
+            } else if sig_l.contains(&q_lower) {
+                Some(3u8)
+            } else {
+                None
+            }
+        } else {
+            // Require every token to appear in name, file path, or signature
             let mut all_ok = true;
             let mut name_hits = 0usize;
+            let mut path_hits = 0usize;
             for tok in &tokens {
-                if name_l.contains(tok) {
+                let in_name = name_l.contains(tok.as_str());
+                let in_path = file_l.contains(tok.as_str());
+                let in_sig = sig_l.contains(tok.as_str());
+                if in_name {
                     name_hits += 1;
-                } else if !sig_l.contains(tok) && !file_l.contains(tok) {
+                }
+                if in_path {
+                    path_hits += 1;
+                }
+                if !in_name && !in_path && !in_sig {
                     all_ok = false;
                     break;
                 }
             }
-            if all_ok {
-                if name_hits == tokens.len() {
-                    tier_name_all.push(si);
-                } else if name_hits > 0 {
-                    tier_name_some.push(si);
-                } else {
-                    tier_other.push(si);
-                }
+            if !all_ok {
+                None
+            } else if name_l.contains(&q_lower) {
+                Some(0)
+            } else if name_hits == tokens.len() {
+                Some(1)
+            } else if name_hits + path_hits >= tokens.len() && (name_hits > 0 || path_hits == tokens.len()) {
+                Some(2)
+            } else {
+                Some(3)
+            }
+        };
+
+        if let Some(tier) = matched_tier {
+            if is_test && !include_tests {
+                test_sym_count += 1;
+                continue;
+            }
+            match tier {
+                0 => tier_exact_name.push(si),
+                1 => tier_name_all.push(si),
+                2 => tier_path_and_name.push(si),
+                _ => tier_sig.push(si),
             }
         }
-        tier_name_all.extend(tier_name_some);
-        tier_name_all.extend(tier_other);
-        tier_name_all
+    }
+
+    let mut all_matches: Vec<u32> = Vec::with_capacity(
+        tier_exact_name.len() + tier_name_all.len() + tier_path_and_name.len() + tier_sig.len(),
+    );
+    all_matches.extend(tier_exact_name);
+    all_matches.extend(tier_name_all);
+    all_matches.extend(tier_path_and_name);
+    all_matches.extend(tier_sig);
+
+    // Apply per-file cap (default 5) so one huge script doesn't eat all 30 slots
+    let matches: Vec<u32> = if max_per_file > 0 {
+        let mut per_file: FxHashMap<u32, usize> = FxHashMap::default();
+        all_matches
+            .into_iter()
+            .filter(|&si| {
+                let fi = g.symbols[si as usize].file_idx.to_native();
+                let c = per_file.entry(fi).or_insert(0);
+                if *c < max_per_file {
+                    *c += 1;
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect()
+    } else {
+        all_matches
     };
 
     if count_only {
         println!("total: {}", matches.len());
         return;
+    }
+
+    if !matching_files.is_empty() {
+        let show_n = matching_files.len().min(10);
+        println!("Matching files ({}):", matching_files.len());
+        for p in &matching_files[..show_n] {
+            println!("  {p}");
+        }
+        if matching_files.len() > show_n {
+            println!(
+                "  ... (+{} more files — use `betterrank files <path>`)",
+                matching_files.len() - show_n
+            );
+        }
+        println!();
     }
 
     let end = (offset + limit).min(matches.len());
@@ -449,15 +597,110 @@ pub fn cmd_search(
         );
     }
 
-    if slice.is_empty() {
+    if slice.is_empty() && matching_files.is_empty() {
         println!("(no matches for \"{query}\")");
     } else if slice.len() == limit && !user_limit && matches.len() > limit {
         println!("\n(showing top {limit} by relevance — use --limit N or --count for total)");
     }
+    if test_sym_count > 0 {
+        println!("(+ {test_sym_count} test matches hidden — pass --include-tests to expand)");
+    }
 
     if include_noncode && offset == 0 && kind.is_none() {
-        let (nc_hits, nc_total) = find_noncode_mentions(&idx.roots, query, 10, 2);
+        let (nc_hits, nc_total) = find_noncode_mentions(&idx.roots, Some(g), query, 10, 2);
         print_noncode_section(&nc_hits, nc_total);
+    }
+}
+
+pub fn cmd_files(
+    g: &ArchivedGraphCacheData,
+    pattern: Option<&str>,
+    code_only: bool,
+    noncode_only: bool,
+    no_tests: bool,
+    count_only: bool,
+    offset: usize,
+    limit: usize,
+) {
+    let mut paths: Vec<&str> = Vec::new();
+    if !noncode_only {
+        for &fi_r in g.file_order.iter() {
+            let f = &g.files[fi_r.to_native() as usize];
+            if f.symbol_count.to_native() < 0 {
+                continue;
+            }
+            paths.push(f.path.as_str());
+        }
+    }
+    if !code_only {
+        for p_r in g.noncode_files.iter() {
+            paths.push(p_r.as_str());
+        }
+    }
+    paths.sort_unstable();
+    paths.dedup();
+
+    let pat_lower = pattern.map(|p| p.trim_start_matches("./").to_ascii_lowercase());
+    let has_glob = pat_lower
+        .as_ref()
+        .map_or(false, |p| p.contains('*') || p.contains('?'));
+    let glob_re = if has_glob {
+        let p = pat_lower.as_deref().unwrap_or("");
+        let mut re_s = String::from("^.*");
+        for ch in p.chars() {
+            match ch {
+                '*' => re_s.push_str(".*"),
+                '?' => re_s.push('.'),
+                other => re_s.push_str(&regex::escape(&other.to_string())),
+            }
+        }
+        re_s.push_str(".*$");
+        regex::Regex::new(&re_s).ok()
+    } else {
+        None
+    };
+
+    let filtered: Vec<&str> = paths
+        .into_iter()
+        .filter(|&p| {
+            if no_tests && is_test_file(p) {
+                return false;
+            }
+            if let Some(ref pl) = pat_lower {
+                let p_low = p.to_ascii_lowercase();
+                if let Some(ref re) = glob_re {
+                    re.is_match(&p_low)
+                } else {
+                    p_low.contains(pl.as_str())
+                }
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if count_only {
+        println!("total: {}", filtered.len());
+        return;
+    }
+
+    let end = (offset + limit).min(filtered.len());
+    let slice = if offset < filtered.len() {
+        &filtered[offset..end]
+    } else {
+        &[]
+    };
+    for p in slice {
+        println!("{p}");
+    }
+    if filtered.is_empty() {
+        println!("(no matching files)");
+    } else if slice.len() < filtered.len() {
+        println!(
+            "\nShowing {} of {} files. Use --limit N or a narrower prefix/glob.",
+            slice.len(),
+            filtered.len()
+        );
     }
 }
 
@@ -553,32 +796,55 @@ pub fn cmd_symbols(
 pub fn cmd_callers(
     idx: &CodeIndex,
     g: &ArchivedGraphCacheData,
-    symbol: &str,
+    raw_symbol: &str,
     file: Option<&str>,
+    path_filter: Option<&str>,
     context_lines: usize,
-    no_tests: bool,
+    include_tests: bool,
     count_only: bool,
     offset: usize,
     limit: usize,
     user_limit: bool,
     include_noncode: bool,
 ) {
+    // Support file-scoped syntax like `router.ts:getItem` or `src/api/router.ts:getItem`
+    let (file_hint_from_sym, symbol) = match raw_symbol.rsplit_once(':') {
+        Some((fpart, spart)) if !fpart.is_empty() && !spart.is_empty() => (Some(fpart), spart),
+        _ => (None, raw_symbol),
+    };
+    let effective_file = file.or(file_hint_from_sym);
+
     let mut target_syms = archived_find_symbols_by_name(g, symbol);
-    if let Some(f) = file {
+    if let Some(f) = effective_file {
+        let f_norm = f.trim_start_matches("./");
+        let suffix = format!("/{f_norm}");
         target_syms.retain(|&si| {
             let fi = g.symbols[si as usize].file_idx.to_native() as usize;
-            g.files[fi].path.as_str() == f
+            let p = g.files[fi].path.as_str();
+            p == f_norm || p.ends_with(&suffix)
         });
     }
 
     let mut caller_set: FxHashSet<u32> = FxHashSet::default();
     let mut callers: Vec<(u32, f32)> = Vec::new();
+    let mut hidden_test_callers = 0usize;
+    let mut seen_hidden_tests: FxHashSet<u32> = FxHashSet::default();
+
     for &si in &target_syms {
         let rs = g.ref_in_offsets[si as usize].to_native() as usize;
         let re = g.ref_in_offsets[si as usize + 1].to_native() as usize;
         for &src_r in &g.ref_in_sources[rs..re] {
             let fi = src_r.to_native();
-            if no_tests && is_test_file(g.files[fi as usize].path.as_str()) {
+            let cpath = g.files[fi as usize].path.as_str();
+            if let Some(pf) = path_filter {
+                if !cpath.contains(pf) {
+                    continue;
+                }
+            }
+            if !include_tests && is_test_or_fixture_path(cpath) {
+                if seen_hidden_tests.insert(fi) {
+                    hidden_test_callers += 1;
+                }
                 continue;
             }
             if caller_set.insert(fi) {
@@ -644,7 +910,7 @@ pub fn cmd_callers(
                 continue;
             };
             let lines: Vec<&str> = source.split('\n').collect();
-            let mut found = false;
+            let mut matched_indices: Vec<usize> = Vec::new();
             for (i, line) in lines.iter().enumerate() {
                 let lnum = i as u32 + 1;
                 if def_ranges
@@ -660,37 +926,60 @@ pub fn cmd_callers(
                     || import_re.is_match(line)
                     || (is_class && type_annot_re.is_match(line))
                     || (is_non_callable && ident_re.is_match(line));
-                if !matched {
-                    continue;
+                if matched {
+                    matched_indices.push(i);
                 }
-                found = true;
+            }
+            if matched_indices.is_empty() {
+                println!("  (no call sites found in source)\n");
+                continue;
+            }
+            // Merge overlapping context windows so adjacent call sites (e.g. lines 59, 60, 62)
+            // print as one clean contiguous hunk instead of 3 duplicated blocks!
+            let matched_set: FxHashSet<usize> = matched_indices.iter().copied().collect();
+            let mut hunks: Vec<(usize, usize)> = Vec::new();
+            for &i in &matched_indices {
                 let s = i.saturating_sub(context_lines);
-                let e = (i + context_lines).min(lines.len() - 1);
+                let e = (i + context_lines).min(lines.len().saturating_sub(1));
+                if let Some(last) = hunks.last_mut() {
+                    if s <= last.1 + 1 {
+                        last.1 = last.1.max(e);
+                        continue;
+                    }
+                }
+                hunks.push((s, e));
+            }
+            for (s, e) in hunks {
                 for j in s..=e {
-                    println!("  {:>6}│ {}", j + 1, lines[j]);
+                    let sep = if matched_set.contains(&j) { "│" } else { "-" };
+                    println!("  {:>6}{sep} {}", j + 1, lines[j]);
                 }
                 println!();
             }
-            if !found {
-                println!("  (no call sites found in source)\n");
-            }
         }
-        if slice.is_empty() {
+        if slice.is_empty() && hidden_test_callers == 0 {
             println!("(no callers found)");
         }
     } else {
         for &(fi, _) in slice {
             println!("{}", g.files[fi as usize].path.as_str());
         }
-        if slice.is_empty() {
+        if slice.is_empty() && hidden_test_callers == 0 {
             println!("(no callers found)");
         } else if slice.len() == limit && !user_limit && total > limit {
             println!("\n(showing top {limit} by relevance — use --limit N or --count for total)");
         }
     }
 
+    if hidden_test_callers > 0 {
+        println!(
+            "(+ {hidden_test_callers} test/fixture caller {} hidden — pass --include-tests to expand)",
+            if hidden_test_callers == 1 { "file" } else { "files" }
+        );
+    }
+
     if include_noncode && offset == 0 {
-        let (nc_hits, nc_total) = find_noncode_mentions(&idx.roots, symbol, 10, 2);
+        let (nc_hits, nc_total) = find_noncode_mentions(&idx.roots, Some(g), symbol, 10, 2);
         print_noncode_section(&nc_hits, nc_total);
     }
 }
@@ -739,11 +1028,28 @@ pub fn cmd_deps(
     }
 }
 
+fn find_import_line_for_stem(abs: &std::path::Path, stem: &str) -> Option<usize> {
+    let source = fs::read_to_string(abs).ok()?;
+    for (i, line) in source.lines().enumerate() {
+        let t = line.trim_start();
+        if (t.starts_with("import ")
+            || t.starts_with("from ")
+            || t.starts_with("export ")
+            || t.contains("require("))
+            && line.contains(stem)
+        {
+            return Some(i + 1);
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_dependents(
     idx: &CodeIndex,
     g: &ArchivedGraphCacheData,
     file: &str,
+    include_tests: bool,
     count_only: bool,
     offset: usize,
     limit: usize,
@@ -756,13 +1062,18 @@ pub fn cmd_dependents(
     };
     let s = g.imp_in_offsets[fi as usize].to_native() as usize;
     let e = g.imp_in_offsets[fi as usize + 1].to_native() as usize;
-    let mut deps: Vec<(u32, f32)> = g.imp_in_sources[s..e]
-        .iter()
-        .map(|r| {
-            let d = r.to_native();
-            (d, g.files[d as usize].file_score.to_native())
-        })
-        .collect();
+
+    let mut deps: Vec<(u32, f32)> = Vec::new();
+    let mut hidden_test_deps = 0usize;
+    for r in &g.imp_in_sources[s..e] {
+        let d = r.to_native();
+        let dpath = g.files[d as usize].path.as_str();
+        if !include_tests && is_test_or_fixture_path(dpath) {
+            hidden_test_deps += 1;
+            continue;
+        }
+        deps.push((d, g.files[d as usize].file_score.to_native()));
+    }
     deps.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
     if count_only {
@@ -776,22 +1087,77 @@ pub fn cmd_dependents(
     } else {
         &[]
     };
+
+    // Build set of symbols defined in target file so we can show exact imported/used symbols per dependent!
+    let ds = g.def_offsets[fi as usize].to_native() as usize;
+    let de = g.def_offsets[fi as usize + 1].to_native() as usize;
+    let target_def_set: FxHashSet<u32> = g.def_syms[ds..de].iter().map(|r| r.to_native()).collect();
+    let base = file.rsplit('/').next().unwrap_or(file);
+    let stem = base.rfind('.').map(|i| &base[..i]).unwrap_or(base);
+
     for &(d, _) in slice {
-        println!("{}", g.files[d as usize].path.as_str());
+        let dpath = g.files[d as usize].path.as_str();
+        let rs = g.ref_out_offsets[d as usize].to_native() as usize;
+        let re = g.ref_out_offsets[d as usize + 1].to_native() as usize;
+        let mut used_syms: Vec<&str> = Vec::new();
+        for &sym_r in &g.ref_out_targets[rs..re] {
+            let si = sym_r.to_native();
+            if target_def_set.contains(&si) {
+                let name = g.symbols[si as usize].name.as_str();
+                if !used_syms.contains(&name) {
+                    used_syms.push(name);
+                }
+            }
+        }
+        let imp_line = find_import_line_for_stem(&idx.resolve_abs_path(dpath), stem);
+        let loc = match imp_line {
+            Some(ln) => format!("{dpath}:{ln}"),
+            None => dpath.to_string(),
+        };
+        if used_syms.is_empty() {
+            println!("{loc}");
+        } else {
+            let shown: Vec<&str> = used_syms.iter().take(6).copied().collect();
+            let more = if used_syms.len() > 6 {
+                format!(" (+{} more)", used_syms.len() - 6)
+            } else {
+                String::new()
+            };
+            println!("{loc}  uses: {}{more}", shown.join(", "));
+        }
     }
-    if slice.is_empty() {
+    if slice.is_empty() && hidden_test_deps == 0 {
         println!("(no dependents)");
     } else if slice.len() == limit && !user_limit && total > limit {
         println!("\n(showing top {limit} by relevance — use --limit N or --count for total)");
     }
+    if hidden_test_deps > 0 {
+        println!(
+            "(+ {hidden_test_deps} test/fixture dependent {} hidden — pass --include-tests to expand)",
+            if hidden_test_deps == 1 { "file" } else { "files" }
+        );
+    }
 
-    if include_noncode && offset == 0 {
-        let base = file.rsplit('/').next().unwrap_or(file);
-        let stem = base.rfind('.').map(|i| &base[..i]).unwrap_or(base);
-        if stem.len() >= 4 && !matches!(stem, "index" | "__init__" | "main" | "types" | "utils") {
-            let (nc_hits, nc_total) = find_noncode_mentions(&idx.roots, stem, 8, 2);
-            print_noncode_section(&nc_hits, nc_total);
-        }
+    if include_noncode && offset == 0 && stem.len() >= 3 && stem != "__init__" {
+        // For generic stems like `shared.ts` / `index.ts` / `utils.py`, require a path-like mention
+        // (`parent/shared` or `shared.ts`) so we don't match prose `"shared"` across 75 unrelated files!
+        let (nc_hits, nc_total) = if is_generic_file_stem(stem) {
+            let parent = file
+                .rsplit('/')
+                .nth(1)
+                .filter(|p| !p.is_empty() && *p != "src");
+            let mut alts = vec![regex::escape(base)];
+            if let Some(p) = parent {
+                alts.push(format!("{}/{}", regex::escape(p), regex::escape(stem)));
+            }
+            let pat = format!(r"(?:{})\b", alts.join("|"));
+            find_noncode_mentions_with_pattern(&idx.roots, Some(g), stem, Some(&pat), 8, 2)
+        } else if stem.len() >= 4 {
+            find_noncode_mentions(&idx.roots, Some(g), stem, 8, 2)
+        } else {
+            (Vec::new(), 0)
+        };
+        print_noncode_section(&nc_hits, nc_total);
     }
 }
 

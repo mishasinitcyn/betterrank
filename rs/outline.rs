@@ -5,10 +5,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const MIN_COLLAPSE_LINES: u32 = 2;
 
 pub fn parse_line_range(spec: &str) -> Option<(u32, u32)> {
-    let s = spec.trim();
+    let s = spec.trim().trim_start_matches(['L', 'l']);
     let sep = s.find('-').or_else(|| s.find(':'))?;
-    let start: u32 = s[..sep].trim().parse().ok()?;
-    let end: u32 = s[sep + 1..].trim().parse().ok()?;
+    let start: u32 = s[..sep].trim().trim_start_matches(['L', 'l']).parse().ok()?;
+    let end: u32 = s[sep + 1..]
+        .trim()
+        .trim_start_matches(['L', 'l'])
+        .parse()
+        .ok()?;
     if start < 1 || end < start {
         return None;
     }
@@ -23,6 +27,8 @@ pub struct OutlineOpts<'a> {
     pub depth: u32,
     pub explicit_depth: bool,
     pub collapse_imports: bool,
+    pub show_imports: bool,
+    pub full_skeleton: bool,
 }
 
 pub fn build_outline(
@@ -34,6 +40,22 @@ pub fn build_outline(
     let lines: Vec<&str> = source.split('\n').collect();
     let pad = lines.len().to_string().len().max(4);
     let depth = if opts.depth == 0 { 1 } else { opts.depth };
+    let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
+
+    // Fast path: if all expand targets are explicit line ranges (e.g. `outline schema.prisma 100-140,800-830`),
+    // work cleanly on ANY file (including Prisma, YAML, JSON, Dockerfiles) without AST parsing!
+    if !expand_symbols.is_empty() && expand_symbols.iter().all(|s| parse_line_range(s).is_some()) {
+        return expand_mode(
+            &lines,
+            &[],
+            file_path,
+            expand_symbols,
+            pad,
+            opts.line_range,
+            opts.no_comments,
+            ext,
+        );
+    }
 
     // Plain `--lines A-B` without folding flags returns a fast raw slice.
     // Combining `--lines` with `--depth`, `--no-comments`, `--annotate`, or `--collapse-imports`
@@ -42,7 +64,8 @@ pub fn build_outline(
         || depth != 1
         || opts.no_comments
         || opts.caller_counts.is_some()
-        || opts.collapse_imports;
+        || opts.collapse_imports
+        || opts.full_skeleton;
     if opts.line_range.is_some() && expand_symbols.is_empty() && !wants_folded {
         return raw_view(&lines, pad, opts.line_range);
     }
@@ -88,11 +111,127 @@ pub fn build_outline(
     defs.sort_by_key(|d| d.line_start);
 
     if !expand_symbols.is_empty() {
-        return expand_mode(&lines, &defs, file_path, expand_symbols, pad, opts.line_range);
+        return expand_mode(
+            &lines,
+            &defs,
+            file_path,
+            expand_symbols,
+            pad,
+            opts.line_range,
+            opts.no_comments,
+            ext,
+        );
     }
 
-    let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
-    outline_mode(&lines, &defs, pad, depth, ext, opts)
+    // Default to 1-line-per-symbol compact skeleton (collapsing imports) so large files
+    // never blow past the 20 KB shell buffer; use folded `outline_mode` when `--depth`,
+    // `--lines`, or `--full` is explicitly requested.
+    if !opts.explicit_depth && !opts.full_skeleton && opts.line_range.is_none() {
+        return compact_outline_mode(&lines, &defs, file_path, &opts);
+    }
+
+    let mut effective_opts = opts;
+    if !effective_opts.show_imports {
+        effective_opts.collapse_imports = true;
+    }
+    outline_mode(&lines, &defs, pad, depth, ext, effective_opts)
+}
+
+fn compact_outline_mode(
+    lines: &[&str],
+    defs: &[ParsedDef],
+    file_path: &str,
+    opts: &OutlineOpts<'_>,
+) -> String {
+    let mut out = Vec::with_capacity(defs.len() + 6);
+    out.push(format!("{file_path} ({} lines, {} symbols):", lines.len(), defs.len()));
+
+    if !opts.show_imports {
+        if let Some(imp) = detect_import_block(lines) {
+            out.push(format!(
+                "  L{}-{}  [imports] ({} lines)",
+                imp.start, imp.end, imp.line_count
+            ));
+        }
+    }
+
+    // Compute parent nesting depth & immediate parent kind
+    // (0 = top-level, 1 = class method or router/registry Variable property, >=2 = deep inner noise)
+    let n = defs.len();
+    let mut depth_of = vec![0usize; n];
+    let mut parent_of: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        let mut d = 0usize;
+        let mut best_parent: Option<usize> = None;
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            if defs[i].line_start > defs[j].line_start && defs[i].line_end <= defs[j].line_end {
+                d += 1;
+                if best_parent.map_or(true, |p| {
+                    defs[j].line_start >= defs[p].line_start && defs[j].line_end <= defs[p].line_end
+                }) {
+                    best_parent = Some(j);
+                }
+            }
+        }
+        depth_of[i] = d;
+        parent_of[i] = best_parent;
+    }
+
+    for (i, def) in defs.iter().enumerate() {
+        let d = depth_of[i];
+        // Skip deeply nested inner object-literal keys (e.g. Mongo $match/$project stages inside functions)
+        if d >= 2 {
+            continue;
+        }
+        // Keep top-level symbols, class methods, and properties of top-level Variable routers/registries
+        // (skip arbitrary object properties inside functions like `return { summary: ... }`)
+        if d == 1 {
+            let k = SymbolKind::from_u8(def.kind);
+            let pk = parent_of[i].map(|p| SymbolKind::from_u8(defs[p].kind));
+            let keep = match k {
+                SymbolKind::Method => true,
+                SymbolKind::Property => matches!(pk, Some(SymbolKind::Variable)),
+                SymbolKind::Class => true,
+                _ => false,
+            };
+            if !keep {
+                continue;
+            }
+        }
+
+        let indent = if d == 0 { "  " } else { "    " };
+        let range = if def.line_end > def.line_start {
+            format!("L{}-{}", def.line_start, def.line_end)
+        } else {
+            format!("L{}", def.line_start)
+        };
+        let kind_s = SymbolKind::from_u8(def.kind).as_str();
+        let sig = if def.signature.chars().count() > 96 {
+            let mut s: String = def.signature.chars().take(93).collect();
+            s.push_str("...");
+            s
+        } else {
+            def.signature.clone()
+        };
+        let mut row = format!("{indent}{range:<12} [{kind_s:<8}] {sig}");
+        if let Some(counts) = opts.caller_counts {
+            if let Some(&cnt) = counts.get(&def.name) {
+                if cnt > 0 {
+                    row.push_str(&format!(
+                        "  ({} {})",
+                        cnt,
+                        if cnt == 1 { "caller" } else { "callers" }
+                    ));
+                }
+            }
+        }
+        out.push(row);
+    }
+
+    out.join("\n")
 }
 
 fn raw_view(lines: &[&str], pad: usize, line_range: Option<(u32, u32)>) -> String {
@@ -107,6 +246,7 @@ fn raw_view(lines: &[&str], pad: usize, line_range: Option<(u32, u32)>) -> Strin
     out.join("\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_mode(
     lines: &[&str],
     defs: &[ParsedDef],
@@ -114,13 +254,51 @@ fn expand_mode(
     expand_symbols: &[String],
     pad: usize,
     line_range: Option<(u32, u32)>,
+    no_comments: bool,
+    ext: &str,
 ) -> String {
+    let comment_lines = if no_comments {
+        detect_comment_lines(lines, ext)
+    } else {
+        FxHashSet::default()
+    };
+    let batch_mode = expand_symbols.len() > 1;
+    let max_lines_per_target: usize = if batch_mode { 140 } else { usize::MAX };
+
     let mut out = Vec::new();
-    for sym_name in expand_symbols {
-        let matches: Vec<&ParsedDef> = defs.iter().filter(|d| d.name == *sym_name).collect();
+    for target in expand_symbols {
+        // Support direct line-range slices like `3150-3220` or `L3150-3220`
+        if let Some((rs, re)) = parse_line_range(target) {
+            let start = rs.max(1) as usize;
+            let end = (re as usize).min(lines.len());
+            if batch_mode {
+                out.push(format!("── {file_path}:{start}-{end} ──"));
+            }
+            let mut emitted = 0usize;
+            for i in start..=end {
+                if no_comments && comment_lines.contains(&(i as u32)) {
+                    continue;
+                }
+                if emitted >= max_lines_per_target {
+                    let rem = end.saturating_sub(i) + 1;
+                    out.push(format!(
+                        "  ... (+{rem} more lines — run: betterrank outline {file_path} {i}-{end})"
+                    ));
+                    break;
+                }
+                out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
+                emitted += 1;
+            }
+            if batch_mode {
+                out.push(String::new());
+            }
+            continue;
+        }
+
+        let matches: Vec<&ParsedDef> = defs.iter().filter(|d| d.name == *target).collect();
         if matches.is_empty() {
-            out.push(format!("Symbol \"{sym_name}\" not found in {file_path}"));
-            let lower = sym_name.to_ascii_lowercase();
+            out.push(format!("Symbol \"{target}\" not found in {file_path}"));
+            let lower = target.to_ascii_lowercase();
             let mut similar: Vec<&str> = Vec::new();
             for d in defs {
                 if d.name.to_ascii_lowercase().contains(&lower)
@@ -141,7 +319,7 @@ fn expand_mode(
             continue;
         }
         for def in &matches {
-            if matches.len() > 1 || expand_symbols.len() > 1 {
+            if matches.len() > 1 || batch_mode {
                 out.push(format!(
                     "── {} ({}:{}-{}) ──",
                     def.name, file_path, def.line_start, def.line_end
@@ -153,10 +331,23 @@ fn expand_mode(
             let end = line_range
                 .map_or(def.line_end, |(_, e)| def.line_end.min(e))
                 .min(lines.len() as u32) as usize;
+            let mut emitted = 0usize;
             for i in start..=end {
+                if no_comments && comment_lines.contains(&(i as u32)) {
+                    continue;
+                }
+                if emitted >= max_lines_per_target {
+                    let rem = end.saturating_sub(i) + 1;
+                    out.push(format!(
+                        "  ... (+{rem} more lines in {} — run: betterrank outline {file_path} {i}-{end})",
+                        def.name
+                    ));
+                    break;
+                }
                 out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
+                emitted += 1;
             }
-            if matches.len() > 1 {
+            if matches.len() > 1 || batch_mode {
                 out.push(String::new());
             }
         }
@@ -172,46 +363,56 @@ struct CollapseRange {
 }
 
 fn detect_import_block(lines: &[&str]) -> Option<CollapseRange> {
-    let mut brace_depth = 0i32;
+    let mut depth = 0i32;
     let mut in_import = false;
     let mut first: Option<u32> = None;
     let mut last: Option<u32> = None;
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("\"use ")
+            || trimmed.starts_with("'use ")
+        {
             continue;
         }
         if !in_import {
-            if trimmed.starts_with("import ") || trimmed == "import" {
+            if trimmed.starts_with("import ")
+                || trimmed == "import"
+                || (trimmed.starts_with("from ") && trimmed.contains(" import"))
+            {
                 if first.is_none() {
                     first = Some(i as u32 + 1);
                 }
-                brace_depth = 0;
+                depth = 0;
                 for b in line.bytes() {
-                    if b == b'{' {
-                        brace_depth += 1;
-                    } else if b == b'}' {
-                        brace_depth -= 1;
+                    if b == b'{' || b == b'(' {
+                        depth += 1;
+                    } else if b == b'}' || b == b')' {
+                        depth -= 1;
                     }
                 }
-                if brace_depth > 0 {
+                if depth > 0 {
                     in_import = true;
                 } else {
                     last = Some(i as u32 + 1);
                 }
             } else if first.is_some() {
                 break;
+            } else if i > 40 {
+                break;
             }
         } else {
             for b in line.bytes() {
-                if b == b'{' {
-                    brace_depth += 1;
-                } else if b == b'}' {
-                    brace_depth -= 1;
+                if b == b'{' || b == b'(' {
+                    depth += 1;
+                } else if b == b'}' || b == b')' {
+                    depth -= 1;
                 }
             }
-            if brace_depth <= 0 {
+            if depth <= 0 {
                 in_import = false;
                 last = Some(i as u32 + 1);
             }

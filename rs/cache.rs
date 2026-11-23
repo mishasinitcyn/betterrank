@@ -5,7 +5,7 @@ use crate::model::{ParseCacheData, ParsedFileRecord, ResolverCtx, RootEntry, CAC
 use crate::parser::{parse_file, ParseOptions};
 use crate::walk::{
     discover_root_metadata, is_minified_source, load_root_extra_ignores, normalize_roots,
-    walk_source_files, CacheLock,
+    walk_root_files, CacheLock,
 };
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -84,15 +84,20 @@ impl CodeIndex {
     /// Fast path (warm & clean): walks/stats in parallel, compares mtimes directly
     /// against the `mmap`'d archive, and returns in ~5–25 ms with zero deserialization!
     pub fn ensure(&self) -> Result<MmapGraphCache, String> {
-        // Walk all roots in parallel
-        let walked_per_root: Vec<_> = self
+        // Walk all roots in parallel (collecting both source files and non-code config files)
+        let walked_all: Vec<_> = self
             .roots
             .par_iter()
             .map(|r| {
                 let extra = load_root_extra_ignores(&r.path);
-                let files = walk_source_files(&r.path, &extra);
-                (r, files)
+                let wr = walk_root_files(&r.path, &extra);
+                (r, wr.source_files, wr.noncode_files)
             })
+            .collect();
+
+        let walked_per_root: Vec<(&RootEntry, Vec<crate::walk::WalkedFile>)> = walked_all
+            .iter()
+            .map(|(r, sf, _)| (*r, sf.clone()))
             .collect();
 
         // Fast-path check against existing mmap cache (zero lock, zero deserialization!)
@@ -143,14 +148,34 @@ impl CodeIndex {
         }
 
         // Parse changed/uncached files per root in parallel via rayon, reusing per-root .parse.brbin caches!
+        // Acquire a per-root lock when a root needs parsing so concurrent commands with different
+        // `--root` combinations never duplicate parsing the same large monorepo.
         let mut all_records: Vec<ParsedFileRecord> = Vec::with_capacity(total_files);
-        let mut pending_parse_caches: Vec<(PathBuf, ParseCacheData)> = Vec::new();
+        let mut pending_parse_caches: Vec<(PathBuf, ParseCacheData, Option<CacheLock>)> = Vec::new();
         let mut total_reused = 0usize;
         let mut total_skipped = 0usize;
 
         for (r, walked) in &walked_per_root {
             let pcache_path = parse_cache_path_for_root(&r.path);
-            let root_cache = load_parse_cache(&pcache_path);
+            // Fast unlocked read first; if many files are missing or cache doesn't exist yet,
+            // acquire per-root lock and re-check so parallel invocations share the first parse.
+            let mut root_cache = load_parse_cache(&pcache_path);
+            let initial_misses = walked
+                .iter()
+                .filter(|wf| {
+                    root_cache
+                        .get(&wf.rel_path)
+                        .map_or(true, |c| c.mtime_ms != wf.mtime_ms)
+                })
+                .count();
+            let mut plock: Option<CacheLock> = None;
+            if initial_misses > 20 || !pcache_path.exists() {
+                let lk = CacheLock::acquire(&pcache_path, 120_000);
+                if lk.waited {
+                    root_cache = load_parse_cache(&pcache_path);
+                }
+                plock = Some(lk);
+            }
 
             let mut hits: Vec<ParsedFileRecord> = Vec::new();
             let mut misses = Vec::new();
@@ -225,7 +250,10 @@ impl CodeIndex {
                         version: CACHE_FORMAT_VERSION,
                         files: next_cache_files,
                     },
+                    plock,
                 ));
+            } else {
+                drop(plock);
             }
             drop(root_cache);
 
@@ -238,15 +266,31 @@ impl CodeIndex {
             }
         }
 
-        // Overlap `.parse.brbin` disk serialization concurrently with `build_graph_cache`!
-        let (graph_data, ()) = rayon::join(
+        // Overlap `.parse.brbin` disk serialization concurrently with `build_graph_cache`,
+        // releasing each root's parse lock as soon as its `.parse.brbin` is atomically written.
+        let (mut graph_data, ()) = rayon::join(
             || build_graph_cache(&all_records, &resolver_ctx),
             || {
-                pending_parse_caches.par_iter().for_each(|(path, pdata)| {
-                    let _ = save_parse_cache(pdata, path);
-                });
+                pending_parse_caches
+                    .into_par_iter()
+                    .for_each(|(path, pdata, lock)| {
+                        let _ = save_parse_cache(&pdata, &path);
+                        drop(lock);
+                    });
             },
         );
+        let mut all_noncode: Vec<String> = Vec::new();
+        for (r, _, nc) in walked_all {
+            if r.prefix.is_empty() {
+                all_noncode.extend(nc);
+            } else {
+                for rel in nc {
+                    all_noncode.push(format!("{}/{rel}", r.prefix));
+                }
+            }
+        }
+        all_noncode.sort();
+        graph_data.noncode_files = all_noncode;
         let sym_count = graph_data.symbols.len();
         let edge_count = graph_data.total_edges;
         let indexed_files = all_records.iter().filter(|r| !r.skipped).count();

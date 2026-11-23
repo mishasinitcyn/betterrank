@@ -1,12 +1,14 @@
-use crate::model::{ArchivedGraphCacheData, RootEntry};
+use crate::model::{is_supported_extension, ArchivedGraphCacheData, RootEntry};
 use crate::walk::{is_test_file, normalize_slashes};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
-use grep_searcher::SearcherBuilder;
+use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 const NONCODE_SKIP_DIRS: &[&str] = &[
     "node_modules",
@@ -23,11 +25,12 @@ const NONCODE_SKIP_DIRS: &[&str] = &[
     "venv",
     ".turbo",
     ".cache",
-    ".code-index",
-    ".playwright-mcp",
-    ".memsearch",
-    ".cursor",
+    ".parcel-cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
     "Pods",
+    ".code-index",
 ];
 
 const NONCODE_SKIP_FILES: &[&str] = &[
@@ -39,13 +42,17 @@ const NONCODE_SKIP_FILES: &[&str] = &[
     "uv.lock",
     "composer.lock",
     "Gemfile.lock",
+    "eslint-suppressions.json",
 ];
 
 /// High-signal non-code / infra / schema / contract surfaces that AST-only tools miss.
 pub fn is_noncode_config_file(rel_path: &str) -> bool {
     let base = rel_path.rsplit('/').next().unwrap_or(rel_path);
     let lower_base = base.to_ascii_lowercase();
-    if NONCODE_SKIP_FILES.iter().any(|&s| lower_base == s.to_ascii_lowercase()) {
+    if NONCODE_SKIP_FILES
+        .iter()
+        .any(|&s| lower_base == s.to_ascii_lowercase())
+    {
         return false;
     }
     if lower_base.ends_with(".min.json") || lower_base.ends_with(".tsbuildinfo") {
@@ -86,10 +93,125 @@ pub fn is_noncode_config_file(rel_path: &str) -> bool {
     )
 }
 
+pub fn is_test_or_fixture_path(path: &str) -> bool {
+    if is_test_file(path) {
+        return true;
+    }
+    let lower = format!("/{}", path.to_ascii_lowercase());
+    for seg in &[
+        "/__fixtures__/",
+        "/fixtures/",
+        "/model-benchmarks/",
+        "/benchmarks/",
+        "/contract_corpus/",
+        "/__snapshots__/",
+    ] {
+        if lower.contains(seg) {
+            return true;
+        }
+    }
+    let base = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    base == "eslint-suppressions.json" || base.ends_with(".snap")
+}
+
+fn is_minified_asset_fast(rel_path: &str, abs_path: &Path, size: u64) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    if lower.ends_with(".min.js")
+        || lower.ends_with(".min.mjs")
+        || lower.ends_with(".min.cjs")
+        || lower.ends_with(".min.css")
+        || lower.ends_with(".bundle.js")
+        || lower.ends_with(".bundle.mjs")
+        || lower.ends_with(".chunk.js")
+        || lower.ends_with(".map")
+    {
+        return true;
+    }
+    // Check first 4 KB for bundled/minified JS/CSS/JSON lines (> 300 avg chars/line)
+    if size > 64 * 1024
+        && (lower.ends_with(".js")
+            || lower.ends_with(".mjs")
+            || lower.ends_with(".cjs")
+            || lower.ends_with(".css"))
+    {
+        if let Ok(mut f) = File::open(abs_path) {
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = f.read(&mut buf) {
+                if n > 512 {
+                    let newlines = memchr::memchr_iter(b'\n', &buf[..n]).count();
+                    if newlines == 0 || (n / (newlines + 1)) > 300 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn matches_type_filter(rel_path: &str, types: &[String]) -> bool {
+    if types.is_empty() {
+        return true;
+    }
+    let lower = rel_path.to_ascii_lowercase();
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    for t in types {
+        let matched = match t.as_str() {
+            "dockerfile" | "docker" => {
+                base == "dockerfile"
+                    || base.starts_with("dockerfile.")
+                    || base.ends_with(".dockerfile")
+                    || base.starts_with("docker-compose.")
+            }
+            "ci" | "workflow" | "workflows" => {
+                lower.contains(".github/workflows/")
+                    || base == ".gitlab-ci.yml"
+                    || base == "jenkinsfile"
+            }
+            "packaging" | "pkg" | "deps" => {
+                matches!(
+                    base,
+                    "pyproject.toml"
+                        | "setup.py"
+                        | "setup.cfg"
+                        | "package.json"
+                        | "cargo.toml"
+                        | "go.mod"
+                        | "pipfile"
+                ) || (base.starts_with("requirements") && base.ends_with(".txt"))
+            }
+            "prisma" => base.ends_with(".prisma"),
+            "sql" => base.ends_with(".sql"),
+            "config" | "noncode" | "non-code" => is_noncode_config_file(rel_path),
+            "code" => is_supported_extension(rel_path),
+            _ => lower.ends_with(&format!(".{t}")) || base == t,
+        };
+        if matched {
+            return true;
+        }
+    }
+    false
+}
+
+fn matches_ext_filter(rel_path: &str, exts: &[String]) -> bool {
+    if exts.is_empty() {
+        return true;
+    }
+    let lower = rel_path.to_ascii_lowercase();
+    let file_ext = match lower.rfind('.') {
+        Some(dot) => &lower[dot + 1..],
+        None => return false,
+    };
+    exts.iter()
+        .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(file_ext))
+}
+
 #[derive(Debug, Clone)]
 pub struct TextMatchLine {
     pub line: u64,
     pub content: String,
+    pub is_context: bool,
+    pub enclosing_sym: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,8 +309,11 @@ where
                             format!("{}/{rel_str}", *prefix)
                         };
                         if accept(&rel_str, &graph_path) {
-                            if entry.metadata().map_or(false, |m| m.len() <= max_bytes) {
-                                flusher.local.push((graph_path, abs.to_path_buf()));
+                            if let Ok(meta) = entry.metadata() {
+                                let sz = meta.len();
+                                if sz <= max_bytes && !is_minified_asset_fast(&rel_str, abs, sz) {
+                                    flusher.local.push((graph_path, abs.to_path_buf()));
+                                }
                             }
                         }
                     }
@@ -204,39 +329,120 @@ where
     }
 }
 
+fn resolve_graph_abs_path(roots: &[RootEntry], graph_path: &str) -> PathBuf {
+    if roots.len() == 1 {
+        return roots[0].path.join(graph_path);
+    }
+    for r in roots {
+        if let Some(rest) = graph_path
+            .strip_prefix(r.prefix.as_str())
+            .and_then(|s| s.strip_prefix('/'))
+        {
+            return r.path.join(rest);
+        }
+    }
+    roots[0].path.join(graph_path)
+}
+
+fn enclosing_symbol_for_line(
+    g: &ArchivedGraphCacheData,
+    file_idx: u32,
+    line: u32,
+) -> Option<String> {
+    let fi = file_idx as usize;
+    if fi + 1 >= g.def_offsets.len() {
+        return None;
+    }
+    let ds = g.def_offsets[fi].to_native() as usize;
+    let de = g.def_offsets[fi + 1].to_native() as usize;
+    let mut best: Option<(&str, u32, u32, u32)> = None;
+    for &si_r in &g.def_syms[ds..de] {
+        let sym = &g.symbols[si_r.to_native() as usize];
+        let ls = sym.line_start.to_native();
+        let le = sym.line_end.to_native();
+        if line >= ls && line <= le {
+            let span = le.saturating_sub(ls);
+            if best.map_or(true, |(_, _, _, bs)| span < bs) {
+                best = Some((sym.name.as_str(), ls, le, span));
+            }
+        }
+    }
+    best.map(|(n, ls, le, _)| format!("in {n} {ls}-{le}"))
+}
+
+const GENERIC_FILE_STEMS: &[&str] = &[
+    "shared", "index", "utils", "util", "types", "type", "config", "page", "route", "main",
+    "app", "client", "server", "helpers", "helper", "constants", "errors", "models", "model",
+    "schema", "test", "tests", "init", "common", "base", "core", "lib", "api", "hooks",
+    "styles", "layout", "loading", "error",
+];
+
+pub fn is_generic_file_stem(stem: &str) -> bool {
+    GENERIC_FILE_STEMS.contains(&stem.to_ascii_lowercase().as_str())
+}
+
 /// Fast parallel ripgrep-crate scan over non-code/config files for a symbol or file stem.
-/// Used automatically by `callers`, `dependents`, and `search` so agents never miss
-/// Dockerfiles, CI workflows, Prisma schemas, SQL, or JSON contracts.
+/// Uses cached `noncode_files` from `.brbin` when available (zero filesystem walk!).
 pub fn find_noncode_mentions(
     roots: &[RootEntry],
+    graph: Option<&ArchivedGraphCacheData>,
     term: &str,
     max_files: usize,
     max_hits_per_file: usize,
 ) -> (Vec<TextFileHits>, usize) {
-    if term.len() < 3 {
+    find_noncode_mentions_with_pattern(roots, graph, term, None, max_files, max_hits_per_file)
+}
+
+/// Same as `find_noncode_mentions`, with an optional custom regex (e.g. path-qualified regex for
+/// generic filenames like `shared.ts` so we don't match prose `"shared"` across 75 unrelated files).
+pub fn find_noncode_mentions_with_pattern(
+    roots: &[RootEntry],
+    graph: Option<&ArchivedGraphCacheData>,
+    term: &str,
+    custom_regex: Option<&str>,
+    max_files: usize,
+    max_hits_per_file: usize,
+) -> (Vec<TextFileHits>, usize) {
+    if term.len() < 3 && custom_regex.is_none() {
         return (Vec::new(), 0);
     }
-    let escaped = regex::escape(term);
-    let pat = format!(r"\b{escaped}\b");
+    let pat = match custom_regex {
+        Some(r) => r.to_string(),
+        None => {
+            let escaped = regex::escape(term);
+            format!(r"\b{escaped}\b")
+        }
+    };
     let matcher = match RegexMatcherBuilder::new().build(&pat) {
         Ok(m) => m,
         Err(_) => return (Vec::new(), 0),
     };
 
-    let skip_set = std::sync::Arc::new(
-        NONCODE_SKIP_DIRS
+    let candidates: Vec<(String, PathBuf)> = if let Some(g) = graph {
+        g.noncode_files
             .iter()
-            .copied()
-            .collect::<FxHashSet<&'static str>>(),
-    );
-    let candidates: Vec<(String, PathBuf)> = roots
-        .par_iter()
-        .flat_map(|r| {
-            walk_root_parallel(r, &skip_set, 512 * 1024, |rel_str, _| {
-                is_noncode_config_file(rel_str)
+            .map(|p| {
+                let gp = p.as_str().to_string();
+                let abs = resolve_graph_abs_path(roots, &gp);
+                (gp, abs)
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        let skip_set = std::sync::Arc::new(
+            NONCODE_SKIP_DIRS
+                .iter()
+                .copied()
+                .collect::<FxHashSet<&'static str>>(),
+        );
+        roots
+            .par_iter()
+            .flat_map(|r| {
+                walk_root_parallel(r, &skip_set, 512 * 1024, |rel_str, _| {
+                    is_noncode_config_file(rel_str)
+                })
+            })
+            .collect()
+    };
 
     let mut matched: Vec<TextFileHits> = candidates
         .into_par_iter()
@@ -253,6 +459,8 @@ pub fn find_noncode_mentions(
                         hits.push(TextMatchLine {
                             line: lnum,
                             content: truncate_line(line.trim(), 140),
+                            is_context: false,
+                            enclosing_sym: None,
                         });
                     }
                     Ok(true)
@@ -298,143 +506,495 @@ fn noncode_priority(path: &str) -> f32 {
     3.0
 }
 
+/// Split top-level `|` alternation branches (respecting escapes, `(...)`, `[...]`).
+fn split_top_level_alternation(pattern: &str) -> Vec<String> {
+    let mut branches = Vec::new();
+    let mut cur = String::new();
+    let mut paren_depth = 0usize;
+    let mut in_bracket = false;
+    let mut escaped = false;
+
+    for ch in pattern.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            cur.push(ch);
+            escaped = true;
+            continue;
+        }
+        if in_bracket {
+            cur.push(ch);
+            if ch == ']' {
+                in_bracket = false;
+            }
+            continue;
+        }
+        match ch {
+            '[' => {
+                in_bracket = true;
+                cur.push(ch);
+            }
+            '(' => {
+                paren_depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                cur.push(ch);
+            }
+            '|' if paren_depth == 0 => {
+                if !cur.is_empty() {
+                    branches.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.is_empty() {
+        branches.push(cur);
+    }
+    branches
+}
+
 #[derive(Debug, Default)]
 pub struct GrepOpts {
     pub case_insensitive: bool,
     pub fixed_strings: bool,
     pub noncode_only: bool,
-    pub no_tests: bool,
+    pub code_only: bool,
+    pub include_tests: bool,
     pub files_only: bool,
     pub limit_files: usize,
     pub max_per_file: usize,
+    pub user_max_per_file: bool,
+    pub before_context: usize,
+    pub after_context: usize,
     pub path_filter: Option<String>,
+    pub exts: Vec<String>,
+    pub types: Vec<String>,
+    pub extra_patterns: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct GrepResult {
+    pub hits: Vec<TextFileHits>,
+    pub total_files: usize,
+    pub total_hits: usize,
+    pub hidden_test_files: usize,
+    pub hidden_test_hits: usize,
+    pub path_matched_zero: bool,
+    pub branch_counts: Vec<(String, usize)>,
+}
+
+struct GrepSink<'a> {
+    max_matches: usize,
+    total_matches: usize,
+    captured_matches: usize,
+    hits: Vec<TextMatchLine>,
+    graph: Option<&'a ArchivedGraphCacheData>,
+    file_idx: Option<u32>,
+}
+
+impl<'a> Sink for GrepSink<'a> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        self.total_matches += 1;
+        if self.captured_matches < self.max_matches {
+            self.captured_matches += 1;
+            let lnum = mat.line_number().unwrap_or(0);
+            let text = String::from_utf8_lossy(mat.bytes());
+            let enclosing = match (self.graph, self.file_idx) {
+                (Some(g), Some(fi)) => enclosing_symbol_for_line(g, fi, lnum as u32),
+                _ => None,
+            };
+            self.hits.push(TextMatchLine {
+                line: lnum,
+                content: truncate_line(&text, 180),
+                is_context: false,
+                enclosing_sym: enclosing,
+            });
+        }
+        Ok(true)
+    }
+
+    fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, Self::Error> {
+        let keep = match ctx.kind() {
+            SinkContextKind::Before => self.captured_matches < self.max_matches,
+            SinkContextKind::After => {
+                self.captured_matches <= self.max_matches && self.total_matches <= self.max_matches
+            }
+            _ => false,
+        };
+        if keep {
+            let lnum = ctx.line_number().unwrap_or(0);
+            if self.hits.last().map_or(true, |prev| prev.line != lnum) {
+                let text = String::from_utf8_lossy(ctx.bytes());
+                self.hits.push(TextMatchLine {
+                    line: lnum,
+                    content: truncate_line(&text, 180),
+                    is_context: true,
+                    enclosing_sym: None,
+                });
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// First-class `betterrank grep <pattern>`: ripgrep-speed search across all files
-/// (code + configs + Dockerfiles + Prisma + YAML + JSON), ranked by PageRank and
-/// hard-bounded by default so agents never flood context with 450 KB raw dumps.
+/// (code + configs + Dockerfiles + Prisma + YAML + JSON), ranked by PageRank,
+/// annotated with enclosing symbols + ranges (when warm), demoting tests/fixtures
+/// by default, and balancing multi-term alternations.
 pub fn ranked_grep(
     roots: &[RootEntry],
     pattern: &str,
     graph: Option<&ArchivedGraphCacheData>,
     opts: &GrepOpts,
-) -> Result<(Vec<TextFileHits>, usize, usize), String> {
+) -> Result<GrepResult, String> {
+    // Combine primary pattern with any `-e` patterns
+    let (combined_pattern, branches): (String, Vec<String>) = if !opts.extra_patterns.is_empty() {
+        let mut all_p = Vec::with_capacity(1 + opts.extra_patterns.len());
+        if !pattern.is_empty() {
+            all_p.push(pattern.to_string());
+        }
+        all_p.extend(opts.extra_patterns.iter().cloned());
+        let joined = if opts.fixed_strings {
+            all_p
+                .iter()
+                .map(|p| regex::escape(p))
+                .collect::<Vec<_>>()
+                .join("|")
+        } else {
+            all_p
+                .iter()
+                .map(|p| format!("(?:{p})"))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        (joined, all_p)
+    } else if !opts.fixed_strings {
+        let split = split_top_level_alternation(pattern);
+        if split.len() >= 2 && split.len() <= 20 {
+            (pattern.to_string(), split)
+        } else {
+            (pattern.to_string(), Vec::new())
+        }
+    } else {
+        (pattern.to_string(), Vec::new())
+    };
+
+    let use_fixed = opts.fixed_strings && opts.extra_patterns.is_empty();
     let mut builder = RegexMatcherBuilder::new();
     builder.case_insensitive(opts.case_insensitive);
-    builder.fixed_strings(opts.fixed_strings);
+    builder.fixed_strings(use_fixed);
     let matcher = builder
-        .build(pattern)
+        .build(&combined_pattern)
         .map_err(|e| format!("Invalid grep pattern: {e}"))?;
 
-    // Map file -> PageRank score from zero-copy mmap graph (if available)
-    let mut file_scores: FxHashMap<&str, f32> = FxHashMap::default();
+    // Compile per-branch matchers for multi-term alternation reporting & balanced budgeting
+    let branch_matchers: Vec<(String, grep_regex::RegexMatcher)> = branches
+        .iter()
+        .filter_map(|b| {
+            let mut bb = RegexMatcherBuilder::new();
+            bb.case_insensitive(opts.case_insensitive);
+            bb.fixed_strings(opts.fixed_strings);
+            bb.build(b).ok().map(|m| (b.clone(), m))
+        })
+        .collect();
+
+    // Map file -> (file_idx, PageRank score) from zero-copy mmap graph (if available)
+    let mut file_meta: FxHashMap<&str, (u32, f32)> = FxHashMap::default();
     if let Some(g) = graph {
-        file_scores.reserve(g.files.len());
-        for f in g.files.iter() {
-            file_scores.insert(f.path.as_str(), f.file_score.to_native());
+        file_meta.reserve(g.files.len());
+        for (i, f) in g.files.iter().enumerate() {
+            file_meta.insert(f.path.as_str(), (i as u32, f.file_score.to_native()));
         }
     }
 
-    let skip_set = std::sync::Arc::new(
-        NONCODE_SKIP_DIRS
-            .iter()
-            .copied()
-            .collect::<FxHashSet<&'static str>>(),
-    );
     let noncode_only = opts.noncode_only;
-    let no_tests = opts.no_tests;
+    let code_only = opts.code_only;
     let path_filter = opts.path_filter.clone();
+    let exts = opts.exts.clone();
+    let types = opts.types.clone();
 
-    let candidates: Vec<(String, PathBuf)> = roots
-        .par_iter()
-        .flat_map(|r| {
-            let pf_opt = path_filter.clone();
-            walk_root_parallel(r, &skip_set, 2 * 1024 * 1024, move |rel_str, graph_path| {
-                let base = rel_str.rsplit('/').next().unwrap_or(rel_str);
-                if NONCODE_SKIP_FILES
-                    .iter()
-                    .any(|&s| base.eq_ignore_ascii_case(s))
-                {
-                    return false;
+    let candidates: Vec<(String, PathBuf)> = if noncode_only && graph.is_some() {
+        let g = graph.unwrap();
+        g.noncode_files
+            .iter()
+            .filter_map(|p| {
+                let gp = p.as_str();
+                if !matches_ext_filter(gp, &exts) || !matches_type_filter(gp, &types) {
+                    return None;
                 }
-                if noncode_only && !is_noncode_config_file(rel_str) {
-                    return false;
-                }
-                if no_tests && is_test_file(graph_path) {
-                    return false;
-                }
-                if let Some(ref pf) = pf_opt {
-                    if !graph_path.contains(pf.as_str()) {
-                        return false;
+                if let Some(ref pf) = path_filter {
+                    if !gp.contains(pf.as_str()) {
+                        return None;
                     }
                 }
-                true
+                let abs = resolve_graph_abs_path(roots, gp);
+                Some((gp.to_string(), abs))
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        let skip_set = std::sync::Arc::new(
+            NONCODE_SKIP_DIRS
+                .iter()
+                .copied()
+                .collect::<FxHashSet<&'static str>>(),
+        );
+        roots
+            .par_iter()
+            .flat_map(|r| {
+                let pf_opt = path_filter.clone();
+                let exts_c = exts.clone();
+                let types_c = types.clone();
+                walk_root_parallel(r, &skip_set, 2 * 1024 * 1024, move |rel_str, graph_path| {
+                    let base = rel_str.rsplit('/').next().unwrap_or(rel_str);
+                    if NONCODE_SKIP_FILES
+                        .iter()
+                        .any(|&s| base.eq_ignore_ascii_case(s))
+                    {
+                        return false;
+                    }
+                    if noncode_only && !is_noncode_config_file(rel_str) {
+                        return false;
+                    }
+                    if code_only && !is_supported_extension(rel_str) {
+                        return false;
+                    }
+                    if !matches_ext_filter(rel_str, &exts_c) || !matches_type_filter(rel_str, &types_c)
+                    {
+                        return false;
+                    }
+                    if let Some(ref pf) = pf_opt {
+                        if !graph_path.contains(pf.as_str()) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+            })
+            .collect()
+    };
 
-    let max_per_file = if opts.files_only {
+    if candidates.is_empty() && path_filter.is_some() {
+        return Ok(GrepResult {
+            path_matched_zero: true,
+            ..GrepResult::default()
+        });
+    }
+
+    // Auto-raise `--max-per-file` to `--limit` when `--path` targets a single file!
+    let effective_max_per_file = if opts.files_only {
         0
+    } else if !opts.user_max_per_file && candidates.len() == 1 && path_filter.is_some() {
+        opts.limit_files.max(opts.max_per_file).max(30)
     } else {
         opts.max_per_file.max(1)
     };
+    let before_ctx = if opts.files_only {
+        0
+    } else {
+        opts.before_context.min(15)
+    };
+    let after_ctx = if opts.files_only {
+        0
+    } else {
+        opts.after_context.min(15)
+    };
 
-    let mut matched: Vec<TextFileHits> = candidates
+    struct ScoredMatch {
+        file_hits: TextFileHits,
+        is_test_or_fix: bool,
+        matched_branches: Vec<usize>,
+    }
+
+    let mut all_scored: Vec<ScoredMatch> = candidates
         .into_par_iter()
         .filter_map(|(graph_path, abs)| {
-            let mut searcher = SearcherBuilder::new()
-                .line_number(true)
-                .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
-                .build();
-            let mut hits = Vec::new();
-            let mut total_in_file = 0usize;
-            let _ = searcher.search_path(
-                &matcher,
-                &abs,
-                UTF8(|lnum, line| {
-                    total_in_file += 1;
-                    if hits.len() < max_per_file {
-                        hits.push(TextMatchLine {
-                            line: lnum,
-                            content: truncate_line(line, 180),
-                        });
-                    }
-                    Ok(true)
-                }),
-            );
-            if total_in_file == 0 {
+            let mut sb = SearcherBuilder::new();
+            sb.line_number(true)
+                .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'));
+            if before_ctx > 0 {
+                sb.before_context(before_ctx);
+            }
+            if after_ctx > 0 {
+                sb.after_context(after_ctx);
+            }
+            let mut searcher = sb.build();
+
+            let (file_idx, base_score) = match file_meta.get(graph_path.as_str()) {
+                Some(&(fi, sc)) => (Some(fi), sc),
+                None => {
+                    let sc = if is_noncode_config_file(&graph_path) {
+                        0.0005 * noncode_priority(&graph_path)
+                    } else {
+                        0.0001
+                    };
+                    (None, sc)
+                }
+            };
+
+            let mut sink = GrepSink {
+                max_matches: effective_max_per_file,
+                total_matches: 0,
+                captured_matches: 0,
+                hits: Vec::new(),
+                graph,
+                file_idx,
+            };
+            let _ = searcher.search_path(&matcher, &abs, &mut sink);
+            if sink.total_matches == 0 {
                 return None;
             }
-            let base_score = file_scores.get(graph_path.as_str()).copied().unwrap_or_else(|| {
-                if is_noncode_config_file(&graph_path) {
-                    0.0005 * noncode_priority(&graph_path)
-                } else {
-                    0.0001
+
+            // Determine which alternation branches hit this file (fast single-file scan only on matched files!)
+            let mut matched_branches = Vec::new();
+            if branch_matchers.len() >= 2 {
+                let mut b_searcher = SearcherBuilder::new()
+                    .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
+                    .build();
+                for (bi, (_, bm)) in branch_matchers.iter().enumerate() {
+                    let mut found = false;
+                    let _ = b_searcher.search_path(
+                        bm,
+                        &abs,
+                        UTF8(|_, _| {
+                            found = true;
+                            Ok(false)
+                        }),
+                    );
+                    if found {
+                        matched_branches.push(bi);
+                    }
                 }
-            });
-            let score = if is_test_file(&graph_path) {
-                base_score * 0.15
-            } else {
-                base_score
-            };
-            Some(TextFileHits {
-                file: graph_path,
-                hits,
-                total_hits_in_file: total_in_file,
-                rank_score: score,
+            }
+
+            let is_tf = is_test_or_fixture_path(&graph_path);
+            let score = if is_tf { base_score * 0.15 } else { base_score };
+            Some(ScoredMatch {
+                file_hits: TextFileHits {
+                    file: graph_path,
+                    hits: sink.hits,
+                    total_hits_in_file: sink.total_matches,
+                    rank_score: score,
+                },
+                is_test_or_fix: is_tf,
+                matched_branches,
             })
         })
         .collect();
 
-    matched.sort_by(|a, b| {
-        b.rank_score
-            .total_cmp(&a.rank_score)
-            .then_with(|| a.file.cmp(&b.file))
+    all_scored.sort_by(|a, b| {
+        b.file_hits
+            .rank_score
+            .total_cmp(&a.file_hits.rank_score)
+            .then_with(|| a.file_hits.file.cmp(&b.file_hits.file))
     });
-    let total_files = matched.len();
-    let total_hits: usize = matched.iter().map(|m| m.total_hits_in_file).sum();
-    if opts.limit_files > 0 && matched.len() > opts.limit_files {
-        matched.truncate(opts.limit_files);
+
+    // Separate prod vs test/fixture unless `--include-tests` is passed
+    let mut prod: Vec<ScoredMatch> = Vec::new();
+    let mut hidden_test_files = 0usize;
+    let mut hidden_test_hits = 0usize;
+
+    for item in all_scored {
+        if !opts.include_tests && item.is_test_or_fix {
+            hidden_test_files += 1;
+            hidden_test_hits += item.file_hits.total_hits_in_file;
+        } else {
+            prod.push(item);
+        }
     }
-    Ok((matched, total_files, total_hits))
+
+    // Compute per-branch file counts over the displayed pool (prod, or all if --include-tests)
+    let mut branch_counts: Vec<(String, usize)> = Vec::new();
+    if branch_matchers.len() >= 2 {
+        let mut counts = vec![0usize; branch_matchers.len()];
+        for item in &prod {
+            for &bi in &item.matched_branches {
+                counts[bi] += 1;
+            }
+        }
+        for (i, (label, _)) in branch_matchers.iter().enumerate() {
+            branch_counts.push((label.clone(), counts[i]));
+        }
+    }
+
+    let total_files = prod.len();
+    let total_hits: usize = prod.iter().map(|m| m.file_hits.total_hits_in_file).sum();
+
+    // Balanced budgeting across alternation branches so one noisy branch cannot starve others!
+    let selected: Vec<TextFileHits> =
+        if opts.limit_files > 0 && prod.len() > opts.limit_files && branch_matchers.len() >= 2 {
+            let mut per_branch: Vec<Vec<usize>> = vec![Vec::new(); branch_matchers.len()];
+            for (idx, item) in prod.iter().enumerate() {
+                for &bi in &item.matched_branches {
+                    per_branch[bi].push(idx);
+                }
+            }
+            let mut chosen_set = vec![false; prod.len()];
+            let mut chosen_indices: Vec<usize> = Vec::with_capacity(opts.limit_files);
+            let mut cursors = vec![0usize; branch_matchers.len()];
+
+            loop {
+                let mut progressed = false;
+                for bi in 0..branch_matchers.len() {
+                    if chosen_indices.len() >= opts.limit_files {
+                        break;
+                    }
+                    while cursors[bi] < per_branch[bi].len() {
+                        let cand = per_branch[bi][cursors[bi]];
+                        cursors[bi] += 1;
+                        if !chosen_set[cand] {
+                            chosen_set[cand] = true;
+                            chosen_indices.push(cand);
+                            progressed = true;
+                            break;
+                        }
+                    }
+                }
+                if !progressed || chosen_indices.len() >= opts.limit_files {
+                    break;
+                }
+            }
+            // Fill any remaining slots in rank order
+            if chosen_indices.len() < opts.limit_files {
+                for idx in 0..prod.len() {
+                    if chosen_indices.len() >= opts.limit_files {
+                        break;
+                    }
+                    if !chosen_set[idx] {
+                        chosen_set[idx] = true;
+                        chosen_indices.push(idx);
+                    }
+                }
+            }
+            // Keep selected files sorted by rank score
+            chosen_indices.sort_unstable();
+            let mut prod_opt: Vec<Option<ScoredMatch>> = prod.into_iter().map(Some).collect();
+            chosen_indices
+                .into_iter()
+                .filter_map(|i| prod_opt[i].take().map(|s| s.file_hits))
+                .collect()
+        } else {
+            let mut v: Vec<TextFileHits> = prod.into_iter().map(|s| s.file_hits).collect();
+            if opts.limit_files > 0 && v.len() > opts.limit_files {
+                v.truncate(opts.limit_files);
+            }
+            v
+        };
+
+    Ok(GrepResult {
+        hits: selected,
+        total_files,
+        total_hits,
+        hidden_test_files,
+        hidden_test_hits,
+        path_matched_zero: false,
+        branch_counts,
+    })
 }

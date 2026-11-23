@@ -1,6 +1,6 @@
 {
   "name": "@mishasinitcyn/betterrank",
-  "version": "0.5.0-beta.2",
+  "version": "0.5.0",
   "description": "Fast native Rust tree-sitter + PageRank code indexer and bounded ripgrep CLI for coding agents.",
   "type": "module",
   "bin": {

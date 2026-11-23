@@ -188,6 +188,12 @@ pub struct WalkedFile {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WalkResult {
+    pub source_files: Vec<WalkedFile>,
+    pub noncode_files: Vec<String>,
+}
+
 /// Load extra ignore patterns from `<root>/.code-index/config.json`.
 pub fn load_root_extra_ignores(root: &Path) -> Vec<String> {
     let cfg_path = root.join(".code-index/config.json");
@@ -211,15 +217,18 @@ pub fn load_root_extra_ignores(root: &Path) -> Vec<String> {
 }
 
 /// Fast parallel file walker using ripgrep's `ignore` crate (respects `.gitignore`,
-/// skips hidden/build/vendor directories before descending, filters to supported extensions).
-pub fn walk_source_files(root: &Path, extra_ignores: &[String]) -> Vec<WalkedFile> {
+/// skips hidden/build/vendor directories before descending). Collects BOTH supported
+/// source files and non-code/config files (Dockerfiles, CI YAML, Prisma, SQL, JSON, etc.)
+/// in a single filesystem pass.
+pub fn walk_root_files(root: &Path, extra_ignores: &[String]) -> WalkResult {
     use ignore::WalkState;
     use std::sync::{Arc, Mutex};
 
     let prune_set: Arc<FxHashSet<&'static str>> = Arc::new(FAST_PRUNE_DIRS.iter().copied().collect());
     let root_buf = Arc::new(root.to_path_buf());
     let extra_owned = Arc::new(extra_ignores.to_vec());
-    let out: Arc<Mutex<Vec<WalkedFile>>> = Arc::new(Mutex::new(Vec::with_capacity(2048)));
+    let out_src: Arc<Mutex<Vec<WalkedFile>>> = Arc::new(Mutex::new(Vec::with_capacity(2048)));
+    let out_nc: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::with_capacity(512)));
 
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 12))
@@ -260,25 +269,34 @@ pub fn walk_source_files(root: &Path, extra_ignores: &[String]) -> Vec<WalkedFil
     walker.run(|| {
         let root_buf = Arc::clone(&root_buf);
         let extra_owned = Arc::clone(&extra_owned);
-        let out = Arc::clone(&out);
-        let mut local: Vec<WalkedFile> = Vec::with_capacity(256);
+        let out_src = Arc::clone(&out_src);
+        let out_nc = Arc::clone(&out_nc);
 
         struct Flusher {
-            local: Vec<WalkedFile>,
-            out: Arc<Mutex<Vec<WalkedFile>>>,
+            local_src: Vec<WalkedFile>,
+            local_nc: Vec<String>,
+            out_src: Arc<Mutex<Vec<WalkedFile>>>,
+            out_nc: Arc<Mutex<Vec<String>>>,
         }
         impl Drop for Flusher {
             fn drop(&mut self) {
-                if !self.local.is_empty() {
-                    if let Ok(mut guard) = self.out.lock() {
-                        guard.append(&mut self.local);
+                if !self.local_src.is_empty() {
+                    if let Ok(mut guard) = self.out_src.lock() {
+                        guard.append(&mut self.local_src);
+                    }
+                }
+                if !self.local_nc.is_empty() {
+                    if let Ok(mut guard) = self.out_nc.lock() {
+                        guard.append(&mut self.local_nc);
                     }
                 }
             }
         }
         let mut flusher = Flusher {
-            local: std::mem::take(&mut local),
-            out,
+            local_src: Vec::with_capacity(256),
+            local_nc: Vec::with_capacity(64),
+            out_src,
+            out_nc,
         };
 
         Box::new(move |res| {
@@ -296,12 +314,19 @@ pub fn walk_source_files(root: &Path, extra_ignores: &[String]) -> Vec<WalkedFil
                                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                                         .map(|d| d.as_millis() as u64)
                                         .unwrap_or(0);
-                                    flusher.local.push(WalkedFile {
+                                    flusher.local_src.push(WalkedFile {
                                         rel_path: rel_str,
                                         mtime_ms,
                                         size: meta.len(),
                                     });
                                 }
+                            }
+                        }
+                    } else if let Ok(rel) = entry.path().strip_prefix(&*root_buf) {
+                        let rel_str = normalize_slashes(&rel.to_string_lossy());
+                        if crate::noncode::is_noncode_config_file(&rel_str) {
+                            if entry.metadata().map_or(false, |m| m.len() <= 512 * 1024) {
+                                flusher.local_nc.push(rel_str);
                             }
                         }
                     }
@@ -311,10 +336,22 @@ pub fn walk_source_files(root: &Path, extra_ignores: &[String]) -> Vec<WalkedFil
         })
     });
 
-    match Arc::try_unwrap(out) {
+    let source_files = match Arc::try_unwrap(out_src) {
         Ok(m) => m.into_inner().unwrap_or_default(),
         Err(arc) => arc.lock().map(|g| g.clone()).unwrap_or_default(),
+    };
+    let noncode_files = match Arc::try_unwrap(out_nc) {
+        Ok(m) => m.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().map(|g| g.clone()).unwrap_or_default(),
+    };
+    WalkResult {
+        source_files,
+        noncode_files,
     }
+}
+
+pub fn walk_source_files(root: &Path, extra_ignores: &[String]) -> Vec<WalkedFile> {
+    walk_root_files(root, extra_ignores).source_files
 }
 
 /// Detect minified / bundled / generated source files that waste parser time.

@@ -958,6 +958,7 @@ pub fn build_graph_cache(
         ref_out_offsets,
         ref_out_targets,
         total_edges,
+        noncode_files: Vec::new(),
     }
 }
 
