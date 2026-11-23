@@ -612,12 +612,56 @@ pub fn cmd_search(
     }
 }
 
+fn rollup_directories(
+    filtered: &[&str],
+    pattern: Option<&str>,
+    depth: usize,
+) -> Vec<(String, usize)> {
+    let base_prefix = pattern
+        .map(|p| p.trim_start_matches("./").trim_end_matches('/'))
+        .filter(|p| !p.is_empty() && !p.contains('*') && !p.contains('?'))
+        .map(|p| format!("{p}/"));
+
+    let use_prefix = base_prefix
+        .as_deref()
+        .filter(|pfx| filtered.iter().all(|f| f.starts_with(pfx)));
+
+    let d = depth.max(1);
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for &path in filtered {
+        let rel = match use_prefix {
+            Some(pfx) => &path[pfx.len()..],
+            None => path,
+        };
+        let parts: Vec<&str> = rel.split('/').collect();
+        let key = if parts.len() <= 1 {
+            match use_prefix {
+                Some(pfx) => format!("{pfx} (direct)"),
+                None => "(root)".to_string(),
+            }
+        } else {
+            let take_n = d.min(parts.len() - 1);
+            let sub = parts[..take_n].join("/");
+            match use_prefix {
+                Some(pfx) => format!("{pfx}{sub}/"),
+                None => format!("{sub}/"),
+            }
+        };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts.into_iter().collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_files(
     g: &ArchivedGraphCacheData,
     pattern: Option<&str>,
     code_only: bool,
     noncode_only: bool,
     no_tests: bool,
+    dirs_only: bool,
+    depth: Option<usize>,
+    show_all: bool,
     count_only: bool,
     offset: usize,
     limit: usize,
@@ -684,7 +728,39 @@ pub fn cmd_files(
         return;
     }
 
-    let end = (offset + limit).min(filtered.len());
+    if filtered.is_empty() {
+        println!("(no matching files)");
+        return;
+    }
+
+    // Directory rollup: triggered explicitly via `--dirs` / `--depth N`, or automatically when
+    // unfiltered results exceed `--limit` (default 200) and neither `--all` nor `--offset` was passed,
+    // so large directories show their full A-Z folder map instead of truncating alphabetically at `g*`.
+    let auto_rollup = !show_all && offset == 0 && filtered.len() > limit;
+    if dirs_only || depth.is_some() || auto_rollup {
+        let rollup_depth = depth.unwrap_or(1);
+        let dirs = rollup_directories(&filtered, pattern, rollup_depth);
+        let show_dirs = dirs.len().min(limit.max(200));
+        for (dir, cnt) in &dirs[..show_dirs] {
+            println!(
+                "{dir}  ({cnt} {})",
+                if *cnt == 1 { "file" } else { "files" }
+            );
+        }
+        if dirs.len() > show_dirs {
+            println!("... (+{} more directories)", dirs.len() - show_dirs);
+        }
+        println!(
+            "\n{} files across {} {} (use a subdirectory, --depth N, --all, or --limit N to list individual files).",
+            filtered.len(),
+            dirs.len(),
+            if dirs.len() == 1 { "directory" } else { "directories" }
+        );
+        return;
+    }
+
+    let eff_limit = if show_all { filtered.len() } else { limit };
+    let end = (offset + eff_limit).min(filtered.len());
     let slice = if offset < filtered.len() {
         &filtered[offset..end]
     } else {
@@ -693,11 +769,9 @@ pub fn cmd_files(
     for p in slice {
         println!("{p}");
     }
-    if filtered.is_empty() {
-        println!("(no matching files)");
-    } else if slice.len() < filtered.len() {
+    if slice.len() < filtered.len() {
         println!(
-            "\nShowing {} of {} files. Use --limit N or a narrower prefix/glob.",
+            "\nShowing {} of {} files. Use --dirs, --all, --offset N, or a narrower prefix/glob.",
             slice.len(),
             filtered.len()
         );
@@ -792,21 +866,64 @@ pub fn cmd_symbols(
     matches.clear();
 }
 
+fn print_compact_tests_footer(
+    g: &ArchivedGraphCacheData,
+    hidden_tests: &mut [(u32, f32)],
+    with_context_hint: bool,
+) {
+    if hidden_tests.is_empty() {
+        return;
+    }
+    hidden_tests.sort_unstable_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| g.files[a.0 as usize].path.as_str().cmp(g.files[b.0 as usize].path.as_str()))
+    });
+    let total = hidden_tests.len();
+    let max_show = 15usize;
+    let shown = total.min(max_show);
+    println!("\nTests ({total}):");
+    for &(fi, _) in &hidden_tests[..shown] {
+        println!("  {}", g.files[fi as usize].path.as_str());
+    }
+    if total > shown {
+        println!(
+            "  ... (+{} more — pass --include-tests to expand)",
+            total - shown
+        );
+    } else if with_context_hint {
+        println!("  (pass --include-tests to expand with context)");
+    }
+}
+
+fn path_filters_target_tests(path_filters: &[String]) -> bool {
+    path_filters.iter().any(|pf| {
+        let low = pf.to_ascii_lowercase();
+        is_test_or_fixture_path(pf)
+            || low.contains("test")
+            || low.contains("spec")
+            || low.contains("fixture")
+            || low.contains("benchmark")
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_callers(
     idx: &CodeIndex,
     g: &ArchivedGraphCacheData,
     raw_symbol: &str,
     file: Option<&str>,
-    path_filter: Option<&str>,
+    path_filters: &[String],
     context_lines: usize,
     include_tests: bool,
+    no_tests_explicit: bool,
     count_only: bool,
     offset: usize,
     limit: usize,
     user_limit: bool,
     include_noncode: bool,
 ) {
+    let eff_include_tests =
+        include_tests || (!no_tests_explicit && path_filters_target_tests(path_filters));
     // Support file-scoped syntax like `router.ts:getItem` or `src/api/router.ts:getItem`
     let (file_hint_from_sym, symbol) = match raw_symbol.rsplit_once(':') {
         Some((fpart, spart)) if !fpart.is_empty() && !spart.is_empty() => (Some(fpart), spart),
@@ -827,7 +944,7 @@ pub fn cmd_callers(
 
     let mut caller_set: FxHashSet<u32> = FxHashSet::default();
     let mut callers: Vec<(u32, f32)> = Vec::new();
-    let mut hidden_test_callers = 0usize;
+    let mut hidden_tests: Vec<(u32, f32)> = Vec::new();
     let mut seen_hidden_tests: FxHashSet<u32> = FxHashSet::default();
 
     for &si in &target_syms {
@@ -836,14 +953,16 @@ pub fn cmd_callers(
         for &src_r in &g.ref_in_sources[rs..re] {
             let fi = src_r.to_native();
             let cpath = g.files[fi as usize].path.as_str();
-            if let Some(pf) = path_filter {
-                if !cpath.contains(pf) {
-                    continue;
-                }
+            if !path_filters.is_empty()
+                && !path_filters
+                    .iter()
+                    .any(|pf| cpath.contains(pf.trim_start_matches("./")))
+            {
+                continue;
             }
-            if !include_tests && is_test_or_fixture_path(cpath) {
+            if !eff_include_tests && is_test_or_fixture_path(cpath) {
                 if seen_hidden_tests.insert(fi) {
-                    hidden_test_callers += 1;
+                    hidden_tests.push((fi, g.files[fi as usize].file_score.to_native()));
                 }
                 continue;
             }
@@ -957,25 +1076,22 @@ pub fn cmd_callers(
                 println!();
             }
         }
-        if slice.is_empty() && hidden_test_callers == 0 {
+        if slice.is_empty() && (hidden_tests.is_empty() || no_tests_explicit) {
             println!("(no callers found)");
         }
     } else {
         for &(fi, _) in slice {
             println!("{}", g.files[fi as usize].path.as_str());
         }
-        if slice.is_empty() && hidden_test_callers == 0 {
+        if slice.is_empty() && (hidden_tests.is_empty() || no_tests_explicit) {
             println!("(no callers found)");
         } else if slice.len() == limit && !user_limit && total > limit {
             println!("\n(showing top {limit} by relevance — use --limit N or --count for total)");
         }
     }
 
-    if hidden_test_callers > 0 {
-        println!(
-            "(+ {hidden_test_callers} test/fixture caller {} hidden — pass --include-tests to expand)",
-            if hidden_test_callers == 1 { "file" } else { "files" }
-        );
+    if !no_tests_explicit {
+        print_compact_tests_footer(g, &mut hidden_tests, context_lines > 0);
     }
 
     if include_noncode && offset == 0 {
@@ -1028,16 +1144,61 @@ pub fn cmd_deps(
     }
 }
 
-fn find_import_line_for_stem(abs: &std::path::Path, stem: &str) -> Option<usize> {
+fn find_enclosing_package_name(
+    abs_file: &std::path::Path,
+    roots: &[crate::model::RootEntry],
+) -> Option<String> {
+    let stop_root = roots
+        .iter()
+        .find(|r| abs_file.starts_with(&r.path))
+        .map(|r| r.path.as_path());
+    let mut cur = abs_file.parent();
+    while let Some(dir) = cur {
+        if let Some(sr) = stop_root {
+            if dir == sr {
+                break;
+            }
+        }
+        let pkg = dir.join("package.json");
+        if pkg.is_file() {
+            if let Ok(txt) = fs::read_to_string(&pkg) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
+                        let trimmed = name.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+fn is_ambiguous_plain_word(stem: &str) -> bool {
+    stem.len() <= 10 && stem.chars().all(|c| c.is_ascii_lowercase())
+}
+
+fn find_import_line_for_stem(
+    abs: &std::path::Path,
+    stem: &str,
+    pkg_name: Option<&str>,
+) -> Option<usize> {
     let source = fs::read_to_string(abs).ok()?;
     for (i, line) in source.lines().enumerate() {
         let t = line.trim_start();
-        if (t.starts_with("import ")
+        let is_imp = t.starts_with("import ")
             || t.starts_with("from ")
             || t.starts_with("export ")
-            || t.contains("require("))
-            && line.contains(stem)
-        {
+            || t.contains(" from ")
+            || t.contains("require(");
+        if !is_imp {
+            continue;
+        }
+        if line.contains(stem) || pkg_name.map_or(false, |pkg| line.contains(pkg)) {
             return Some(i + 1);
         }
     }
@@ -1050,6 +1211,7 @@ pub fn cmd_dependents(
     g: &ArchivedGraphCacheData,
     file: &str,
     include_tests: bool,
+    no_tests_explicit: bool,
     count_only: bool,
     offset: usize,
     limit: usize,
@@ -1064,12 +1226,12 @@ pub fn cmd_dependents(
     let e = g.imp_in_offsets[fi as usize + 1].to_native() as usize;
 
     let mut deps: Vec<(u32, f32)> = Vec::new();
-    let mut hidden_test_deps = 0usize;
+    let mut hidden_tests: Vec<(u32, f32)> = Vec::new();
     for r in &g.imp_in_sources[s..e] {
         let d = r.to_native();
         let dpath = g.files[d as usize].path.as_str();
         if !include_tests && is_test_or_fixture_path(dpath) {
-            hidden_test_deps += 1;
+            hidden_tests.push((d, g.files[d as usize].file_score.to_native()));
             continue;
         }
         deps.push((d, g.files[d as usize].file_score.to_native()));
@@ -1094,6 +1256,12 @@ pub fn cmd_dependents(
     let target_def_set: FxHashSet<u32> = g.def_syms[ds..de].iter().map(|r| r.to_native()).collect();
     let base = file.rsplit('/').next().unwrap_or(file);
     let stem = base.rfind('.').map(|i| &base[..i]).unwrap_or(base);
+    let target_abs = idx.resolve_abs_path(file);
+    let enclosing_pkg = if stem == "index" {
+        find_enclosing_package_name(&target_abs, &idx.roots)
+    } else {
+        None
+    };
 
     for &(d, _) in slice {
         let dpath = g.files[d as usize].path.as_str();
@@ -1109,7 +1277,8 @@ pub fn cmd_dependents(
                 }
             }
         }
-        let imp_line = find_import_line_for_stem(&idx.resolve_abs_path(dpath), stem);
+        let imp_line =
+            find_import_line_for_stem(&idx.resolve_abs_path(dpath), stem, enclosing_pkg.as_deref());
         let loc = match imp_line {
             Some(ln) => format!("{dpath}:{ln}"),
             None => dpath.to_string(),
@@ -1126,29 +1295,57 @@ pub fn cmd_dependents(
             println!("{loc}  uses: {}{more}", shown.join(", "));
         }
     }
-    if slice.is_empty() && hidden_test_deps == 0 {
+    if slice.is_empty() && (hidden_tests.is_empty() || no_tests_explicit) {
         println!("(no dependents)");
     } else if slice.len() == limit && !user_limit && total > limit {
         println!("\n(showing top {limit} by relevance — use --limit N or --count for total)");
     }
-    if hidden_test_deps > 0 {
-        println!(
-            "(+ {hidden_test_deps} test/fixture dependent {} hidden — pass --include-tests to expand)",
-            if hidden_test_deps == 1 { "file" } else { "files" }
-        );
+    if !no_tests_explicit {
+        print_compact_tests_footer(g, &mut hidden_tests, false);
     }
 
     if include_noncode && offset == 0 && stem.len() >= 3 && stem != "__init__" {
-        // For generic stems like `shared.ts` / `index.ts` / `utils.py`, require a path-like mention
-        // (`parent/shared` or `shared.ts`) so we don't match prose `"shared"` across 75 unrelated files!
+        // Compute path-qualified prefix (`parent/stem`, or `grandparent/src/stem` when parent is `src`/`lib`).
+        let parts: Vec<&str> = file.split('/').collect();
+        let qualified_stem = if parts.len() >= 3
+            && matches!(parts[parts.len() - 2], "src" | "lib" | "dist")
+        {
+            Some(format!(
+                "{}/{}/{}",
+                parts[parts.len() - 3],
+                parts[parts.len() - 2],
+                stem
+            ))
+        } else if parts.len() >= 2 {
+            Some(format!("{}/{}", parts[parts.len() - 2], stem))
+        } else {
+            None
+        };
+
         let (nc_hits, nc_total) = if is_generic_file_stem(stem) {
-            let parent = file
-                .rsplit('/')
-                .nth(1)
-                .filter(|p| !p.is_empty() && *p != "src");
+            // For generic stems like `index.ts` / `shared.ts` / `utils.py`, NEVER match bare
+            // `index.ts` across unrelated `package.json` files — require enclosing workspace
+            // package name (e.g. `@scope/pkg`) or path-qualified `pkg/src/index` / `dir/shared`!
+            let mut alts: Vec<String> = Vec::new();
+            if let Some(ref pkg) = enclosing_pkg {
+                alts.push(regex::escape(pkg));
+            }
+            if let Some(ref qs) = qualified_stem {
+                alts.push(regex::escape(qs));
+            }
+            if alts.is_empty() {
+                (Vec::new(), 0)
+            } else {
+                let pat = format!(r"(?:{})\b", alts.join("|"));
+                find_noncode_mentions_with_pattern(&idx.roots, Some(g), stem, Some(&pat), 8, 2)
+            }
+        } else if is_ambiguous_plain_word(stem) {
+            // For short plain lowercase English words (e.g. `drift.ts`, `cache.py`, `state.ts`),
+            // require filename-with-extension (`drift.ts`) or path-qualified (`pkg/drift`) rather
+            // than bare English prose `\bdrift\b` in CI workflows / SQL comments!
             let mut alts = vec![regex::escape(base)];
-            if let Some(p) = parent {
-                alts.push(format!("{}/{}", regex::escape(p), regex::escape(stem)));
+            if let Some(ref qs) = qualified_stem {
+                alts.push(regex::escape(qs));
             }
             let pat = format!(r"(?:{})\b", alts.join("|"));
             find_noncode_mentions_with_pattern(&idx.roots, Some(g), stem, Some(&pat), 8, 2)

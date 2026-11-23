@@ -418,7 +418,10 @@ fn ux_audit_all_five_fixes() {
     let dep_s = String::from_utf8_lossy(&dep.stdout);
     assert!(dep_s.contains("page.tsx:1  uses: getItem, helperB") || dep_s.contains("page.tsx:1  uses: helperB, getItem"), "got:\n{dep_s}");
     assert!(!dep_s.contains("ci.yml"), "generic stem 'shared' should not match prose in ci.yml, got:\n{dep_s}");
-    assert!(dep_s.contains("test/fixture dependent file hidden"), "got:\n{dep_s}");
+    assert!(
+        dep_s.contains("Tests (1):") && dep_s.contains("src/__tests__/dashboard.test.ts"),
+        "expected compact Tests (1) footer, got:\n{dep_s}"
+    );
 
     // 2. File-scoped `callers shared.ts:getItem --context 1` merges lines 4 & 5 into one hunk & hides test by default
     let cal = Command::new(bin_path())
@@ -496,6 +499,304 @@ fn ux_audit_all_five_fixes() {
         .unwrap();
     let fs_out = String::from_utf8_lossy(&fls.stdout);
     assert!(fs_out.contains("src/team-settings/page.tsx") && fs_out.contains("src/team-settings/shared.ts"), "got:\n{fs_out}");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn v051_bugs_and_ergonomics() {
+    let base = temp_dir("v051-suite");
+    let cache_dir = base.join("cache");
+    let repo = base.join("mono");
+    let sibling = base.join("sibling-repo");
+
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::create_dir_all(sibling.join(".git")).unwrap();
+    fs::create_dir_all(repo.join("packages/pkg-alpha/src")).unwrap();
+    fs::create_dir_all(repo.join("packages/pkg-beta/src")).unwrap();
+    fs::create_dir_all(repo.join("apps/web/src/routes")).unwrap();
+    fs::create_dir_all(repo.join("apps/api/src/handlers")).unwrap();
+    fs::create_dir_all(repo.join("apps/web/locales")).unwrap();
+    fs::create_dir_all(repo.join("tests/unit")).unwrap();
+    fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+
+    // Workspace packages + unrelated package.json mentioning "src/index.ts"
+    fs::write(repo.join("package.json"), r#"{"name":"mono-root","private":true}"#).unwrap();
+    fs::write(
+        repo.join("packages/pkg-alpha/package.json"),
+        r#"{"name":"@demo/pkg-alpha","main":"src/index.ts","exports":{".":"./src/index.ts"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("packages/pkg-alpha/src/index.ts"),
+        "export function alphaCore(x: number) {\n  return x + 1;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("packages/pkg-beta/package.json"),
+        r#"{"name":"@demo/pkg-beta","main":"src/index.ts"}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("packages/pkg-beta/src/index.ts"),
+        "export const betaVal = 2;\n",
+    )
+    .unwrap();
+
+    // Consumer importing workspace package `@demo/pkg-alpha`
+    fs::write(
+        repo.join("apps/web/package.json"),
+        r#"{"name":"@demo/web","dependencies":{"@demo/pkg-alpha":"workspace:*"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("apps/web/src/routes/home.ts"),
+        "import { alphaCore } from '@demo/pkg-alpha';\n\nexport function renderHome() {\n  const marker = 'MULTI_PATH_TOKEN';\n  return alphaCore(1) + marker.length;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("apps/api/src/handlers/status.ts"),
+        "import { alphaCore } from '@demo/pkg-alpha';\n\nexport function statusCheck() {\n  const token = 'MULTI_PATH_TOKEN';\n  return alphaCore(2) + token.length;\n}\n",
+    )
+    .unwrap();
+    // Plain-word file `drift.ts` + prose "drift" in workflow
+    fs::write(
+        repo.join("apps/api/src/handlers/drift.ts"),
+        "export function computeDrift() { return 0; }\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join(".github/workflows/nightly.yml"),
+        "name: nightly\n# Check for schema drift nightly\njobs:\n  run:\n    steps:\n      - run: echo ok\n",
+    )
+    .unwrap();
+    // Test file + noise data files (*.dic and locales/*.json)
+    fs::write(
+        repo.join("tests/unit/home.test.ts"),
+        "import { alphaCore } from '@demo/pkg-alpha';\nexport function testHome() {\n  return alphaCore(99) + 'TEST_ONLY_TOKEN'.length;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("apps/web/locales/en.json"),
+        r#"{"title": "MULTI_PATH_TOKEN"}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("apps/web/words.dic"),
+        "MULTI_PATH_TOKEN\n",
+    )
+    .unwrap();
+    // Sibling repo file for Bug #3 test
+    fs::write(
+        sibling.join("only_in_sibling.ts"),
+        "export function siblingFn() { return 42; }\n",
+    )
+    .unwrap();
+    // Long file (180 lines) to verify explicit line-range slicing is NOT chopped at 140 lines
+    let mut long_src = String::new();
+    for i in 1..=180 {
+        long_src.push_str(&format!("export const line_{i} = {i};\n"));
+    }
+    fs::write(repo.join("apps/api/src/long.ts"), &long_src).unwrap();
+
+    // Warm index for `mono`
+    let warm = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["stats", "--root", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(warm.status.success());
+
+    // Bug #1: repeatable `--path` is OR-union (both apps/web and apps/api appear)
+    let multi_path = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "MULTI_PATH_TOKEN",
+            "--path",
+            "apps/web",
+            "--path",
+            "apps/api",
+            "--root",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(multi_path.status.success());
+    let mp_s = String::from_utf8_lossy(&multi_path.stdout);
+    assert!(
+        mp_s.contains("apps/web/src/routes/home.ts") && mp_s.contains("apps/api/src/handlers/status.ts"),
+        "repeatable --path must OR-union, got:\n{mp_s}"
+    );
+    // Upgrade #4: skips locales/*.json and *.dic by default
+    assert!(
+        !mp_s.contains("locales/en.json") && !mp_s.contains("words.dic"),
+        "locales/*.json and *.dic should be skipped by default, got:\n{mp_s}"
+    );
+
+    // Upgrade #4: `--exclude-path`, `--no-imports`, and `--compact`
+    let excl = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "alphaCore",
+            "--no-imports",
+            "--exclude-path",
+            "apps/api",
+            "--compact",
+            "--root",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let excl_s = String::from_utf8_lossy(&excl.stdout);
+    assert!(excl_s.contains("apps/web/src/routes/home.ts  L5"), "expected home.ts L5 only (--no-imports omits L1):\n{excl_s}");
+    assert!(!excl_s.contains("apps/api/src/handlers/status.ts"), "--exclude-path failed:\n{excl_s}");
+    assert!(!excl_s.contains("home.ts  L1"), "--no-imports should omit home.ts line 1 import:\n{excl_s}");
+
+    // Bug #4: `--path tests/unit` auto-includes test hits without needing `--include-tests`
+    let test_path = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "TEST_ONLY_TOKEN",
+            "--path",
+            "tests/unit",
+            "--root",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let tp_s = String::from_utf8_lossy(&test_path.stdout);
+    assert!(
+        tp_s.contains("tests/unit/home.test.ts"),
+        "--path tests/unit should auto-include tests, got:\n{tp_s}"
+    );
+
+    // Bug #3: `outline <abs-path-in-sibling> --annotate` from parent `base` dir must walk up from target file's `.git`
+    let sib_out = Command::new(bin_path())
+        .current_dir(&base)
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "outline",
+            sibling.join("only_in_sibling.ts").to_str().unwrap(),
+            "--annotate",
+        ])
+        .output()
+        .unwrap();
+    assert!(sib_out.status.success());
+    let sib_err = String::from_utf8_lossy(&sib_out.stderr);
+    assert!(
+        sib_err.contains("Indexed 1 files"),
+        "expected outline --annotate to auto-root to sibling .git (1 file), got stderr:\n{sib_err}"
+    );
+
+    // Bug #5: `dependents packages/pkg-alpha/src/index.ts` finds code dependents with import lines,
+    // mentions `@demo/pkg-alpha` in apps/web/package.json, and does NOT match unrelated pkg-beta/package.json!
+    let dep_pkg = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "dependents",
+            "packages/pkg-alpha/src/index.ts",
+            "--root",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let dp_s = String::from_utf8_lossy(&dep_pkg.stdout);
+    assert!(dp_s.contains("apps/web/src/routes/home.ts:1"), "expected import line via @demo/pkg-alpha, got:\n{dp_s}");
+    assert!(dp_s.contains("Tests (1):") && dp_s.contains("tests/unit/home.test.ts"), "expected Tests footer, got:\n{dp_s}");
+    assert!(!dp_s.contains("pkg-beta/package.json"), "must not match bare index.ts in unrelated package.json:\n{dp_s}");
+
+    // Bug #5b: plain-word `drift.ts` must NOT match prose "drift" in nightly.yml
+    let dep_drift = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "dependents",
+            "apps/api/src/handlers/drift.ts",
+            "--root",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let dd_s = String::from_utf8_lossy(&dep_drift.stdout);
+    assert!(!dd_s.contains("nightly.yml"), "plain word 'drift' must not match prose in nightly.yml:\n{dd_s}");
+
+    // Upgrade #1: multi-file batched `outline`, always-on headers, `--filter`, and full explicit line range >140 lines
+    let multi_out = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/web/src/routes/home.ts:1-4",
+            "apps/api/src/handlers/status.ts:statusCheck",
+            "--root",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(multi_out.status.success());
+    let mo_s = String::from_utf8_lossy(&multi_out.stdout);
+    assert!(mo_s.contains("── apps/web/src/routes/home.ts:1-4 ──"), "got:\n{mo_s}");
+    assert!(mo_s.contains("── statusCheck (apps/api/src/handlers/status.ts:"), "got:\n{mo_s}");
+
+    let long_slice = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/api/src/long.ts",
+            "1-180",
+            "--root",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let ls_s = String::from_utf8_lossy(&long_slice.stdout);
+    assert!(ls_s.contains("180│ export const line_180 = 180;"), "explicit 1-180 range must not be chopped at 140 lines:\n{ls_s}");
+
+    let filt_out = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/api/src/long.ts",
+            "--filter",
+            "line_17[89]",
+            "--root",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let fo_s = String::from_utf8_lossy(&filt_out.stdout);
+    assert!(fo_s.contains("line_178") && fo_s.contains("line_179") && !fo_s.contains("line_1 "), "got:\n{fo_s}");
+
+    // Upgrade #2: `files` auto-rollup when > --limit and explicit `--dirs`
+    let rollup = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "files",
+            "apps",
+            "--limit",
+            "2",
+            "--root",
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let ru_s = String::from_utf8_lossy(&rollup.stdout);
+    assert!(ru_s.contains("apps/api/") && ru_s.contains("apps/web/"), "expected directory rollup, got:\n{ru_s}");
+
+    // Bug #2: Unix SIGPIPE exits cleanly without Rust panic when piped to `head -n 1`
+    #[cfg(unix)]
+    {
+        let cmd_str = format!(
+            "{} outline {} 1-180 --root {} | head -n 1",
+            bin_path().display(),
+            "apps/api/src/long.ts",
+            repo.display()
+        );
+        let piped = Command::new("sh").args(["-c", &cmd_str]).output().unwrap();
+        let err_s = String::from_utf8_lossy(&piped.stderr);
+        assert!(
+            !err_s.contains("panicked") && !err_s.contains("Broken pipe"),
+            "SIGPIPE must not panic, got stderr:\n{err_s}"
+        );
+    }
 
     let _ = fs::remove_dir_all(&base);
 }

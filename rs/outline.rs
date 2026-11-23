@@ -29,9 +29,50 @@ pub struct OutlineOpts<'a> {
     pub collapse_imports: bool,
     pub show_imports: bool,
     pub full_skeleton: bool,
+    pub filter: Option<&'a str>,
+    pub max_chars: Option<usize>,
+}
+
+fn apply_max_chars(s: String, max_chars: Option<usize>) -> String {
+    let Some(limit) = max_chars else {
+        return s;
+    };
+    if limit == 0 || s.len() <= limit {
+        return s;
+    }
+    let mut kept = String::with_capacity(limit + 80);
+    let mut emitted_lines = 0usize;
+    let total_lines = s.lines().count();
+    for line in s.lines() {
+        let add_len = line.len() + if kept.is_empty() { 0 } else { 1 };
+        if !kept.is_empty() && kept.len() + add_len > limit {
+            let omitted = total_lines.saturating_sub(emitted_lines);
+            kept.push_str(&format!(
+                "\n... (truncated at --max-chars {limit}; {omitted} more lines omitted)"
+            ));
+            return kept;
+        }
+        if !kept.is_empty() {
+            kept.push('\n');
+        }
+        kept.push_str(line);
+        emitted_lines += 1;
+    }
+    kept
 }
 
 pub fn build_outline(
+    source: &str,
+    file_path: &str,
+    expand_symbols: &[String],
+    opts: OutlineOpts<'_>,
+) -> String {
+    let max_chars = opts.max_chars;
+    let res = build_outline_inner(source, file_path, expand_symbols, opts);
+    apply_max_chars(res, max_chars)
+}
+
+fn build_outline_inner(
     source: &str,
     file_path: &str,
     expand_symbols: &[String],
@@ -67,11 +108,11 @@ pub fn build_outline(
         || opts.collapse_imports
         || opts.full_skeleton;
     if opts.line_range.is_some() && expand_symbols.is_empty() && !wants_folded {
-        return raw_view(&lines, pad, opts.line_range);
+        return raw_view(&lines, file_path, pad, opts.line_range);
     }
 
     if !is_supported_extension(file_path) {
-        return raw_view(&lines, pad, opts.line_range);
+        return raw_view(&lines, file_path, pad, opts.line_range);
     }
 
     let parsed = match parse_file(
@@ -84,7 +125,7 @@ pub fn build_outline(
         },
     ) {
         Some(p) if !p.definitions.is_empty() => p,
-        _ => return raw_view(&lines, pad, opts.line_range),
+        _ => return raw_view(&lines, file_path, pad, opts.line_range),
     };
 
     let kind_priority = |k: u8| -> u8 {
@@ -124,9 +165,13 @@ pub fn build_outline(
     }
 
     // Default to 1-line-per-symbol compact skeleton (collapsing imports) so large files
-    // never blow past the 20 KB shell buffer; use folded `outline_mode` when `--depth`,
-    // `--lines`, or `--full` is explicitly requested.
-    if !opts.explicit_depth && !opts.full_skeleton && opts.line_range.is_none() {
+    // never blow past the 20 KB shell buffer; `--depth 1` also stays in compact mode
+    // restricted to top-level symbols (`d == 0`). Use folded `outline_mode` when
+    // `--depth >= 2`, `--lines`, or `--full` is explicitly requested.
+    let use_compact = !opts.full_skeleton
+        && opts.line_range.is_none()
+        && (!opts.explicit_depth || depth == 1);
+    if use_compact {
         return compact_outline_mode(&lines, &defs, file_path, &opts);
     }
 
@@ -143,17 +188,14 @@ fn compact_outline_mode(
     file_path: &str,
     opts: &OutlineOpts<'_>,
 ) -> String {
-    let mut out = Vec::with_capacity(defs.len() + 6);
-    out.push(format!("{file_path} ({} lines, {} symbols):", lines.len(), defs.len()));
-
-    if !opts.show_imports {
-        if let Some(imp) = detect_import_block(lines) {
-            out.push(format!(
-                "  L{}-{}  [imports] ({} lines)",
-                imp.start, imp.end, imp.line_count
-            ));
-        }
-    }
+    let filter_re = opts.filter.and_then(|pat| {
+        regex::RegexBuilder::new(pat)
+            .case_insensitive(true)
+            .build()
+            .ok()
+    });
+    let filter_sub = opts.filter.map(|p| p.to_ascii_lowercase());
+    let top_level_only = opts.explicit_depth && opts.depth <= 1;
 
     // Compute parent nesting depth & immediate parent kind
     // (0 = top-level, 1 = class method or router/registry Variable property, >=2 = deep inner noise)
@@ -180,66 +222,152 @@ fn compact_outline_mode(
         parent_of[i] = best_parent;
     }
 
-    for (i, def) in defs.iter().enumerate() {
-        let d = depth_of[i];
-        // Skip deeply nested inner object-literal keys (e.g. Mongo $match/$project stages inside functions)
-        if d >= 2 {
-            continue;
-        }
-        // Keep top-level symbols, class methods, and properties of top-level Variable routers/registries
-        // (skip arbitrary object properties inside functions like `return { summary: ... }`)
-        if d == 1 {
-            let k = SymbolKind::from_u8(def.kind);
-            let pk = parent_of[i].map(|p| SymbolKind::from_u8(defs[p].kind));
-            let keep = match k {
-                SymbolKind::Method => true,
-                SymbolKind::Property => matches!(pk, Some(SymbolKind::Variable)),
-                SymbolKind::Class => true,
-                _ => false,
-            };
-            if !keep {
+    let render_rows = |only_top: bool| -> Vec<String> {
+        let mut rows = Vec::new();
+        for (i, def) in defs.iter().enumerate() {
+            let d = depth_of[i];
+            if d >= 2 {
                 continue;
             }
-        }
-
-        let indent = if d == 0 { "  " } else { "    " };
-        let range = if def.line_end > def.line_start {
-            format!("L{}-{}", def.line_start, def.line_end)
-        } else {
-            format!("L{}", def.line_start)
-        };
-        let kind_s = SymbolKind::from_u8(def.kind).as_str();
-        let sig = if def.signature.chars().count() > 96 {
-            let mut s: String = def.signature.chars().take(93).collect();
-            s.push_str("...");
-            s
-        } else {
-            def.signature.clone()
-        };
-        let mut row = format!("{indent}{range:<12} [{kind_s:<8}] {sig}");
-        if let Some(counts) = opts.caller_counts {
-            if let Some(&cnt) = counts.get(&def.name) {
-                if cnt > 0 {
-                    row.push_str(&format!(
-                        "  ({} {})",
-                        cnt,
-                        if cnt == 1 { "caller" } else { "callers" }
-                    ));
+            if only_top && d >= 1 {
+                continue;
+            }
+            if d == 1 {
+                let k = SymbolKind::from_u8(def.kind);
+                let pk = parent_of[i].map(|p| SymbolKind::from_u8(defs[p].kind));
+                let keep = match k {
+                    SymbolKind::Method => true,
+                    SymbolKind::Property => matches!(pk, Some(SymbolKind::Variable)),
+                    SymbolKind::Class => true,
+                    _ => false,
+                };
+                if !keep {
+                    continue;
                 }
             }
+            if let Some(ref re) = filter_re {
+                if !re.is_match(&def.name) && !re.is_match(&def.signature) {
+                    continue;
+                }
+            } else if let Some(ref sub) = filter_sub {
+                if !def.name.to_ascii_lowercase().contains(sub)
+                    && !def.signature.to_ascii_lowercase().contains(sub)
+                {
+                    continue;
+                }
+            }
+
+            let indent = if d == 0 { "  " } else { "    " };
+            let range = if def.line_end > def.line_start {
+                format!("L{}-{}", def.line_start, def.line_end)
+            } else {
+                format!("L{}", def.line_start)
+            };
+            let kind_s = SymbolKind::from_u8(def.kind).as_str();
+            let sig = if def.signature.chars().count() > 96 {
+                let mut s: String = def.signature.chars().take(93).collect();
+                s.push_str("...");
+                s
+            } else {
+                def.signature.clone()
+            };
+            let mut row = format!("{indent}{range:<12} [{kind_s:<8}] {sig}");
+            if let Some(counts) = opts.caller_counts {
+                if let Some(&cnt) = counts.get(&def.name) {
+                    if cnt > 0 {
+                        row.push_str(&format!(
+                            "  ({} {})",
+                            cnt,
+                            if cnt == 1 { "caller" } else { "callers" }
+                        ));
+                    }
+                }
+            }
+            rows.push(row);
         }
-        out.push(row);
+        rows
+    };
+
+    let mut rows = render_rows(top_level_only);
+    let mut auto_folded_nested = false;
+    // Guard against huge 15K+ line files blowing the 20 KB shell buffer in default compact mode
+    let est_bytes: usize = rows.iter().map(|r| r.len() + 1).sum();
+    if !top_level_only && opts.filter.is_none() && opts.max_chars.is_none() && est_bytes > 16_000 {
+        let top_rows = render_rows(true);
+        if !top_rows.is_empty() && top_rows.len() < rows.len() {
+            rows = top_rows;
+            auto_folded_nested = true;
+        }
+    }
+
+    let mut out = Vec::with_capacity(rows.len() + 6);
+    if let Some(pat) = opts.filter {
+        out.push(format!(
+            "{file_path} ({} lines, {} of {} symbols matching \"{pat}\"):",
+            lines.len(),
+            rows.len(),
+            defs.len()
+        ));
+    } else {
+        out.push(format!(
+            "{file_path} ({} lines, {} symbols):",
+            lines.len(),
+            defs.len()
+        ));
+    }
+
+    if !opts.show_imports && opts.filter.is_none() {
+        if let Some(imp) = detect_import_block(lines) {
+            out.push(format!(
+                "  L{}-{}  [imports] ({} lines)",
+                imp.start, imp.end, imp.line_count
+            ));
+        }
+    }
+
+    if rows.is_empty() && opts.filter.is_some() {
+        out.push("  (no symbols matched --filter)".to_string());
+    } else {
+        // If STILL > 16 KB (e.g. hundreds of top-level symbols) without explicit --max-chars or --filter, cap cleanly
+        let cap_bytes = if opts.filter.is_none() && opts.max_chars.is_none() {
+            16_000usize
+        } else {
+            usize::MAX
+        };
+        let mut used_bytes = 0usize;
+        let total_rows = rows.len();
+        let mut shown_rows = 0usize;
+        for row in rows {
+            if used_bytes + row.len() + 1 > cap_bytes && shown_rows > 0 {
+                break;
+            }
+            used_bytes += row.len() + 1;
+            out.push(row);
+            shown_rows += 1;
+        }
+        if shown_rows < total_rows {
+            out.push(format!(
+                "  ... (+{} more symbols — use --filter <regex> or --full)",
+                total_rows - shown_rows
+            ));
+        } else if auto_folded_nested {
+            out.push(
+                "  (large file: showing top-level symbols only — use --filter <regex> or --full for nested members)"
+                    .to_string(),
+            );
+        }
     }
 
     out.join("\n")
 }
 
-fn raw_view(lines: &[&str], pad: usize, line_range: Option<(u32, u32)>) -> String {
+fn raw_view(lines: &[&str], file_path: &str, pad: usize, line_range: Option<(u32, u32)>) -> String {
     let start = line_range.map_or(1, |(s, _)| s.max(1)) as usize;
     let end = line_range
         .map_or(lines.len(), |(_, e)| (e as usize).min(lines.len()))
         .min(lines.len());
-    let mut out = Vec::with_capacity(end.saturating_sub(start) + 1);
+    let mut out = Vec::with_capacity(end.saturating_sub(start) + 2);
+    out.push(format!("── {file_path}:{start}-{end} ──"));
     for i in start..=end {
         out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
     }
@@ -263,7 +391,8 @@ fn expand_mode(
         FxHashSet::default()
     };
     let batch_mode = expand_symbols.len() > 1;
-    let max_lines_per_target: usize = if batch_mode { 140 } else { usize::MAX };
+    // Only cap multi-symbol name batches; never silently chop an explicit Lstart-end line range!
+    let max_lines_per_symbol: usize = if batch_mode { 140 } else { usize::MAX };
 
     let mut out = Vec::new();
     for target in expand_symbols {
@@ -271,23 +400,12 @@ fn expand_mode(
         if let Some((rs, re)) = parse_line_range(target) {
             let start = rs.max(1) as usize;
             let end = (re as usize).min(lines.len());
-            if batch_mode {
-                out.push(format!("── {file_path}:{start}-{end} ──"));
-            }
-            let mut emitted = 0usize;
+            out.push(format!("── {file_path}:{start}-{end} ──"));
             for i in start..=end {
                 if no_comments && comment_lines.contains(&(i as u32)) {
                     continue;
                 }
-                if emitted >= max_lines_per_target {
-                    let rem = end.saturating_sub(i) + 1;
-                    out.push(format!(
-                        "  ... (+{rem} more lines — run: betterrank outline {file_path} {i}-{end})"
-                    ));
-                    break;
-                }
                 out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
-                emitted += 1;
             }
             if batch_mode {
                 out.push(String::new());
@@ -319,12 +437,10 @@ fn expand_mode(
             continue;
         }
         for def in &matches {
-            if matches.len() > 1 || batch_mode {
-                out.push(format!(
-                    "── {} ({}:{}-{}) ──",
-                    def.name, file_path, def.line_start, def.line_end
-                ));
-            }
+            out.push(format!(
+                "── {} ({}:{}-{}) ──",
+                def.name, file_path, def.line_start, def.line_end
+            ));
             let start = line_range
                 .map_or(def.line_start, |(s, _)| def.line_start.max(s))
                 .max(1) as usize;
@@ -336,7 +452,7 @@ fn expand_mode(
                 if no_comments && comment_lines.contains(&(i as u32)) {
                     continue;
                 }
-                if emitted >= max_lines_per_target {
+                if emitted >= max_lines_per_symbol {
                     let rem = end.saturating_sub(i) + 1;
                     out.push(format!(
                         "  ... (+{rem} more lines in {} — run: betterrank outline {file_path} {i}-{end})",

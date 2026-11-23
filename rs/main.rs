@@ -20,21 +20,21 @@ const USAGE: &str = "\
 betterrank <command> [options]
 
 Commands:
-  outline     <file> [sym1,L10-50,...] [--annotate]  Compact symbol skeleton (collapses imports); pass symbols or line ranges to expand
+  outline     <file[:syms|L1-50]> [...] [--filter]  Compact skeleton or batched multi-file slices (always-on headers)
   map         [--focus file1,file2] [--include-tests] Repo map (ranked by PageRank, excludes tests by default)
-  files       [dir-or-glob] [--code|--non-code]     List all indexed code + config files by path/glob
+  files       [dir-or-glob] [--dirs] [--depth N]    List indexed code + config files (auto directory rollup when > 200)
   search      <query> [--kind type]                 Path- & token-aware search on symbols, files, + non-code mentions
-  grep        <pattern> [-C N] [--code|--non-code]  PageRank-ranked ripgrep with enclosing symbols & balanced alternations
+  grep        <pattern> [-C N] [--compact] [--path] Code-first PageRank ripgrep (repeatable --path, --exclude-path, --no-imports)
   structure   [--depth N]                           File tree with symbol counts (default depth: 3)
   symbols     [--file path] [--kind type]           List definitions (ranked by PageRank)
-  callers     <sym1[,sym2]> [--file path] [--context] Ranked callers (prod first, merged context, supports file.ts:sym)
+  callers     <sym1[,sym2]> [--file path] [--context] Ranked callers + compact Tests footer (supports file.ts:sym)
   context     <symbol> [--file path]                 Full context: source, deps, types, callers
   history     <symbol> [--file path]                Git history of a specific function
   trace       <symbol> [--depth N]                  Recursive caller chain (upward)
   callees     <symbol> [--depth N]                  Recursive callee chain (downward)
   diff        [--ref <commit>]                      Git-aware blast radius (changed symbols + callers)
   deps        <file>                                What this file imports (ranked)
-  dependents  <file>                                What imports this file (with import lines & symbols) + non-code mentions
+  dependents  <file>                                What imports this file (lines + symbols + Tests footer) + non-code mentions
   neighborhood <file> [--hops N] [--max-files N]    Local subgraph (ranked by PageRank)
   orphans     [--level file|symbol] [--kind type]   Find disconnected files/symbols
   reindex                                           Force full rebuild
@@ -53,6 +53,8 @@ Global flags:
 struct Flags {
     positional: Vec<String>,
     roots: Vec<String>,
+    paths: Vec<String>,
+    exclude_paths: Vec<String>,
     extra_patterns: Vec<String>,
     values: FxHashMap<String, String>,
     bools: rustc_hash::FxHashSet<String>,
@@ -150,6 +152,10 @@ fn parse_flags(args: &[String]) -> Flags {
                 if let Some((k, v)) = raw.split_once('=') {
                     if k == "root" {
                         f.roots.push(v.to_string());
+                    } else if k == "path" {
+                        f.paths.push(v.to_string());
+                    } else if k == "exclude-path" {
+                        f.exclude_paths.push(v.to_string());
                     }
                     f.values.insert(k.to_string(), v.to_string());
                     i += 1;
@@ -166,12 +172,17 @@ fn parse_flags(args: &[String]) -> Flags {
                         | "show-imports"
                         | "full"
                         | "include-tests"
+                        | "include-data"
                         | "no-tests"
+                        | "no-imports"
                         | "no-source"
                         | "no-noncode"
                         | "non-code"
                         | "code"
                         | "files-only"
+                        | "compact"
+                        | "dirs"
+                        | "all"
                         | "case-insensitive"
                         | "fixed-strings"
                         | "patch"
@@ -186,6 +197,10 @@ fn parse_flags(args: &[String]) -> Flags {
                     let val = args[i + 1].clone();
                     if key == "root" {
                         f.roots.push(val.clone());
+                    } else if key == "path" {
+                        f.paths.push(val.clone());
+                    } else if key == "exclude-path" {
+                        f.exclude_paths.push(val.clone());
                     }
                     f.values.insert(key.to_string(), val);
                     i += 2;
@@ -203,13 +218,75 @@ fn parse_flags(args: &[String]) -> Flags {
     f
 }
 
-fn resolve_roots(flags: &Flags) -> Vec<PathBuf> {
-    if !flags.roots.is_empty() {
-        flags.roots.iter().map(PathBuf::from).collect()
-    } else {
-        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        vec![find_default_root(&cwd)]
+fn find_root_for_existing_path(p: &Path) -> Option<PathBuf> {
+    if !p.exists() {
+        return None;
     }
+    let abs = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let start_dir = if abs.is_dir() {
+        abs.as_path()
+    } else {
+        abs.parent().unwrap_or(abs.as_path())
+    };
+    Some(find_default_root(start_dir))
+}
+
+fn resolve_roots(flags: &Flags, target_file_hint: Option<&str>) -> Vec<PathBuf> {
+    if !flags.roots.is_empty() {
+        return flags.roots.iter().map(PathBuf::from).collect();
+    }
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(raw_f) = target_file_hint {
+        let candidate = Path::new(raw_f);
+        let probe = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            cwd.join(candidate)
+        };
+        if let Some(root) = find_root_for_existing_path(&probe) {
+            return vec![root];
+        }
+    }
+    vec![find_default_root(&cwd)]
+}
+
+fn strip_outline_spec(arg: &str) -> (&str, Vec<String>) {
+    // Only split `file:spec` when the left side looks like a path (length > 1 so Windows `C:\...` isn't split)
+    // and the right side does not contain a path separator.
+    if let Some((fpart, spec)) = arg.rsplit_once(':') {
+        if fpart.len() > 1 && !spec.is_empty() && !spec.contains('/') && !spec.contains('\\') {
+            let specs: Vec<String> = spec
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !specs.is_empty() {
+                return (fpart, specs);
+            }
+        }
+    }
+    (arg, Vec::new())
+}
+
+fn try_resolve_outline_file(file_arg: &str, roots: &[PathBuf], cwd: &Path) -> Option<PathBuf> {
+    let p = Path::new(file_arg);
+    if p.is_absolute() {
+        return p.is_file().then(|| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+    }
+    let mut cands = Vec::with_capacity(roots.len() + 1);
+    if let Some(r0) = roots.first() {
+        cands.push(r0.join(p));
+    }
+    cands.push(cwd.join(p));
+    for r in roots.iter().skip(1) {
+        cands.push(r.join(p));
+    }
+    for cand in cands {
+        if cand.is_file() {
+            return Some(fs::canonicalize(&cand).unwrap_or(cand));
+        }
+    }
+    None
 }
 
 fn normalize_graph_file_arg(idx: &CodeIndex, raw: &str) -> String {
@@ -241,14 +318,22 @@ fn normalize_graph_file_arg(idx: &CodeIndex, raw: &str) -> String {
 fn print_command_help(cmd: &str) {
     match cmd {
         "map" => println!("betterrank map [--focus file1,file2] [--include-tests] [--limit N] [--root <path>]\n\nOptions:\n  --focus <files>   Comma-separated files to bias ranking\n  --include-tests   Include test/spec files (excluded by default)\n  --count           Return total symbol count only\n  --offset N        Skip first N symbols\n  --limit N         Max symbols to return (default: 50)"),
-        "callers" => println!("betterrank callers <sym1[,sym2,...]> [--file path] [--context [N]] [--no-tests] [--no-noncode] [--root <path>]\n\nOptions:\n  --file <path>    Disambiguate duplicate symbol names\n  --context [N]    Show N lines of context around call sites (default: 2)\n  --no-tests       Exclude test/spec files\n  --no-noncode     Skip automatic non-code/config mention scan\n  --count          Return count only"),
-        "grep" => println!("betterrank grep <pattern> [--non-code] [--no-tests] [-C N] [-l] [-i] [-F] [--path sub] [--limit N] [--max-per-file N] [--root <path>]\n\nPageRank-ranked, hard-bounded ripgrep across ALL files (code + Dockerfiles + CI YAML + Prisma + SQL + JSON), annotated with enclosing symbol names when warm.\n\nOptions:\n  --non-code         Search only non-code/config/infra/schema files\n  --no-tests         Exclude test/spec files\n  -C N, --context N  Show N lines of surrounding context (max: 5)\n  -l, --files-only   List matching file paths only\n  -i                 Case-insensitive search\n  -F                 Fixed-string literal search (no regex)\n  --path <substr>    Restrict to files whose path contains <substr>\n  --limit N          Max matching files (default: 30)\n  --max-per-file N   Max matching lines per file (default: 5)"),
-        "outline" => println!("betterrank outline <file> [symbol1,symbol2] [--annotate --lines A-B --no-comments --depth N --collapse-imports --root <path>]"),
+        "callers" => println!("betterrank callers <sym1[,sym2,...]> [--file path] [--path sub] [--context [N]] [--include-tests|--no-tests] [--no-noncode] [--root <path>]\n\nOptions:\n  --file <path>    Disambiguate duplicate symbol names (or pass file.ts:sym)\n  --path <substr>  Filter caller paths (repeatable OR-union)\n  --context [N]    Show N lines of merged context around call sites (default: 2)\n  --include-tests  Include test/fixture callers with full context\n  --no-tests       Suppress even the compact Tests (N) footer\n  --no-noncode     Skip automatic non-code/config mention scan\n  --count          Return count only"),
+        "grep" => println!("betterrank grep <pattern> [-C N] [--compact] [--code|--non-code] [--path sub ...] [--exclude-path sub ...] [--no-imports] [--include-tests] [--include-data] [-l] [-i] [-F] [--limit N] [--root <path>]\n\nCode-first, PageRank-ranked ripgrep across all files, annotated with enclosing symbol names when warm.\n\nOptions:\n  --code             Search only supported source code files\n  --non-code         Search only non-code/config/infra/schema files\n  --path <substr>    Restrict to matching paths (repeatable OR-union; auto-includes tests if path targets tests)\n  --exclude-path <s> Exclude files whose path contains <s> (repeatable)\n  --no-imports       Filter out import/export-from/require lines\n  --include-tests    Include test/spec/fixture files in main output\n  --no-tests         Force-exclude tests even when --path targets tests\n  --include-data     Include bulk data/locale/dictionary files (*.dic, locales/*, >128KB JSON)\n  --compact          Dense 1-line-per-file matrix: path [matched_terms] L12, L45\n  -C N, --context N  Show N lines of surrounding context (max: 5)\n  -l, --files-only   List matching file paths only\n  -i                 Case-insensitive search\n  -F                 Fixed-string literal search (no regex)\n  --limit N          Max matching files (default: 30)\n  --max-per-file N   Max matching lines per file (default: 5; uncapped on single-file --path)"),
+        "files" => println!("betterrank files [dir-or-glob] [--dirs] [--depth N] [--all] [--code|--non-code] [--no-tests] [--limit N] [--root <path>]\n\nLists indexed files. Automatically rolls up by directory when matches exceed --limit (default: 200).\n\nOptions:\n  --dirs      Force directory rollup view (`dir/ (N files)`)\n  --depth N   Directory rollup depth below prefix (default: 1)\n  --all       Disable auto-rollup and list all matching files\n  --code      Code files only\n  --non-code  Non-code/config files only\n  --no-tests  Exclude test/spec files"),
+        "outline" => println!("betterrank outline <file[:sym1,L10-50]> [...] [--filter <regex>] [--depth N] [--max-chars N] [--annotate] [--no-comments] [--full] [--root <path>]\n\nExamples:\n  betterrank outline src/api.ts --filter \"review|score\"\n  betterrank outline src/a.ts:10-40 src/b.ts:handler,90-120\n  betterrank outline src/api.ts 3150-3220 --no-comments"),
         _ => println!("{USAGE}"),
     }
 }
 
 fn main() {
+    // Reset SIGPIPE to default on Unix so piping `betterrank ... | head -n 50`
+    // exits cleanly instead of panicking with `Broken pipe (os error 32)`.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         println!("{USAGE}");
@@ -276,20 +361,17 @@ fn main() {
     }
 
     if command == "outline" {
-        let Some(file_arg) = flags.positional.first() else {
-            eprintln!("Usage: betterrank outline <file> [symbol1,symbol2] [--annotate --lines A-B --no-comments --depth N --root <path>]");
+        if flags.positional.is_empty() {
+            eprintln!("Usage: betterrank outline <file[:sym1,L10-50]> [...] [--filter <regex>] [--annotate] [--no-comments] [--depth N] [--max-chars N] [--root <path>]");
             process::exit(1);
-        };
-        let expand_syms: Vec<String> = flags
-            .positional
-            .get(1)
-            .map(|s| s.split(',').map(|x| x.to_string()).collect())
-            .unwrap_or_default();
+        }
         let annotate = flags.has("annotate");
         let no_comments = flags.has("no-comments");
         let collapse_imports = flags.has("collapse-imports");
         let explicit_depth = flags.get("depth").is_some();
         let depth = flags.get_usize("depth").unwrap_or(1) as u32;
+        let filter_pat = flags.get("filter");
+        let max_chars = flags.get_usize("max-chars");
         let line_range = match flags.get("lines") {
             Some(spec) => match parse_line_range(spec) {
                 Some(r) => Some(r),
@@ -302,8 +384,56 @@ fn main() {
         };
 
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let initial_roots: Vec<PathBuf> = if !flags.roots.is_empty() {
+            flags
+                .roots
+                .iter()
+                .map(|r| fs::canonicalize(r).unwrap_or_else(|_| PathBuf::from(r)))
+                .collect()
+        } else {
+            vec![fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone())]
+        };
+
+        // Parse either classic single-file `outline <file> [sym1,10-40]` OR multi-file batched
+        // `outline fileA.ts:10-40 fileB.ts:sym1,sym2 fileC.ts`.
+        let targets: Vec<(String, Vec<String>)> = if flags.positional.len() == 2 {
+            let (f0, s0) = strip_outline_spec(&flags.positional[0]);
+            let (f1, s1) = strip_outline_spec(&flags.positional[1]);
+            let second_is_existing_file = s1.is_empty()
+                && try_resolve_outline_file(f1, &initial_roots, &cwd).is_some();
+            if s0.is_empty() && s1.is_empty() && !second_is_existing_file {
+                let syms: Vec<String> = flags.positional[1]
+                    .split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect();
+                vec![(f0.to_string(), syms)]
+            } else {
+                vec![(f0.to_string(), s0), (f1.to_string(), s1)]
+            }
+        } else {
+            flags
+                .positional
+                .iter()
+                .map(|arg| {
+                    // If the raw arg itself exists on disk, treat it as a bare file path
+                    if try_resolve_outline_file(arg, &initial_roots, &cwd).is_some() {
+                        (arg.clone(), Vec::new())
+                    } else {
+                        let (fp, sp) = strip_outline_spec(arg);
+                        (fp.to_string(), sp)
+                    }
+                })
+                .collect()
+        };
+
+        // Resolve roots from the target file's own enclosing `.git` when `--root` was omitted
+        // (avoids walking up from `cwd` and cold-indexing a parent multi-repo workspace!).
+        let first_resolved = try_resolve_outline_file(&targets[0].0, &initial_roots, &cwd);
         let raw_roots: Vec<PathBuf> = if !flags.roots.is_empty() {
             flags.roots.iter().map(PathBuf::from).collect()
+        } else if let Some(ref abs0) = first_resolved {
+            vec![find_default_root(abs0.parent().unwrap_or(&cwd))]
         } else if annotate {
             vec![find_default_root(&cwd)]
         } else {
@@ -314,85 +444,109 @@ fn main() {
             .map(|r| fs::canonicalize(r).unwrap_or_else(|_| r.clone()))
             .collect();
 
-        let p = Path::new(file_arg);
-        let candidates: Vec<PathBuf> = if p.is_absolute() {
-            vec![p.to_path_buf()]
-        } else {
-            let mut c = vec![roots[0].join(p), cwd.join(p)];
-            for r in roots.iter().skip(1) {
-                c.push(r.join(p));
-            }
-            c
-        };
-
-        let mut source_opt = None;
-        let mut abs_path = candidates[0].clone();
-        for cand in candidates {
-            if let Ok(s) = fs::read_to_string(&cand) {
-                abs_path = fs::canonicalize(&cand).unwrap_or(cand);
-                source_opt = Some(s);
-                break;
-            }
-        }
-        let Some(source) = source_opt else {
-            eprintln!("Cannot read file: {}", abs_path.display());
-            process::exit(1);
-        };
-
-        let matched_root = roots
-            .iter()
-            .find(|r| abs_path.strip_prefix(r).is_ok())
-            .unwrap_or(&roots[0]);
-        let rel_path = normalize_slashes(
-            &abs_path
-                .strip_prefix(matched_root)
-                .unwrap_or(&abs_path)
-                .to_string_lossy(),
-        );
-
-        let caller_counts = if annotate {
+        // Open index once across all targets if `--annotate` is requested
+        let annotate_idx_and_mmap = if annotate {
             let idx = CodeIndex::new(&roots);
-            match idx.ensure() {
-                Ok(mmap) => {
-                    let gpath = if idx.is_multi_root() {
-                        let pfx = idx
-                            .roots
-                            .iter()
-                            .find(|r| &r.path == matched_root)
-                            .map(|r| r.prefix.as_str())
-                            .unwrap_or("");
-                        format!("{pfx}/{rel_path}")
-                    } else {
-                        rel_path.clone()
-                    };
-                    Some(get_caller_counts_for_file(mmap.archived(), &gpath))
-                }
-                Err(_) => None,
-            }
+            idx.ensure().ok().map(|mmap| (idx, mmap))
         } else {
             None
         };
 
-        let out = build_outline(
-            &source,
-            &rel_path,
-            &expand_syms,
-            OutlineOpts {
-                caller_counts: caller_counts.as_ref(),
-                line_range,
-                no_comments,
-                depth,
-                explicit_depth,
-                collapse_imports,
-                show_imports: flags.has("show-imports"),
-                full_skeleton: flags.has("full"),
-            },
-        );
-        println!("{out}");
+        let mut remaining_chars = max_chars;
+        let mut sections: Vec<String> = Vec::with_capacity(targets.len());
+
+        for (file_arg, expand_syms) in &targets {
+            let Some(abs_path) = try_resolve_outline_file(file_arg, &roots, &cwd) else {
+                eprintln!("Cannot read file: {file_arg}");
+                if targets.len() == 1 {
+                    process::exit(1);
+                }
+                continue;
+            };
+            let Ok(source) = fs::read_to_string(&abs_path) else {
+                eprintln!("Cannot read file: {}", abs_path.display());
+                if targets.len() == 1 {
+                    process::exit(1);
+                }
+                continue;
+            };
+
+            let matched_root = roots
+                .iter()
+                .find(|r| abs_path.strip_prefix(r).is_ok())
+                .unwrap_or(&roots[0]);
+            let rel_path = normalize_slashes(
+                &abs_path
+                    .strip_prefix(matched_root)
+                    .unwrap_or(&abs_path)
+                    .to_string_lossy(),
+            );
+
+            let caller_counts = annotate_idx_and_mmap.as_ref().map(|(idx, mmap)| {
+                let gpath = if idx.is_multi_root() {
+                    let pfx = idx
+                        .roots
+                        .iter()
+                        .find(|r| &r.path == matched_root)
+                        .map(|r| r.prefix.as_str())
+                        .unwrap_or("");
+                    format!("{pfx}/{rel_path}")
+                } else {
+                    rel_path.clone()
+                };
+                get_caller_counts_for_file(mmap.archived(), &gpath)
+            });
+
+            if let Some(0) = remaining_chars {
+                sections.push(format!("... (skipped {rel_path}: --max-chars budget reached)"));
+                continue;
+            }
+
+            let out = build_outline(
+                &source,
+                &rel_path,
+                expand_syms,
+                OutlineOpts {
+                    caller_counts: caller_counts.as_ref(),
+                    line_range,
+                    no_comments,
+                    depth,
+                    explicit_depth,
+                    collapse_imports,
+                    show_imports: flags.has("show-imports"),
+                    full_skeleton: flags.has("full"),
+                    filter: filter_pat,
+                    max_chars: remaining_chars,
+                },
+            );
+            if let Some(rem) = remaining_chars {
+                remaining_chars = Some(rem.saturating_sub(out.len() + 2));
+            }
+            sections.push(out);
+        }
+
+        if !sections.is_empty() {
+            println!("{}", sections.join("\n\n"));
+        }
         return;
     }
 
-    let raw_roots = resolve_roots(&flags);
+    // For file-targeted commands, auto-detect `.git` root from the target file when `--root` is omitted.
+    let target_file_hint: Option<&str> = match command {
+        "deps" | "dependents" | "neighborhood" => flags.positional.first().map(|s| s.as_str()),
+        "symbols" | "context" | "history" | "trace" | "callees" => flags.get("file"),
+        "grep" if flags.paths.len() == 1 => {
+            let p = Path::new(&flags.paths[0]);
+            if p.is_absolute() && p.exists() {
+                Some(flags.paths[0].as_str())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let raw_roots = resolve_roots(&flags, target_file_hint);
     let idx = CodeIndex::new(&raw_roots);
     let count_only = flags.has("count");
     let offset = flags.get_usize("offset").unwrap_or(0);
@@ -403,7 +557,7 @@ fn main() {
     // `grep` works even without triggering a cold index (uses warm mmap cache if present for PageRank!)
     if command == "grep" {
         if flags.positional.is_empty() && flags.extra_patterns.is_empty() {
-            eprintln!("Usage: betterrank grep <pattern> [-C N] [--code|--non-code] [--ext ts,py] [--type dockerfile,ci] [--include-tests] [-l] [-i] [-F] [--limit N]");
+            eprintln!("Usage: betterrank grep <pattern> [-C N] [--compact] [--code|--non-code] [--path sub ...] [--exclude-path sub ...] [--no-imports] [--include-tests] [-l] [-i] [-F] [--limit N]");
             process::exit(1);
         }
         let pattern = flags
@@ -439,20 +593,43 @@ fn main() {
                     .collect()
             })
             .unwrap_or_default();
-        let include_tests = flags.has("include-tests") && !flags.has("no-tests");
+        let norm_path_filters: Vec<String> = flags
+            .paths
+            .iter()
+            .map(|p| {
+                let raw = Path::new(p);
+                if raw.is_absolute() && raw.exists() {
+                    normalize_graph_file_arg(&idx, p)
+                } else {
+                    normalize_slashes(p)
+                }
+            })
+            .collect();
+        let norm_exclude_paths: Vec<String> = flags
+            .exclude_paths
+            .iter()
+            .map(|p| normalize_slashes(p))
+            .collect();
+        let no_tests_explicit = flags.has("no-tests");
+        let include_tests = flags.has("include-tests") && !no_tests_explicit;
         let opts = GrepOpts {
             case_insensitive: flags.has("case-insensitive"),
             fixed_strings: flags.has("fixed-strings"),
             noncode_only: flags.has("non-code"),
             code_only: flags.has("code"),
             include_tests,
+            include_data: flags.has("include-data"),
+            no_tests_explicit,
+            no_imports: flags.has("no-imports"),
             files_only: flags.has("files-only"),
+            compact: flags.has("compact"),
             limit_files: user_limit.unwrap_or(30),
             max_per_file: flags.get_usize("max-per-file").unwrap_or(5),
             user_max_per_file: flags.get("max-per-file").is_some(),
             before_context: before_ctx,
             after_context: after_ctx,
-            path_filter: flags.get("path").map(|s| s.to_string()),
+            path_filters: norm_path_filters,
+            exclude_paths: norm_exclude_paths,
             exts,
             types,
             extra_patterns: flags.extra_patterns.clone(),
@@ -460,7 +637,7 @@ fn main() {
         match ranked_grep(&idx.roots, pattern, warm.as_ref().map(|m| m.archived()), &opts) {
             Ok(res) => {
                 if res.path_matched_zero {
-                    let pf = opts.path_filter.as_deref().unwrap_or("");
+                    let pf = opts.path_filters.join(", ");
                     eprintln!("⚠ --path \"{pf}\" matched 0 files under the active --root(s). Use a repo-relative path or pass --root <repo>.");
                     return;
                 }
@@ -491,6 +668,30 @@ fn main() {
                 for fh in &res.hits {
                     if opts.files_only {
                         println!("{}  ({} matches)", fh.file, fh.total_hits_in_file);
+                    } else if opts.compact {
+                        let line_nums: Vec<String> = fh
+                            .hits
+                            .iter()
+                            .filter(|h| !h.is_context)
+                            .map(|h| format!("L{}", h.line))
+                            .collect();
+                        let shown = line_nums.len();
+                        let more = if fh.total_hits_in_file > shown {
+                            format!(" (+{})", fh.total_hits_in_file - shown)
+                        } else {
+                            String::new()
+                        };
+                        if !fh.matched_branches.is_empty() {
+                            println!(
+                                "{}  [{}]  {}{}",
+                                fh.file,
+                                fh.matched_branches.join(", "),
+                                line_nums.join(", "),
+                                more
+                            );
+                        } else {
+                            println!("{}  {}{}", fh.file, line_nums.join(", "), more);
+                        }
                     } else {
                         println!("{}:", fh.file);
                         let mut prev_line: Option<u64> = None;
@@ -617,6 +818,9 @@ fn main() {
                 flags.has("code"),
                 flags.has("non-code"),
                 flags.has("no-tests"),
+                flags.has("dirs"),
+                flags.get_usize("depth"),
+                flags.has("all"),
                 count_only,
                 offset,
                 files_limit,
@@ -660,7 +864,7 @@ fn main() {
         }
         "callers" => {
             let Some(sym_arg) = flags.positional.first() else {
-                eprintln!("Usage: betterrank callers <sym1[,sym2,...]> [--file|--defined-in path] [--path sub] [--include-tests]");
+                eprintln!("Usage: betterrank callers <sym1[,sym2,...]> [--file|--defined-in path] [--path sub ...] [--include-tests|--no-tests]");
                 process::exit(1);
             };
             let f_arg = flags
@@ -674,7 +878,8 @@ fn main() {
             } else {
                 0
             };
-            let include_tests = flags.has("include-tests") && !flags.has("no-tests");
+            let no_tests_explicit = flags.has("no-tests");
+            let include_tests = flags.has("include-tests") && !no_tests_explicit;
             let syms: Vec<&str> = sym_arg
                 .split(',')
                 .map(|s| s.trim())
@@ -692,9 +897,10 @@ fn main() {
                     g,
                     sym,
                     f_arg.as_deref(),
-                    flags.get("path"),
+                    &flags.paths,
                     ctx_lines,
                     include_tests,
+                    no_tests_explicit,
                     count_only,
                     offset,
                     limit,
@@ -768,16 +974,18 @@ fn main() {
         }
         "dependents" => {
             let Some(raw_f) = flags.positional.first() else {
-                eprintln!("Usage: betterrank dependents <file> [--include-tests]");
+                eprintln!("Usage: betterrank dependents <file> [--include-tests|--no-tests]");
                 process::exit(1);
             };
             let f = normalize_graph_file_arg(&idx, raw_f);
-            let include_tests = flags.has("include-tests") && !flags.has("no-tests");
+            let no_tests_explicit = flags.has("no-tests");
+            let include_tests = flags.has("include-tests") && !no_tests_explicit;
             cmd_dependents(
                 &idx,
                 g,
                 &f,
                 include_tests,
+                no_tests_explicit,
                 count_only,
                 offset,
                 limit,
