@@ -1,7 +1,8 @@
 import { createHash } from 'crypto';
 import { readFile, unlink } from 'fs/promises';
-import { homedir, platform } from 'os';
+import { availableParallelism, cpus, homedir, platform } from 'os';
 import { basename, join, resolve } from 'path';
+import { Worker } from 'worker_threads';
 import { parseFile, SUPPORTED_EXTENSIONS } from './parser.js';
 import {
   walkFiles,
@@ -150,6 +151,70 @@ function normalizeRoots(projectRootOrRoots) {
   });
 }
 
+const WORKER_SCRIPT_URL = new URL('./parse-worker.js', import.meta.url);
+const WORKER_MIN_FILES = 120;
+const MAX_PARSE_WORKERS = 8;
+
+function getParseWorkerCount(fileCount) {
+  if (fileCount < WORKER_MIN_FILES) return 1;
+  const cores = typeof availableParallelism === 'function'
+    ? availableParallelism()
+    : (cpus()?.length || 1);
+  return Math.max(1, Math.min(cores, MAX_PARSE_WORKERS, Math.ceil(fileCount / 60)));
+}
+
+/**
+ * LPT greedy bin-packing by file byte size so large routers/components are
+ * spread evenly across workers instead of creating a straggler chunk.
+ */
+function partitionForWorkers(items, numWorkers) {
+  const sorted = [...items].sort((a, b) => (b.size || 0) - (a.size || 0));
+  const chunks = Array.from({ length: numWorkers }, () => []);
+  const loads = new Array(numWorkers).fill(0);
+
+  for (const item of sorted) {
+    let minIdx = 0;
+    for (let i = 1; i < numWorkers; i++) {
+      if (loads[i] < loads[minIdx]) minIdx = i;
+    }
+    chunks[minIdx].push(item);
+    loads[minIdx] += (item.size || 1024);
+  }
+
+  return chunks.filter(c => c.length > 0);
+}
+
+function parseRootInWorkers(rootPath, items, numWorkers) {
+  const chunks = partitionForWorkers(items, numWorkers);
+  return Promise.all(
+    chunks.map(
+      chunk =>
+        new Promise((resolvePromise, rejectPromise) => {
+          const worker = new Worker(WORKER_SCRIPT_URL, {
+            workerData: { rootPath, items: chunk },
+          });
+          let settled = false;
+          worker.on('message', msg => {
+            settled = true;
+            resolvePromise(msg);
+          });
+          worker.on('error', err => {
+            if (!settled) {
+              settled = true;
+              rejectPromise(err);
+            }
+          });
+          worker.on('exit', code => {
+            if (!settled && code !== 0) {
+              settled = true;
+              rejectPromise(new Error(`parse-worker exited with code ${code}`));
+            }
+          });
+        }),
+    ),
+  );
+}
+
 function cachePathForRoot(projectRootOrRoots) {
   const list = Array.isArray(projectRootOrRoots)
     ? [...projectRootOrRoots].map(r => resolve(r)).sort()
@@ -175,6 +240,7 @@ class CodeIndexCache {
     this.configPath = join(this.projectRoot, CONFIG_PATH);
     this.graph = null;
     this.mtimes = new Map();
+    this.fileSizes = new Map();
     this.cachedRanked = null;
     this.initialized = false;
     this.skipCacheLoadOnce = false;
@@ -334,6 +400,7 @@ class CodeIndexCache {
   async reindex() {
     this.graph = null;
     this.mtimes = new Map();
+    this.fileSizes = new Map();
     this.cachedRanked = null;
     this.initialized = false;
     this.skipCacheLoadOnce = true;
@@ -367,6 +434,7 @@ class CodeIndexCache {
       for (const entry of stats) {
         const graphPath = prefix ? `${prefix}/${entry.relPath}` : entry.relPath;
         currentFiles.add(graphPath);
+        this.fileSizes.set(graphPath, entry.size || 0);
 
         const storedMtime = this.mtimes.get(graphPath);
         if (storedMtime === undefined || storedMtime < entry.mtimeMs) {
@@ -438,47 +506,91 @@ class CodeIndexCache {
             });
           }
         } else {
-          toParse.push({ graphPath, relPath, currentMtime });
+          toParse.push({
+            graphPath,
+            relPath,
+            currentMtime,
+            size: this.fileSizes.get(graphPath) || 0,
+          });
         }
       }
 
-      for (let i = 0; i < toParse.length; i += BATCH_SIZE) {
-        const batch = toParse.slice(i, i + BATCH_SIZE);
-        const sources = await Promise.all(
-          batch.map(async entry => {
-            try {
-              const source = await readFile(join(rootObj.path, entry.relPath), 'utf-8');
-              return { ...entry, source };
-            } catch {
-              return null;
-            }
-          }),
-        );
+      const numWorkers = getParseWorkerCount(toParse.length);
+      let usedWorkers = false;
 
-        for (const item of sources) {
-          if (!item) continue;
-          const { graphPath, relPath, currentMtime, source } = item;
-          if (isMinifiedSource(source, graphPath)) {
-            skippedCount++;
-            rootCache.set(relPath, { mtimeMs: currentMtime, skipped: true });
-            cacheDirty = true;
-            continue;
-          }
-          try {
-            const result = parseFile(graphPath, source);
-            if (result) {
-              parsed.push(result);
-              rootCache.set(relPath, {
-                mtimeMs: currentMtime,
+      if (numWorkers > 1) {
+        try {
+          const workerOutputs = await parseRootInWorkers(rootObj.path, toParse, numWorkers);
+          usedWorkers = true;
+          for (const out of workerOutputs) {
+            skippedCount += out.skippedCount || 0;
+            for (const rec of out.results || []) {
+              if (rec.skipped) {
+                rootCache.set(rec.relPath, { mtimeMs: rec.currentMtime, skipped: true });
+                cacheDirty = true;
+                continue;
+              }
+              parsed.push({
+                file: rec.graphPath,
+                definitions: rec.definitions,
+                references: rec.references,
+                imports: rec.imports,
+              });
+              rootCache.set(rec.relPath, {
+                mtimeMs: rec.currentMtime,
                 skipped: false,
-                definitions: result.definitions,
-                references: result.references,
-                imports: result.imports,
+                definitions: rec.definitions,
+                references: rec.references,
+                imports: rec.imports,
               });
               cacheDirty = true;
             }
-          } catch {
-            // skip unparseable files
+          }
+        } catch {
+          // Graceful fallback to single-threaded parsing if worker_threads fails
+          usedWorkers = false;
+        }
+      }
+
+      if (!usedWorkers) {
+        for (let i = 0; i < toParse.length; i += BATCH_SIZE) {
+          const batch = toParse.slice(i, i + BATCH_SIZE);
+          const sources = await Promise.all(
+            batch.map(async entry => {
+              try {
+                const source = await readFile(join(rootObj.path, entry.relPath), 'utf-8');
+                return { ...entry, source };
+              } catch {
+                return null;
+              }
+            }),
+          );
+
+          for (const item of sources) {
+            if (!item) continue;
+            const { graphPath, relPath, currentMtime, source } = item;
+            if (isMinifiedSource(source, graphPath)) {
+              skippedCount++;
+              rootCache.set(relPath, { mtimeMs: currentMtime, skipped: true });
+              cacheDirty = true;
+              continue;
+            }
+            try {
+              const result = parseFile(graphPath, source);
+              if (result) {
+                parsed.push(result);
+                rootCache.set(relPath, {
+                  mtimeMs: currentMtime,
+                  skipped: false,
+                  definitions: result.definitions,
+                  references: result.references,
+                  imports: result.imports,
+                });
+                cacheDirty = true;
+              }
+            } catch {
+              // skip unparseable files
+            }
           }
         }
       }

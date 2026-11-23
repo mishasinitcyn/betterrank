@@ -305,3 +305,35 @@ test('CLI outline accepts cwd-relative path with --root subdir and map --help do
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test('parallel worker_threads parsing indexes >=120 files cleanly and persists per-root parse cache', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'betterrank-v042-workers-'));
+
+  try {
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(
+      join(root, 'src/core.ts'),
+      `export function sharedCore(n: number) {\n  return n * 2;\n}\n`,
+    );
+    const writes = [];
+    for (let i = 0; i < 130; i++) {
+      writes.push(
+        writeFile(
+          join(root, `src/mod_${i}.ts`),
+          `import { sharedCore } from './core';\nexport function fn_${i}(x: number) {\n  return sharedCore(x) + ${i};\n}\n`,
+        ),
+      );
+    }
+    await Promise.all(writes);
+
+    const idx = new CodeIndex(root, { cachePath: '.code-index-cache/test.br.gz' });
+    const st = await idx.stats();
+    assert.equal(st.files, 131);
+    assert.equal(st.symbols, 131);
+
+    const callers = await idx.callers({ symbol: 'sharedCore', count: true });
+    assert.equal(callers.total, 130);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
