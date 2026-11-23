@@ -337,3 +337,56 @@ test('parallel worker_threads parsing indexes >=120 files cleanly and persists p
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('outline --depth 2 --lines preserves skeleton folding while plain --lines returns raw slice', () => {
+  const bodyLines = Array.from({ length: 40 }, (_, i) => `  const v${i} = ${i};`).join('\n');
+  const source = [
+    `export function alpha() {`,
+    bodyLines,
+    `  return 1;`,
+    `}`,
+    `export function beta() {`,
+    bodyLines,
+    `  return 2;`,
+    `}`,
+  ].join('\n');
+
+  // Plain --lines returns exact raw lines
+  const raw = buildOutline(source, 'demo.ts', [], { lineRange: [1, 43] });
+  assert.ok(raw.includes('const v20 = 20;'));
+  assert.equal(raw.split('\n').length, 43);
+
+  // --depth 2 --lines applies folding and slices to the requested range
+  const folded = buildOutline(source, 'demo.ts', [], {
+    lineRange: [1, 45],
+    depth: 2,
+    explicitDepth: true,
+  });
+  assert.ok(folded.includes('export function alpha()'));
+  assert.ok(!folded.includes('const v20 = 20;'), '--depth 2 --lines must not dump raw collapsed body');
+  assert.ok(folded.split('\n').length < 10, `expected folded slice (<10 lines), got ${folded.split('\n').length}`);
+});
+
+test('CLI auto-detects enclosing .git root silently when --root is omitted', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'betterrank-v043-gitroot-'));
+  const cacheDir = join(repo, 'cache');
+
+  try {
+    await mkdir(join(repo, '.git'), { recursive: true });
+    await mkdir(join(repo, 'src/nested'), { recursive: true });
+    await writeFile(
+      join(repo, 'src/nested/util.ts'),
+      `export function findMe() {\n  return 42;\n}\n`,
+    );
+
+    const { stdout, stderr } = await execFileAsync(
+      process.execPath,
+      [CLI_PATH, 'search', 'findMe'],
+      { cwd: join(repo, 'src/nested'), env: { ...process.env, CODE_INDEX_CACHE_DIR: cacheDir } },
+    );
+    assert.ok(stdout.includes('src/nested/util.ts'));
+    assert.ok(!stderr.includes('No --root specified'), 'should not nag when .git root is auto-detected');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});

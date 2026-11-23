@@ -35,20 +35,25 @@ export function buildOutline(
   source,
   filePath,
   expandSymbols = [],
-  { callerCounts, lineRange = null, noComments = false, depth = 1, collapseImports = false } = {},
+  {
+    callerCounts,
+    lineRange = null,
+    noComments = false,
+    depth = 1,
+    explicitDepth = false,
+    collapseImports = false,
+  } = {},
 ) {
   const lines = source.split('\n');
   const pad = Math.max(String(lines.length).length, 4);
 
-  if (lineRange && expandSymbols.length === 0) {
-    const [start, end] = lineRange;
-    const clampedStart = Math.max(1, start);
-    const clampedEnd = Math.min(lines.length, end);
-    const out = [];
-    for (let i = clampedStart; i <= clampedEnd; i++) {
-      out.push(`${String(i).padStart(pad)}│ ${lines[i - 1]}`);
-    }
-    return out.join('\n');
+  // Plain `--lines A-B` without outline-folding flags returns a fast raw line slice.
+  // When combined with `--depth`, `--no-comments`, `--annotate`, or `--collapse-imports`,
+  // apply outline folding first and slice the folded view to `[start, end]`.
+  const wantsFoldedOutline =
+    explicitDepth || depth !== 1 || noComments || Boolean(callerCounts) || collapseImports;
+  if (lineRange && expandSymbols.length === 0 && !wantsFoldedOutline) {
+    return rawView(lines, pad, lineRange);
   }
 
   const ext = extname(filePath);
@@ -74,7 +79,7 @@ export function buildOutline(
   if (expandSymbols.length > 0) {
     return expandMode(lines, defs, filePath, expandSymbols, pad, lineRange);
   }
-  return outlineMode(lines, defs, pad, { callerCounts, noComments, depth, collapseImports, ext });
+  return outlineMode(lines, defs, pad, { callerCounts, noComments, depth, collapseImports, ext, lineRange });
 }
 
 function rawView(lines, pad, lineRange = null) {
@@ -287,7 +292,7 @@ function appendAnnotation(line, count) {
   return line + padding + annotation;
 }
 
-function outlineMode(lines, defs, pad, { callerCounts, noComments = false, depth = 1, collapseImports = false, ext = '' } = {}) {
+function outlineMode(lines, defs, pad, { callerCounts, noComments = false, depth = 1, collapseImports = false, ext = '', lineRange = null } = {}) {
   const parentMap = findImmediateParents(defs);
   const { delegatingContainers, deepFunctionContainers } = findDelegatingContainers(defs, parentMap, depth);
 
@@ -380,28 +385,38 @@ function outlineMode(lines, defs, pad, { callerCounts, noComments = false, depth
   collapseRanges.sort((a, b) => a.start - b.start);
   const commentLines = noComments ? detectCommentLines(lines, ext) : null;
 
+  const sliceStart = lineRange ? Math.max(1, lineRange[0]) : 1;
+  const sliceEnd = lineRange ? Math.min(lines.length, lineRange[1]) : lines.length;
+
   const output = [];
   let lineNum = 1;
   let rangeIdx = 0;
 
-  while (lineNum <= lines.length) {
+  while (lineNum <= sliceEnd) {
     while (rangeIdx < collapseRanges.length && collapseRanges[rangeIdx].start < lineNum) {
       rangeIdx++;
     }
 
     if (rangeIdx < collapseRanges.length && collapseRanges[rangeIdx].start === lineNum) {
       const range = collapseRanges[rangeIdx];
-      const bodyLine = lines[lineNum - 1];
-      const indent = bodyLine ? bodyLine.match(/^\s*/)[0] : '';
-      let marker = `${' '.repeat(pad)}│ ${indent}... (${range.lineCount} lines)`;
+      if (range.end >= sliceStart && range.start <= sliceEnd) {
+        const bodyLine = lines[lineNum - 1];
+        const indent = bodyLine ? bodyLine.match(/^\s*/)[0] : '';
+        let marker = `${' '.repeat(pad)}│ ${indent}... (${range.lineCount} lines)`;
 
-      if (callerCounts && range.name && callerCounts.has(range.name)) {
-        marker = appendAnnotation(marker, callerCounts.get(range.name));
+        if (callerCounts && range.name && callerCounts.has(range.name)) {
+          marker = appendAnnotation(marker, callerCounts.get(range.name));
+        }
+
+        output.push(marker);
       }
-
-      output.push(marker);
       lineNum = range.end + 1;
       rangeIdx++;
+      continue;
+    }
+
+    if (lineNum < sliceStart) {
+      lineNum++;
       continue;
     }
 

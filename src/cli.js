@@ -2,10 +2,25 @@
 
 import { CodeIndex } from './index.js';
 import { resolve, relative, isAbsolute, dirname, join } from 'path';
+import { existsSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Walk up from `startDir` to locate the enclosing git repository root.
+ * Falls back cleanly to `startDir` when not inside a git repo.
+ */
+function findDefaultRoot(startDir = process.cwd()) {
+  let dir = resolve(startDir);
+  while (true) {
+    if (existsSync(join(dir, '.git'))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return resolve(startDir);
+    dir = parent;
+  }
+}
 const DEFAULT_LIMIT = 50;
 const DEFAULT_DEPTH = 3;
 
@@ -483,16 +498,12 @@ async function main() {
     const annotate = flags.annotate === true;
     const noComments = flags['no-comments'] === true;
     const collapseImports = flags['collapse-imports'] === true;
-    const depth = flags.depth !== undefined ? parseInt(flags.depth, 10) : 1;
-
-    if (annotate && !flags.root) {
-      console.error('outline --annotate requires --root for graph data');
-      process.exit(1);
-    }
+    const explicitDepth = flags.depth !== undefined;
+    const depth = explicitDepth ? parseInt(flags.depth, 10) : 1;
 
     const roots = flags._roots && flags._roots.length > 0
       ? flags._roots.map(r => resolve(r))
-      : [flags.root ? resolve(flags.root) : process.cwd()];
+      : [flags.root ? resolve(flags.root) : (annotate ? findDefaultRoot() : process.cwd())];
     let matchedRoot = roots[0];
     let absPath = isAbsolute(filePath) ? filePath : resolve(matchedRoot, filePath);
 
@@ -555,6 +566,7 @@ async function main() {
       lineRange,
       noComments,
       depth,
+      explicitDepth,
       collapseImports,
     });
     console.log(result);
@@ -563,11 +575,8 @@ async function main() {
 
   const roots = flags._roots && flags._roots.length > 0
     ? flags._roots.map(r => resolve(r))
-    : [resolve(flags.root || process.cwd())];
+    : [flags.root ? resolve(flags.root) : findDefaultRoot()];
   const projectRoot = roots[0];
-  if (!flags.root && (!flags._roots || flags._roots.length === 0)) {
-    process.stderr.write(`⚠ No --root specified, using cwd: ${projectRoot}\n`);
-  }
   const idx = new CodeIndex(roots.length > 1 ? roots : projectRoot);
 
   const countMode = flags.count === true;
