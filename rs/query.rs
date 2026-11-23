@@ -647,27 +647,24 @@ fn rollup_directories(
         .filter(|p| !p.is_empty() && !p.contains('*') && !p.contains('?'))
         .map(|p| format!("{p}/"));
 
-    let use_prefix = base_prefix
-        .as_deref()
-        .filter(|pfx| filtered.iter().all(|f| f.starts_with(pfx)));
-
     let d = depth.max(1);
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for &path in filtered {
-        let rel = match use_prefix {
-            Some(pfx) => &path[pfx.len()..],
-            None => path,
+        // Strip base_prefix per-file whenever matched so we NEVER collapse back up to a parent dir!
+        let (active_pfx, rel) = match base_prefix.as_deref() {
+            Some(pfx) if path.starts_with(pfx) => (Some(pfx), &path[pfx.len()..]),
+            _ => (None, path),
         };
         let parts: Vec<&str> = rel.split('/').collect();
         let key = if parts.len() <= 1 {
-            match use_prefix {
+            match active_pfx {
                 Some(pfx) => format!("{pfx} (direct)"),
                 None => "(root)".to_string(),
             }
         } else {
             let take_n = d.min(parts.len() - 1);
             let sub = parts[..take_n].join("/");
-            match use_prefix {
+            match active_pfx {
                 Some(pfx) => format!("{pfx}{sub}/"),
                 None => format!("{sub}/"),
             }
@@ -678,7 +675,7 @@ fn rollup_directories(
 }
 
 fn compile_file_pattern(raw: &str) -> (String, Option<Regex>) {
-    let pat_lower = raw.trim_start_matches("./").to_ascii_lowercase();
+    let pat_lower = raw.trim_start_matches("./").trim_end_matches('/').to_ascii_lowercase();
     let has_glob = pat_lower.contains('*') || pat_lower.contains('?');
     let glob_re = if has_glob {
         let mut re_s = String::from("^.*");
@@ -713,13 +710,15 @@ pub fn cmd_files(
     limit: usize,
 ) {
     let mut paths: Vec<&str> = Vec::new();
+    let mut unindexed_set: FxHashSet<&str> = FxHashSet::default();
     if !noncode_only {
         for &fi_r in g.file_order.iter() {
             let f = &g.files[fi_r.to_native() as usize];
+            let p = f.path.as_str();
             if f.symbol_count.to_native() < 0 {
-                continue;
+                unindexed_set.insert(p);
             }
-            paths.push(f.path.as_str());
+            paths.push(p);
         }
     }
     if !code_only {
@@ -730,9 +729,24 @@ pub fn cmd_files(
     paths.sort_unstable();
     paths.dedup();
 
-    let compiled_pats: Vec<(String, Option<Regex>)> = patterns
+    // For each non-glob pattern, check whether it matches as a real directory prefix (`apps/qa/`)
+    // so `files apps/qa` doesn't accidentally pull in `apps/qa-other/...` or `.github/apps-qa.yml`!
+    let compiled_pats: Vec<(String, Option<Regex>, bool)> = patterns
         .iter()
-        .map(|p| compile_file_pattern(p))
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| {
+            let (pl, re_opt) = compile_file_pattern(p);
+            let is_dir_prefix = if re_opt.is_none() && !pl.is_empty() {
+                let pfx = format!("{pl}/");
+                paths.iter().any(|path| {
+                    let low = path.to_ascii_lowercase();
+                    low.starts_with(&pfx) || low == pl
+                })
+            } else {
+                false
+            };
+            (pl, re_opt, is_dir_prefix)
+        })
         .collect();
     let filter_re = filter.and_then(|pat| {
         regex::RegexBuilder::new(pat)
@@ -750,9 +764,13 @@ pub fn cmd_files(
             }
             let p_low = p.to_ascii_lowercase();
             if !compiled_pats.is_empty() {
-                let any_pat = compiled_pats.iter().any(|(pl, re_opt)| {
+                let any_pat = compiled_pats.iter().any(|(pl, re_opt, is_dir_prefix)| {
                     if let Some(ref re) = re_opt {
                         re.is_match(&p_low)
+                    } else if *is_dir_prefix {
+                        p_low == *pl
+                            || (p_low.starts_with(pl.as_str())
+                                && p_low.as_bytes().get(pl.len()) == Some(&b'/'))
                     } else {
                         p_low.contains(pl.as_str())
                     }
@@ -786,16 +804,24 @@ pub fn cmd_files(
 
     // Directory rollup: triggered explicitly via `--dirs`, or automatically ONLY when
     // filtered results exceed `--limit` (default 200) and neither `--all` nor `--offset` was passed.
-    // Passing `--depth N` controls rollup depth when rolling up, without hiding tiny dirs (<= limit)!
     let auto_rollup = !show_all && offset == 0 && filtered.len() > limit;
     if dirs_only || auto_rollup {
-        let rollup_depth = depth.unwrap_or(1);
-        let single_pat = if patterns.len() == 1 {
-            Some(patterns[0].as_str())
+        let mut rollup_depth = depth.unwrap_or(1);
+        let single_pat = if compiled_pats.len() == 1 {
+            Some(compiled_pats[0].0.as_str())
         } else {
             None
         };
-        let dirs = rollup_directories(&filtered, single_pat, rollup_depth);
+        let mut dirs = rollup_directories(&filtered, single_pat, rollup_depth);
+        // If auto-rolling up a subtree like `apps/qa` and depth=1 collapsed everything into a single
+        // intermediate folder (e.g. `apps/qa/src/`), step 1 level deeper automatically!
+        if depth.is_none() && dirs.len() == 1 && !dirs[0].0.ends_with("(direct)") {
+            rollup_depth += 1;
+            let deeper = rollup_directories(&filtered, single_pat, rollup_depth);
+            if deeper.len() > 1 {
+                dirs = deeper;
+            }
+        }
         let show_dirs = dirs.len().min(limit.max(200));
         for (dir, cnt) in &dirs[..show_dirs] {
             println!(
@@ -823,7 +849,11 @@ pub fn cmd_files(
         &[]
     };
     for p in slice {
-        println!("{p}");
+        if unindexed_set.contains(p) {
+            println!("{p}  [unindexed]");
+        } else {
+            println!("{p}");
+        }
     }
     if slice.len() < filtered.len() {
         println!(
@@ -980,10 +1010,17 @@ pub fn cmd_callers(
 ) {
     let eff_include_tests =
         include_tests || (!no_tests_explicit && path_filters_target_tests(path_filters));
-    // Support file-scoped syntax like `router.ts:getItem` or `src/api/router.ts:getItem`
-    let (file_hint_from_sym, symbol) = match raw_symbol.rsplit_once(':') {
+    // Support file-scoped syntax (`router.ts:getItem`) AND receiver-qualified syntax (`review.getItem` / `api.review.getItem`)
+    let (file_hint_from_sym, sym_after_colon) = match raw_symbol.rsplit_once(':') {
         Some((fpart, spart)) if !fpart.is_empty() && !spart.is_empty() => (Some(fpart), spart),
         _ => (None, raw_symbol),
+    };
+    let (receiver_hint, symbol) = match sym_after_colon.rsplit_once('.') {
+        Some((rpart, spart)) if !rpart.is_empty() && !spart.is_empty() => {
+            let last_recv = rpart.rsplit('.').next().unwrap_or(rpart);
+            (Some(last_recv), spart)
+        }
+        _ => (None, sym_after_colon),
     };
     let effective_file = file.or(file_hint_from_sym);
 
@@ -997,6 +1034,41 @@ pub fn cmd_callers(
             p == f_norm || p.ends_with(&suffix)
         });
     }
+    if let Some(recv) = receiver_hint {
+        let recv_low = recv.to_ascii_lowercase();
+        let narrowed: Vec<u32> = target_syms
+            .iter()
+            .copied()
+            .filter(|&si| {
+                let fi = g.symbols[si as usize].file_idx.to_native() as usize;
+                let p = g.files[fi].path.as_str().to_ascii_lowercase();
+                if p.contains(&format!("/{recv_low}."))
+                    || p.starts_with(&format!("{recv_low}."))
+                    || p.contains(&format!("/{recv_low}/"))
+                {
+                    return true;
+                }
+                let ds = g.def_offsets[fi].to_native() as usize;
+                let de = g.def_offsets[fi + 1].to_native() as usize;
+                g.def_syms[ds..de].iter().any(|r| {
+                    let sname = g.symbols[r.to_native() as usize]
+                        .name
+                        .as_str()
+                        .to_ascii_lowercase();
+                    sname == recv_low || sname == format!("{recv_low}router")
+                })
+            })
+            .collect();
+        if !narrowed.is_empty() {
+            target_syms = narrowed;
+        }
+    }
+
+    let recv_call_re = receiver_hint.map(|recv| {
+        let r_esc = regex::escape(recv);
+        let s_esc = regex::escape(symbol);
+        Regex::new(&format!(r"\b{r_esc}\s*\??\.\s*{s_esc}\b")).unwrap()
+    });
 
     let mut caller_set: FxHashSet<u32> = FxHashSet::default();
     let mut callers: Vec<(u32, f32)> = Vec::new();
@@ -1015,6 +1087,15 @@ pub fn cmd_callers(
                     .any(|pf| cpath.contains(pf.trim_start_matches("./")))
             {
                 continue;
+            }
+            if let Some(ref rre) = recv_call_re {
+                let abs = idx.resolve_abs_path(cpath);
+                let ok = fs::read_to_string(&abs)
+                    .map(|src| rre.is_match(&src))
+                    .unwrap_or(false);
+                if !ok {
+                    continue;
+                }
             }
             if !eff_include_tests && is_test_or_fixture_path(cpath) {
                 if seen_hidden_tests.insert(fi) {
@@ -1094,13 +1175,17 @@ pub fn cmd_callers(
                 {
                     continue;
                 }
-                let matched = call_re.is_match(line)
-                    || jsx_re.is_match(line)
-                    || member_re.is_match(line)
-                    || bracket_re.is_match(line)
-                    || import_re.is_match(line)
-                    || (is_class && type_annot_re.is_match(line))
-                    || (is_non_callable && ident_re.is_match(line));
+                let matched = if let Some(ref rre) = recv_call_re {
+                    rre.is_match(line)
+                } else {
+                    call_re.is_match(line)
+                        || jsx_re.is_match(line)
+                        || member_re.is_match(line)
+                        || bracket_re.is_match(line)
+                        || import_re.is_match(line)
+                        || (is_class && type_annot_re.is_match(line))
+                        || (is_non_callable && ident_re.is_match(line))
+                };
                 if matched {
                     matched_indices.push(i);
                 }

@@ -1071,3 +1071,291 @@ fn v052_quotas_budget_files_and_outlines() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn v053_fair_outline_schema_files_and_quotas() {
+    let base = temp_dir("v053-suite");
+    let cache_dir = base.join("cache");
+    let repo_a = base.join("repo-a");
+    let repo_b = base.join("repo-b");
+
+    fs::create_dir_all(repo_a.join(".git")).unwrap();
+    fs::create_dir_all(repo_b.join(".git")).unwrap();
+    fs::create_dir_all(repo_a.join("apps/qa/src/app")).unwrap();
+    fs::create_dir_all(repo_a.join("apps/qa/src/server")).unwrap();
+    fs::create_dir_all(repo_a.join("apps/qa-extra")).unwrap();
+    fs::create_dir_all(repo_a.join("packages/schema/prisma")).unwrap();
+    fs::create_dir_all(repo_a.join("tests")).unwrap();
+    fs::create_dir_all(repo_b.join("src")).unwrap();
+
+    // 1. Huge markdown (25 KB) + TOML with 10 KB single-line comment + small target slice
+    let mut huge_md = String::from("# Big Guide\n");
+    for i in 1..=320 {
+        huge_md.push_str(&format!(
+            "Line {i:03}: detailed architectural paragraph padding text for water-filling test.\n"
+        ));
+    }
+    fs::write(repo_a.join("BIG_GUIDE.md"), &huge_md).unwrap();
+
+    let huge_comment = format!("# {}\n[project]\nname = \"demo\"\n", "x".repeat(10_000));
+    fs::write(repo_a.join("pyproject.toml"), &huge_comment).unwrap();
+
+    let mut imp_ts = String::new();
+    for i in 1..=10 {
+        imp_ts.push_str(&format!("import {{ dep{i} }} from './dep{i}';\n"));
+    }
+    imp_ts.push_str("\nexport function importantSlice() {\n  return 'SLICE_MUST_APPEAR';\n}\n");
+    fs::write(repo_a.join("apps/qa/src/server/slice.ts"), &imp_ts).unwrap();
+
+    // 2. Large schema.prisma (~620 KB > old 512 KB cap!)
+    let mut big_prisma = String::from("model DemoEntity {\n  id String @id\n}\n");
+    for i in 1..=7000 {
+        big_prisma.push_str(&format!(
+            "model FillerModel{i} {{\n  id String @id\n  label String // padding comment {i:04}\n}}\n"
+        ));
+    }
+    big_prisma.push_str("model TargetSchemaRecord {\n  id String @id\n}\n");
+    fs::write(
+        repo_a.join("packages/schema/prisma/schema.prisma"),
+        &big_prisma,
+    )
+    .unwrap();
+
+    // 3. Files inside apps/qa/src/app and apps/qa/src/server + apps/qa-extra
+    for i in 1..=3 {
+        fs::write(
+            repo_a.join(format!("apps/qa/src/app/page_{i}.ts")),
+            format!("export const p{i} = {i};\n"),
+        )
+        .unwrap();
+        fs::write(
+            repo_a.join(format!("apps/qa/src/server/svc_{i}.ts")),
+            format!("export const s{i} = {i};\n"),
+        )
+        .unwrap();
+    }
+    fs::write(repo_a.join("apps/qa-extra/other.ts"), "export const other = 1;\n").unwrap();
+
+    // 4. Huge router file with 250 private helpers BEFORE `export const mainRouter`
+    let mut giant_router = String::new();
+    for i in 1..=250 {
+        giant_router.push_str(&format!(
+            "function privateHelperWithLongDescriptiveName_{i:03}(arg: string): string {{ return arg + '{i}'; }}\n"
+        ));
+    }
+    giant_router.push_str("export const mainRouter = {\n  submitItem: () => 1,\n};\n");
+    fs::write(repo_a.join("apps/qa/src/server/giant-router.ts"), &giant_router).unwrap();
+
+    // 5. Receiver-qualified callers fixture (realistic multi-line tRPC routers)
+    fs::write(
+        repo_a.join("apps/qa/src/server/review.ts"),
+        "export const reviewRouter = createTRPCRouter({\n  getEntry: publicProcedure\n    .query(() => 'review'),\n});\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_a.join("apps/qa/src/server/audit.ts"),
+        "export const auditRouter = createTRPCRouter({\n  getEntry: publicProcedure\n    .query(() => 'audit'),\n});\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_a.join("apps/qa/src/app/caller-review.ts"),
+        "export function runA(api: any) { return api.review.getEntry.useQuery(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_a.join("apps/qa/src/app/caller-audit.ts"),
+        "export function runB(api: any) { return api.audit.getEntry.useQuery(); }\n",
+    )
+    .unwrap();
+
+    // 6. Multi-repo comment monopoly vs sibling code + multi-scope branch header
+    for i in 1..=10 {
+        fs::write(
+            repo_a.join(format!("apps/qa/src/server/comment_only_{i}.ts")),
+            format!("// CROSS_REPO_TOKEN mentioned only in comment {i}\nexport const c{i} = {i};\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        repo_a.join("tests/scope_only.test.ts"),
+        "export function testScope() { return 'TEST_SCOPED_TERM'; }\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_b.join("src/real_code.ts"),
+        "export function siblingConsumer() {\n  return 'CROSS_REPO_TOKEN';\n}\n",
+    )
+    .unwrap();
+
+    // Warm repo-a
+    let warm = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["stats", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(warm.status.success());
+
+    // Fix #1: Fair water-filling + explicit-slice priority + ultra-long line cap + import collapse
+    let batch = Command::new(bin_path())
+        .args([
+            "outline",
+            "BIG_GUIDE.md:ALL",
+            "pyproject.toml:ALL",
+            "apps/qa/src/server/slice.ts:12-14",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let bs = String::from_utf8_lossy(&batch.stdout);
+    assert!(bs.contains("SLICE_MUST_APPEAR"), "trailing explicit slice must NEVER be dropped:\n{bs}");
+    assert!(bs.contains("chars truncated"), "10KB single line in pyproject.toml should be capped:\n{bs}");
+    assert!(bs.contains("name = \"demo\""), "pyproject.toml content after huge comment must still appear:\n{bs}");
+
+    let imp_col = Command::new(bin_path())
+        .args(["outline", "apps/qa/src/server/slice.ts:ALL", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let ics = String::from_utf8_lossy(&imp_col.stdout);
+    assert!(ics.contains("[imports collapsed: L1-10"), "expected collapsed imports in :ALL, got:\n{ics}");
+    assert!(ics.contains("SLICE_MUST_APPEAR"), "got:\n{ics}");
+
+    // Fix #2: 620 KB schema.prisma appears in `files`, `grep --code`, AND `grep --non-code`!
+    let f_prisma = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["files", "--filter", r"schema\.prisma", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&f_prisma.stdout).contains("packages/schema/prisma/schema.prisma"),
+        "620KB schema.prisma must appear in `files`, got:\n{}",
+        String::from_utf8_lossy(&f_prisma.stdout)
+    );
+    for flag in ["--code", "--non-code"] {
+        let g_pr = Command::new(bin_path())
+            .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+            .args([
+                "grep",
+                "TargetSchemaRecord",
+                flag,
+                "--root",
+                repo_a.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        let gs = String::from_utf8_lossy(&g_pr.stdout);
+        assert!(
+            gs.contains("packages/schema/prisma/schema.prisma"),
+            "schema.prisma must be searchable under grep {flag}, got:\n{gs}"
+        );
+    }
+
+    // Fix #3a: `files apps/qa --limit 4` rolls up into `apps/qa/src/app/` and `apps/qa/src/server/`, NEVER `apps/`!
+    let f_qa = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["files", "apps/qa", "--limit", "4", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let fqs = String::from_utf8_lossy(&f_qa.stdout);
+    assert!(
+        fqs.contains("apps/qa/src/app/") && fqs.contains("apps/qa/src/server/"),
+        "files apps/qa must roll up to children (not parent apps/), got:\n{fqs}"
+    );
+    assert!(!fqs.contains("qa-extra"), "files apps/qa must not leak apps/qa-extra:\n{fqs}");
+
+    // Fix #3b: `files /abs/path/to/repo-b` from parent `base` dir auto-roots to `repo-b/.git`!
+    let f_abs = Command::new(bin_path())
+        .current_dir(&base)
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["files", repo_b.to_str().unwrap(), "--filter", "real_code"])
+        .output()
+        .unwrap();
+    let fas = String::from_utf8_lossy(&f_abs.stdout);
+    let fae = String::from_utf8_lossy(&f_abs.stderr);
+    assert!(fas.contains("src/real_code.ts"), "positional repo dir in files should work:\n{fas}\nstderr:\n{fae}");
+    assert!(fae.contains("Indexed 1 files"), "must index ONLY repo-b (1 file), not parent:\n{fae}");
+
+    // Fix #4a: Export-first `outline` on giant router surfaces `mainRouter` despite 250 private helpers before it!
+    let exp_out = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/qa/src/server/giant-router.ts",
+            "--max-chars",
+            "4000",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let eos = String::from_utf8_lossy(&exp_out.stdout);
+    assert!(eos.contains("mainRouter"), "export-first outline must surface exported mainRouter:\n{eos}");
+
+    // Fix #4b: Multi-root `grep` reserves per-repo slots so repo-b appears even with 10 comment files in repo-a!
+    let g_multi = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "CROSS_REPO_TOKEN",
+            "--limit",
+            "4",
+            "--root",
+            repo_a.to_str().unwrap(),
+            "--root",
+            repo_b.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gms = String::from_utf8_lossy(&g_multi.stdout);
+    assert!(gms.contains("repo-b/src/real_code.ts"), "multi-root grep must include sibling repo-b:\n{gms}");
+
+    // Fix #4c: `--inventory` includes enclosing symbol names & multi-scope branch split shows `code/non-code/tests`
+    let g_inv = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "SLICE_MUST_APPEAR",
+            "--inventory",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gis = String::from_utf8_lossy(&g_inv.stdout);
+    assert!(
+        gis.contains("apps/qa/src/server/slice.ts (1): importantSlice"),
+        "expected inventory format with enclosing symbol, got:\n{gis}"
+    );
+
+    let g_scopes = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "NEVER_EXISTS_ZZZ|TEST_SCOPED_TERM",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gsc = String::from_utf8_lossy(&g_scopes.stdout);
+    assert!(
+        gsc.contains("NEVER_EXISTS_ZZZ: 0/0/0") && gsc.contains("TEST_SCOPED_TERM: 0/0/1"),
+        "expected code/non-code/tests branch split, got:\n{gsc}"
+    );
+
+    // Fix #4d: Receiver-qualified `callers review.getEntry` excludes `audit.getEntry`!
+    let c_recv = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "callers",
+            "review.getEntry",
+            "--no-noncode",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let crs = String::from_utf8_lossy(&c_recv.stdout);
+    assert!(crs.contains("caller-review.ts") && !crs.contains("caller-audit.ts"), "receiver-qualified callers failed:\n{crs}");
+
+    let _ = fs::remove_dir_all(&base);
+}

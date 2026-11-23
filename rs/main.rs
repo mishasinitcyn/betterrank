@@ -1,6 +1,6 @@
 use betterrank::cache::CodeIndex;
 use betterrank::noncode::{ranked_grep, GrepOpts};
-use betterrank::outline::{build_outline, parse_line_range, OutlineOpts};
+use betterrank::outline::{apply_max_chars, build_outline, parse_line_range, OutlineOpts};
 use betterrank::query::{
     cmd_callees, cmd_callers, cmd_context, cmd_dependents, cmd_deps, cmd_diff, cmd_files,
     cmd_history, cmd_map, cmd_neighborhood, cmd_orphans, cmd_search, cmd_stats, cmd_structure,
@@ -190,9 +190,11 @@ fn parse_flags(args: &[String]) -> Flags {
                         | "no-comments"
                         | "collapse-imports"
                         | "show-imports"
+                        | "with-imports"
                         | "full"
                         | "include-tests"
                         | "include-data"
+                        | "all-scopes"
                         | "no-tests"
                         | "no-imports"
                         | "no-source"
@@ -200,6 +202,7 @@ fn parse_flags(args: &[String]) -> Flags {
                         | "non-code"
                         | "code"
                         | "files-only"
+                        | "inventory"
                         | "compact"
                         | "dirs"
                         | "all"
@@ -476,23 +479,19 @@ fn main() {
             None
         };
 
-        let mut remaining_chars = max_chars;
-        let mut sections: Vec<String> = Vec::with_capacity(targets.len());
-        let mut skipped_targets: Vec<String> = Vec::new();
+        let show_imports = flags.has("show-imports") || flags.has("with-imports");
+        let cap_long_lines = max_chars.is_some();
+        let multi_target = targets.len() > 1;
+
+        struct RenderedTarget {
+            rel_path: String,
+            text: String,
+            is_explicit_slice: bool,
+        }
+
+        let mut rendered: Vec<RenderedTarget> = Vec::with_capacity(targets.len());
 
         for (file_arg, expand_syms) in &targets {
-            if let Some(rem) = remaining_chars {
-                if rem < 120 && !sections.is_empty() {
-                    let spec = if expand_syms.is_empty() {
-                        file_arg.clone()
-                    } else {
-                        format!("{file_arg}:{}", expand_syms.join(","))
-                    };
-                    skipped_targets.push(spec);
-                    continue;
-                }
-            }
-
             let Some(abs_path) = try_resolve_outline_file(file_arg, &roots, &cwd) else {
                 eprintln!("Cannot read file: {file_arg}");
                 if targets.len() == 1 {
@@ -508,10 +507,20 @@ fn main() {
                 continue;
             };
 
-            let matched_root = roots
-                .iter()
-                .find(|r| abs_path.strip_prefix(r).is_ok())
-                .unwrap_or(&roots[0]);
+            // When `--root` was omitted on cross-repo multi-file batches, resolve each file's
+            // own enclosing `.git` root cleanly so paths stay repo-relative & short!
+            let per_file_root: PathBuf;
+            let matched_root: &Path = if let Some(r) =
+                roots.iter().find(|r| abs_path.strip_prefix(r).is_ok())
+            {
+                r.as_path()
+            } else if flags.roots.is_empty() {
+                per_file_root = find_default_root(abs_path.parent().unwrap_or(&cwd));
+                per_file_root.as_path()
+            } else {
+                roots[0].as_path()
+            };
+
             let rel_path = normalize_slashes(
                 &abs_path
                     .strip_prefix(matched_root)
@@ -524,7 +533,7 @@ fn main() {
                     let pfx = idx
                         .roots
                         .iter()
-                        .find(|r| &r.path == matched_root)
+                        .find(|r| r.path.as_path() == matched_root)
                         .map(|r| r.prefix.as_str())
                         .unwrap_or("");
                     format!("{pfx}/{rel_path}")
@@ -533,6 +542,10 @@ fn main() {
                 };
                 get_caller_counts_for_file(mmap.archived(), &gpath)
             });
+
+            // Explicit small line ranges / symbol slices get priority over `:ALL` full-file dumps
+            let is_explicit_slice = !expand_syms.is_empty()
+                && !expand_syms.iter().any(|s| s.eq_ignore_ascii_case("ALL"));
 
             let out = build_outline(
                 &source,
@@ -545,33 +558,171 @@ fn main() {
                     depth,
                     explicit_depth,
                     collapse_imports,
-                    show_imports: flags.has("show-imports"),
+                    show_imports,
                     full_skeleton: flags.has("full"),
                     filter: filter_pat,
                     around: around_pat,
                     around_context: around_ctx,
                     full_under,
-                    max_chars: remaining_chars,
+                    // For multi-target batches, apply fair water-filling allocation below instead
+                    // of letting target #1 greedily starve trailing targets to 0 lines!
+                    max_chars: if multi_target { None } else { max_chars },
+                    cap_long_lines,
                 },
             );
-            if let Some(rem) = remaining_chars {
-                remaining_chars = Some(rem.saturating_sub(out.len() + 2));
+            rendered.push(RenderedTarget {
+                rel_path,
+                text: out,
+                is_explicit_slice,
+            });
+        }
+
+        if rendered.is_empty() {
+            return;
+        }
+
+        if !multi_target {
+            println!("{}", rendered[0].text);
+            return;
+        }
+
+        let sections: Vec<String> = if let Some(total_budget) = max_chars {
+            let total_len: usize = rendered.iter().map(|r| r.text.len() + 2).sum();
+            if total_len <= total_budget {
+                rendered.into_iter().map(|r| r.text).collect()
+            } else {
+                let n = rendered.len();
+                let mut alloc = vec![0usize; n];
+                let mut assigned = vec![false; n];
+                let usable = total_budget.saturating_sub(n * 2);
+
+                // Water-fill helper: allocates `pool` fairly across `indices`, giving short targets
+                // 100% of what they need and redistributing unused bytes to larger targets!
+                let water_fill = |indices: &[usize],
+                                  pool: usize,
+                                  rendered: &[RenderedTarget],
+                                  alloc: &mut [usize],
+                                  assigned: &mut [bool]|
+                 -> usize {
+                    let mut rem = pool;
+                    loop {
+                        let pending: Vec<usize> = indices
+                            .iter()
+                            .copied()
+                            .filter(|&i| !assigned[i])
+                            .collect();
+                        if pending.is_empty() || rem == 0 {
+                            break;
+                        }
+                        let share = (rem / pending.len()).max(1);
+                        let mut any_fit = false;
+                        for &i in &pending {
+                            if rendered[i].text.len() <= share {
+                                alloc[i] = rendered[i].text.len();
+                                assigned[i] = true;
+                                rem = rem.saturating_sub(alloc[i]);
+                                any_fit = true;
+                            }
+                        }
+                        if !any_fit {
+                            for &i in &pending {
+                                alloc[i] = share;
+                                assigned[i] = true;
+                                rem = rem.saturating_sub(share);
+                            }
+                            break;
+                        }
+                    }
+                    rem
+                };
+
+                let prio_idxs: Vec<usize> = (0..n)
+                    .filter(|&i| rendered[i].is_explicit_slice)
+                    .collect();
+                let other_idxs: Vec<usize> = (0..n)
+                    .filter(|&i| !rendered[i].is_explicit_slice)
+                    .collect();
+
+                if !prio_idxs.is_empty() && !other_idxs.is_empty() {
+                    // Reserve a modest floor for `:ALL` targets while prioritizing explicit slices first
+                    let floor_other = (usable / n).min(1_500) * other_idxs.len();
+                    let prio_pool = usable.saturating_sub(floor_other);
+                    let leftover = water_fill(&prio_idxs, prio_pool, &rendered, &mut alloc, &mut assigned);
+                    let other_pool = floor_other + leftover;
+                    let _ = water_fill(&other_idxs, other_pool, &rendered, &mut alloc, &mut assigned);
+                } else {
+                    let all_idxs: Vec<usize> = (0..n).collect();
+                    let _ = water_fill(&all_idxs, usable, &rendered, &mut alloc, &mut assigned);
+                }
+
+                rendered
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| apply_max_chars(r.text, &r.rel_path, Some(alloc[i].max(200))))
+                    .collect()
             }
-            sections.push(out);
-        }
+        } else {
+            rendered.into_iter().map(|r| r.text).collect()
+        };
 
-        if !skipped_targets.is_empty() {
-            let cap_label = max_chars.unwrap_or(DEFAULT_NON_TTY_MAX_CHARS);
-            sections.push(format!(
-                "... (stopped at --max-chars {cap_label} — next: betterrank outline {})",
-                skipped_targets.join(" ")
-            ));
-        }
-
-        if !sections.is_empty() {
-            println!("{}", sections.join("\n\n"));
-        }
+        println!("{}", sections.join("\n\n"));
         return;
+    }
+
+    // Auto-detect `.git` roots for `files` when positional args are existing directories on disk
+    // (e.g. `betterrank files /agent/repos/repo-a --depth 2 --filter ...` without `--root`),
+    // avoiding accidentally indexing a parent multi-repo workspace!
+    let mut files_positional_override: Option<Vec<String>> = None;
+    let mut files_auto_roots: Vec<PathBuf> = Vec::new();
+    if command == "files" && flags.roots.is_empty() && !flags.positional.is_empty() {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut detected_any_dir = false;
+        let mut resolved_dirs: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for arg in &flags.positional {
+            let p = Path::new(arg);
+            let probe = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            };
+            if probe.is_dir() {
+                if let Some(root) = find_root_for_existing_path(&probe) {
+                    let canon_dir = fs::canonicalize(&probe).unwrap_or(probe);
+                    let canon_root = fs::canonicalize(&root).unwrap_or(root);
+                    if !files_auto_roots.contains(&canon_root) {
+                        files_auto_roots.push(canon_root.clone());
+                    }
+                    resolved_dirs.push((canon_dir, canon_root));
+                    detected_any_dir = true;
+                }
+            }
+        }
+        if detected_any_dir && resolved_dirs.len() == flags.positional.len() {
+            let multi = files_auto_roots.len() > 1;
+            let norm_roots = betterrank::walk::normalize_roots(&files_auto_roots);
+            let mut rewritten: Vec<String> = Vec::new();
+            for (canon_dir, canon_root) in resolved_dirs {
+                let rel = canon_dir
+                    .strip_prefix(&canon_root)
+                    .ok()
+                    .map(|r| normalize_slashes(&r.to_string_lossy()))
+                    .unwrap_or_default();
+                if multi {
+                    if let Some(re) = norm_roots.iter().find(|r| r.path == canon_root) {
+                        if rel.is_empty() {
+                            rewritten.push(re.prefix.clone());
+                        } else {
+                            rewritten.push(format!("{}/{rel}", re.prefix));
+                        }
+                    }
+                } else if !rel.is_empty() {
+                    rewritten.push(rel);
+                }
+            }
+            files_positional_override = Some(rewritten);
+        } else {
+            files_auto_roots.clear();
+        }
     }
 
     // For file-targeted commands, auto-detect `.git` root from the target file when `--root` is omitted.
@@ -589,7 +740,11 @@ fn main() {
         _ => None,
     };
 
-    let raw_roots = resolve_roots(&flags, target_file_hint);
+    let raw_roots = if !files_auto_roots.is_empty() {
+        files_auto_roots
+    } else {
+        resolve_roots(&flags, target_file_hint)
+    };
     let idx = CodeIndex::new(&raw_roots);
     let count_only = flags.has("count");
     let offset = flags.get_usize("offset").unwrap_or(0);
@@ -654,7 +809,9 @@ fn main() {
             .map(|p| normalize_slashes(p))
             .collect();
         let no_tests_explicit = flags.has("no-tests");
-        let include_tests = flags.has("include-tests") && !no_tests_explicit;
+        let all_scopes = flags.has("all-scopes");
+        let include_tests = (flags.has("include-tests") || all_scopes) && !no_tests_explicit;
+        let files_only = flags.has("files-only") || flags.has("inventory");
         let max_chars = effective_max_chars(&flags);
         let opts = GrepOpts {
             case_insensitive: flags.has("case-insensitive"),
@@ -663,13 +820,13 @@ fn main() {
             noncode_only: flags.has("non-code"),
             code_only: flags.has("code"),
             include_tests,
-            include_data: flags.has("include-data"),
+            include_data: flags.has("include-data") || all_scopes,
             no_tests_explicit,
             no_imports: flags.has("no-imports"),
             no_comments: flags.has("no-comments"),
-            files_only: flags.has("files-only"),
+            files_only,
             compact: flags.has("compact"),
-            limit_files: user_limit.unwrap_or(30),
+            limit_files: user_limit.unwrap_or(if files_only { 200 } else { 30 }),
             max_per_file: flags.get_usize("max-per-file").unwrap_or(5),
             user_max_per_file: flags.get("max-per-file").is_some(),
             before_context: before_ctx,
@@ -707,13 +864,29 @@ fn main() {
                     return;
                 }
                 let mut emitted_chars = 0usize;
-                if !res.branch_counts.is_empty() {
-                    let summary: Vec<String> = res
-                        .branch_counts
+                if !res.branch_scope_counts.is_empty() {
+                    let has_multi_scope = res
+                        .branch_scope_counts
                         .iter()
-                        .map(|(b, c)| format!("{b}: {c}"))
-                        .collect();
-                    let line = format!("Pattern matches (files): {}", summary.join(" | "));
+                        .any(|&(_, _, nc, t)| nc > 0 || t > 0);
+                    let line = if has_multi_scope || all_scopes {
+                        let summary: Vec<String> = res
+                            .branch_scope_counts
+                            .iter()
+                            .map(|(b, c, nc, t)| format!("{b}: {c}/{nc}/{t}"))
+                            .collect();
+                        format!(
+                            "Pattern matches (files, code/non-code/tests): {}",
+                            summary.join(" | ")
+                        )
+                    } else {
+                        let summary: Vec<String> = res
+                            .branch_counts
+                            .iter()
+                            .map(|(b, c)| format!("{b}: {c}"))
+                            .collect();
+                        format!("Pattern matches (files): {}", summary.join(" | "))
+                    };
                     emitted_chars += line.len() + 1;
                     println!("{line}");
                 }
@@ -738,7 +911,19 @@ fn main() {
                 for fh in &res.hits {
                     let mut block = String::new();
                     if opts.files_only {
-                        block.push_str(&format!("{}  ({} matches)\n", fh.file, fh.total_hits_in_file));
+                        if !fh.enclosing_syms.is_empty() {
+                            block.push_str(&format!(
+                                "{} ({}): {}\n",
+                                fh.file,
+                                fh.total_hits_in_file,
+                                fh.enclosing_syms.join(", ")
+                            ));
+                        } else {
+                            block.push_str(&format!(
+                                "{} ({})\n",
+                                fh.file, fh.total_hits_in_file
+                            ));
+                        }
                     } else if opts.compact {
                         let line_nums: Vec<String> = fh
                             .hits
@@ -902,9 +1087,12 @@ fn main() {
         }
         "files" => {
             let files_limit = user_limit.unwrap_or(200);
+            let pats = files_positional_override
+                .as_deref()
+                .unwrap_or(&flags.positional);
             cmd_files(
                 g,
-                &flags.positional,
+                pats,
                 flags.get("filter"),
                 flags.has("code"),
                 flags.has("non-code"),

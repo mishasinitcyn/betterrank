@@ -34,6 +34,25 @@ pub struct OutlineOpts<'a> {
     pub around_context: usize,
     pub full_under: Option<usize>,
     pub max_chars: Option<usize>,
+    /// When true (default in budgeted non-TTY output), cap individual ultra-long lines (>500 chars)
+    /// so a single 10 KB comment line cannot consume the entire output budget.
+    pub cap_long_lines: bool,
+}
+
+fn format_source_line(line: &str, cap_long_lines: bool) -> std::borrow::Cow<'_, str> {
+    const MAX_LINE_CHARS: usize = 500;
+    if !cap_long_lines || line.len() <= MAX_LINE_CHARS {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let char_count = line.chars().count();
+    if char_count <= MAX_LINE_CHARS {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let prefix: String = line.chars().take(MAX_LINE_CHARS).collect();
+    std::borrow::Cow::Owned(format!(
+        "{prefix}... (+{} chars truncated — pass --max-chars 0 for full line)",
+        char_count - MAX_LINE_CHARS
+    ))
 }
 
 fn parse_header_end_line(line: &str) -> Option<(String, u32)> {
@@ -55,7 +74,7 @@ fn parse_numbered_line(line: &str) -> Option<u32> {
     prefix.trim().parse::<u32>().ok()
 }
 
-fn apply_max_chars(s: String, file_path: &str, max_chars: Option<usize>) -> String {
+pub fn apply_max_chars(s: String, file_path: &str, max_chars: Option<usize>) -> String {
     let Some(limit) = max_chars else {
         return s;
     };
@@ -186,6 +205,7 @@ fn structured_config_outline(
     file_path: &str,
     ext: &str,
     filter: Option<&str>,
+    depth_opt: Option<u32>,
 ) -> Option<String> {
     let lower_ext = ext.to_ascii_lowercase();
     if !matches!(lower_ext.as_str(), ".json" | ".yml" | ".yaml" | ".toml") {
@@ -247,7 +267,7 @@ fn structured_config_outline(
             }
         }
     } else {
-        // JSON: track brace depth / shallow indentation (2 or 4 spaces)
+        // JSON: track brace depth / shallow indentation (level 0 = depth 1, level 1 = depth 2)
         let mut depth: i32 = 0;
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
@@ -292,30 +312,47 @@ fn structured_config_outline(
     }
 
     let total_lines = lines.len() as u32;
-    let mut rows: Vec<String> = Vec::new();
-    for idx in 0..entries.len() {
-        let (start, level, ref label) = entries[idx];
-        if !matches_filter(label) {
-            continue;
-        }
-        // Estimate end line as next entry at same or shallower level - 1
-        let mut end = total_lines;
-        for next in &entries[idx + 1..] {
-            if next.1 <= level {
-                end = next.0.saturating_sub(1).max(start);
-                break;
+    let build_rows = |max_level: usize| -> Vec<String> {
+        let mut rows: Vec<String> = Vec::new();
+        for idx in 0..entries.len() {
+            let (start, level, ref label) = entries[idx];
+            if level > max_level || !matches_filter(label) {
+                continue;
             }
+            let mut end = total_lines;
+            for next in &entries[idx + 1..] {
+                if next.1 <= level {
+                    end = next.0.saturating_sub(1).max(start);
+                    break;
+                }
+            }
+            let indent = if level == 0 { "  " } else { "    " };
+            let range = if end > start {
+                format!("L{start}-{end}")
+            } else {
+                format!("L{start}")
+            };
+            rows.push(format!("{indent}{range:<12} {label}"));
         }
-        let indent = if level == 0 { "  " } else { "    " };
-        let range = if end > start {
-            format!("L{start}-{end}")
-        } else {
-            format!("L{start}")
-        };
-        rows.push(format!("{indent}{range:<12} {label}"));
+        rows
+    };
+
+    let req_max_level = match depth_opt {
+        Some(1) => 0usize,
+        _ => 1usize,
+    };
+    let mut rows = build_rows(req_max_level);
+    let mut collapsed_to_top = false;
+    let est_bytes: usize = rows.iter().map(|r| r.len() + 1).sum();
+    if req_max_level > 0 && filter.is_none() && est_bytes > 12_000 {
+        let top_rows = build_rows(0);
+        if !top_rows.is_empty() && top_rows.len() < rows.len() {
+            rows = top_rows;
+            collapsed_to_top = true;
+        }
     }
 
-    let mut out = Vec::with_capacity(rows.len() + 2);
+    let mut out = Vec::with_capacity(rows.len() + 3);
     out.push(format!(
         "{file_path} ({} lines, {} keys — pass :ALL or Lstart-end to expand):",
         lines.len(),
@@ -325,6 +362,12 @@ fn structured_config_outline(
         out.push("  (no keys matched --filter)".to_string());
     } else {
         out.extend(rows);
+        if collapsed_to_top {
+            out.push(
+                "  (large config: showing top-level keys only — use --filter <regex> or --depth 2)"
+                    .to_string(),
+            );
+        }
     }
     Some(out.join("\n"))
 }
@@ -365,7 +408,14 @@ fn build_outline_inner(
                 ext,
             );
         }
-        return raw_view(&lines, file_path, pad, opts.line_range);
+        return raw_view(
+            &lines,
+            file_path,
+            pad,
+            opts.line_range,
+            opts.show_imports,
+            opts.cap_long_lines,
+        );
     }
 
     // Fast path: if all expand targets are explicit line ranges (e.g. `outline schema.prisma 100-140,800-830`),
@@ -383,6 +433,8 @@ fn build_outline_inner(
             pad,
             opts.line_range,
             opts.no_comments,
+            opts.show_imports,
+            opts.cap_long_lines,
             ext,
         );
     }
@@ -406,7 +458,14 @@ fn build_outline_inner(
     // `--full-under N`: return full file when line count <= N and no symbols/ranges requested
     if let Some(n) = opts.full_under {
         if expand_symbols.is_empty() && opts.filter.is_none() && lines.len() <= n {
-            return raw_view(&lines, file_path, pad, opts.line_range);
+            return raw_view(
+                &lines,
+                file_path,
+                pad,
+                opts.line_range,
+                opts.show_imports,
+                opts.cap_long_lines,
+            );
         }
     }
 
@@ -420,20 +479,41 @@ fn build_outline_inner(
         || opts.collapse_imports
         || opts.full_skeleton;
     if opts.line_range.is_some() && expand_symbols.is_empty() && !wants_folded {
-        return raw_view(&lines, file_path, pad, opts.line_range);
+        return raw_view(
+            &lines,
+            file_path,
+            pad,
+            opts.line_range,
+            opts.show_imports,
+            opts.cap_long_lines,
+        );
     }
 
     if !is_supported_extension(file_path) {
         if expand_symbols.is_empty()
             && !opts.full_skeleton
             && opts.line_range.is_none()
-            && lines.len() > 60
+            && lines.len() > 40
         {
-            if let Some(cfg_out) = structured_config_outline(&lines, file_path, ext, opts.filter) {
+            let depth_opt = if opts.explicit_depth {
+                Some(depth)
+            } else {
+                None
+            };
+            if let Some(cfg_out) =
+                structured_config_outline(&lines, file_path, ext, opts.filter, depth_opt)
+            {
                 return cfg_out;
             }
         }
-        return raw_view(&lines, file_path, pad, opts.line_range);
+        return raw_view(
+            &lines,
+            file_path,
+            pad,
+            opts.line_range,
+            opts.show_imports,
+            opts.cap_long_lines,
+        );
     }
 
     let parsed = match parse_file(
@@ -446,7 +526,16 @@ fn build_outline_inner(
         },
     ) {
         Some(p) if !p.definitions.is_empty() => p,
-        _ => return raw_view(&lines, file_path, pad, opts.line_range),
+        _ => {
+            return raw_view(
+                &lines,
+                file_path,
+                pad,
+                opts.line_range,
+                opts.show_imports,
+                opts.cap_long_lines,
+            )
+        }
     };
 
     let kind_priority = |k: u8| -> u8 {
@@ -521,6 +610,8 @@ fn build_outline_inner(
             pad,
             opts.line_range,
             opts.no_comments,
+            opts.show_imports,
+            opts.cap_long_lines,
             ext,
         );
     }
@@ -583,7 +674,7 @@ fn compact_outline_mode(
         parent_of[i] = best_parent;
     }
 
-    let render_rows = |only_top: bool| -> Vec<String> {
+    let render_rows = |only_top: bool| -> Vec<(String, bool)> {
         let mut rows = Vec::new();
         for (i, def) in defs.iter().enumerate() {
             let d = depth_of[i];
@@ -644,20 +735,42 @@ fn compact_outline_mode(
                     }
                 }
             }
-            rows.push(row);
+            let is_exp = def.exported
+                || parent_of[i].map_or(false, |p| defs[p].exported)
+                || def.signature.trim_start().starts_with("export ");
+            rows.push((row, is_exp));
         }
         rows
     };
 
+    let budget_bytes = match opts.max_chars {
+        Some(0) => usize::MAX,
+        Some(n) => n.saturating_sub(300).max(2_000),
+        None => 16_000usize,
+    };
+
     let mut rows = render_rows(top_level_only);
-    let mut auto_folded_nested = false;
-    // Guard against huge 15K+ line files blowing the 20 KB shell buffer in default compact mode
-    let est_bytes: usize = rows.iter().map(|r| r.len() + 1).sum();
-    if !top_level_only && opts.filter.is_none() && opts.max_chars.is_none() && est_bytes > 16_000 {
-        let top_rows = render_rows(true);
-        if !top_rows.is_empty() && top_rows.len() < rows.len() {
-            rows = top_rows;
-            auto_folded_nested = true;
+    let mut exported_first = false;
+    let est_bytes: usize = rows.iter().map(|(r, _)| r.len() + 1).sum();
+
+    // On huge files that would exceed the output budget, prioritize exported symbols (and their
+    // router/class members) first so private helpers at the top never bury the exported API!
+    if opts.filter.is_none() && est_bytes > budget_bytes {
+        let has_exp = rows.iter().any(|(_, e)| *e);
+        let has_priv = rows.iter().any(|(_, e)| !*e);
+        if has_exp && has_priv {
+            let mut exp_rows: Vec<(String, bool)> = Vec::new();
+            let mut priv_rows: Vec<(String, bool)> = Vec::new();
+            for item in rows {
+                if item.1 {
+                    exp_rows.push(item);
+                } else {
+                    priv_rows.push(item);
+                }
+            }
+            exp_rows.extend(priv_rows);
+            rows = exp_rows;
+            exported_first = true;
         }
     }
 
@@ -667,6 +780,12 @@ fn compact_outline_mode(
             "{file_path} ({} lines, {} of {} symbols matching \"{pat}\"):",
             lines.len(),
             rows.len(),
+            defs.len()
+        ));
+    } else if exported_first {
+        out.push(format!(
+            "{file_path} ({} lines, {} symbols — exported symbols first):",
+            lines.len(),
             defs.len()
         ));
     } else {
@@ -689,16 +808,15 @@ fn compact_outline_mode(
     if rows.is_empty() && opts.filter.is_some() {
         out.push("  (no symbols matched --filter)".to_string());
     } else {
-        // If STILL > 16 KB (e.g. hundreds of top-level symbols) without explicit --max-chars or --filter, cap cleanly
-        let cap_bytes = if opts.filter.is_none() && opts.max_chars.is_none() {
-            16_000usize
+        let cap_bytes = if opts.filter.is_none() {
+            budget_bytes
         } else {
             usize::MAX
         };
         let mut used_bytes = 0usize;
         let total_rows = rows.len();
         let mut shown_rows = 0usize;
-        for row in rows {
+        for (row, _) in rows {
             if used_bytes + row.len() + 1 > cap_bytes && shown_rows > 0 {
                 break;
             }
@@ -708,30 +826,88 @@ fn compact_outline_mode(
         }
         if shown_rows < total_rows {
             out.push(format!(
-                "  ... (+{} more symbols — use --filter <regex> or --full)",
+                "  ... (+{} more symbols — use --filter <regex>, --depth 1, or --max-chars 0)",
                 total_rows - shown_rows
             ));
-        } else if auto_folded_nested {
-            out.push(
-                "  (large file: showing top-level symbols only — use --filter <regex> or --full for nested members)"
-                    .to_string(),
-            );
         }
     }
 
     out.join("\n")
 }
 
-fn raw_view(lines: &[&str], file_path: &str, pad: usize, line_range: Option<(u32, u32)>) -> String {
+fn emit_line_range(
+    out: &mut Vec<String>,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    pad: usize,
+    no_comments: bool,
+    comment_lines: &FxHashSet<u32>,
+    show_imports: bool,
+    cap_long_lines: bool,
+) {
+    // Collapse large top-of-file import blocks (>= 6 lines) by default in `:ALL` / `L1-...` slices
+    // unless `--show-imports` is passed OR the requested range ends inside the import block!
+    let imp_collapse = if !show_imports && start <= 10 {
+        detect_import_block(lines).filter(|imp| {
+            imp.line_count >= 6
+                && (imp.start as usize) >= start
+                && (imp.end as usize) < end
+        })
+    } else {
+        None
+    };
+
+    let mut i = start;
+    while i <= end {
+        if let Some(ref imp) = imp_collapse {
+            if i == imp.start as usize {
+                out.push(format!(
+                    "{}│ ... [imports collapsed: L{}-{} — pass --show-imports to expand]",
+                    " ".repeat(pad),
+                    imp.start,
+                    imp.end
+                ));
+                i = (imp.end as usize) + 1;
+                continue;
+            }
+        }
+        if no_comments && comment_lines.contains(&(i as u32)) {
+            i += 1;
+            continue;
+        }
+        let formatted = format_source_line(lines[i - 1], cap_long_lines);
+        out.push(format!("{:>pad$}│ {formatted}", i, pad = pad));
+        i += 1;
+    }
+}
+
+fn raw_view(
+    lines: &[&str],
+    file_path: &str,
+    pad: usize,
+    line_range: Option<(u32, u32)>,
+    show_imports: bool,
+    cap_long_lines: bool,
+) -> String {
     let start = line_range.map_or(1, |(s, _)| s.max(1)) as usize;
     let end = line_range
         .map_or(lines.len(), |(_, e)| (e as usize).min(lines.len()))
         .min(lines.len());
     let mut out = Vec::with_capacity(end.saturating_sub(start) + 2);
     out.push(format!("── {file_path}:{start}-{end} ──"));
-    for i in start..=end {
-        out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
-    }
+    let empty_comments = FxHashSet::default();
+    emit_line_range(
+        &mut out,
+        lines,
+        start,
+        end,
+        pad,
+        false,
+        &empty_comments,
+        show_imports,
+        cap_long_lines,
+    );
     out.join("\n")
 }
 
@@ -744,6 +920,8 @@ fn expand_mode(
     pad: usize,
     line_range: Option<(u32, u32)>,
     no_comments: bool,
+    show_imports: bool,
+    cap_long_lines: bool,
     ext: &str,
 ) -> String {
     let comment_lines = if no_comments {
@@ -761,12 +939,17 @@ fn expand_mode(
             let start = 1usize;
             let end = lines.len();
             out.push(format!("── {file_path}:{start}-{end} ──"));
-            for i in start..=end {
-                if no_comments && comment_lines.contains(&(i as u32)) {
-                    continue;
-                }
-                out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
-            }
+            emit_line_range(
+                &mut out,
+                lines,
+                start,
+                end,
+                pad,
+                no_comments,
+                &comment_lines,
+                show_imports,
+                cap_long_lines,
+            );
             if batch_mode {
                 out.push(String::new());
             }
@@ -777,12 +960,17 @@ fn expand_mode(
             let start = rs.max(1) as usize;
             let end = (re as usize).min(lines.len());
             out.push(format!("── {file_path}:{start}-{end} ──"));
-            for i in start..=end {
-                if no_comments && comment_lines.contains(&(i as u32)) {
-                    continue;
-                }
-                out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
-            }
+            emit_line_range(
+                &mut out,
+                lines,
+                start,
+                end,
+                pad,
+                no_comments,
+                &comment_lines,
+                show_imports,
+                cap_long_lines,
+            );
             if batch_mode {
                 out.push(String::new());
             }
@@ -836,7 +1024,8 @@ fn expand_mode(
                     ));
                     break;
                 }
-                out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
+                let formatted = format_source_line(lines[i - 1], cap_long_lines);
+                out.push(format!("{:>pad$}│ {formatted}", i, pad = pad));
                 emitted += 1;
             }
             if matches.len() > 1 || batch_mode {

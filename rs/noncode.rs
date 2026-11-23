@@ -257,6 +257,15 @@ fn is_comment_only_line(line: &str) -> bool {
         || t.starts_with("<!--")
 }
 
+pub fn is_schema_or_idl_extension(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    lower.ends_with(".prisma")
+        || lower.ends_with(".sql")
+        || lower.ends_with(".graphql")
+        || lower.ends_with(".gql")
+        || lower.ends_with(".proto")
+}
+
 #[derive(Debug, Clone)]
 pub struct TextFileHits {
     pub file: String,
@@ -264,6 +273,7 @@ pub struct TextFileHits {
     pub total_hits_in_file: usize,
     pub rank_score: f32,
     pub matched_branches: Vec<String>,
+    pub enclosing_syms: Vec<String>,
 }
 
 fn truncate_line(s: &str, max_chars: usize) -> String {
@@ -481,7 +491,7 @@ pub fn find_noncode_mentions_with_pattern(
         roots
             .par_iter()
             .flat_map(|r| {
-                walk_root_parallel(r, &skip_set, 512 * 1024, |rel_str, _| {
+                walk_root_parallel(r, &skip_set, 4 * 1024 * 1024, |rel_str, _| {
                     is_noncode_config_file(rel_str)
                 })
             })
@@ -520,6 +530,7 @@ pub fn find_noncode_mentions_with_pattern(
                 total_hits_in_file: total_in_file,
                 rank_score: priority,
                 matched_branches: Vec::new(),
+                enclosing_syms: Vec::new(),
             })
         })
         .collect();
@@ -639,6 +650,8 @@ pub struct GrepResult {
     pub hidden_test_hits: usize,
     pub path_matched_zero: bool,
     pub branch_counts: Vec<(String, usize)>,
+    /// Per-branch counts split across `(branch_label, code_files, noncode_files, test_files)`
+    pub branch_scope_counts: Vec<(String, usize, usize, usize)>,
     pub repo_counts: Vec<(String, usize)>,
 }
 
@@ -653,15 +666,18 @@ struct GrepSink<'a> {
     max_matches: usize,
     buffer_cap: usize,
     total_matches: usize,
+    total_noncomment: usize,
     captured_matches: usize,
     captured_noncomment: usize,
     no_imports: bool,
     no_comments: bool,
+    collect_inventory_syms: bool,
     branch_regexes: &'a [(String, regex::Regex)],
     seen_branches: Vec<bool>,
     captured_branches: Vec<bool>,
     records: Vec<MatchRecord>,
     hits: Vec<TextMatchLine>,
+    inventory_syms: Vec<String>,
     graph: Option<&'a ArchivedGraphCacheData>,
     file_idx: Option<u32>,
     last_matched_captured: bool,
@@ -682,6 +698,9 @@ impl<'a> Sink for GrepSink<'a> {
             return Ok(true);
         }
         self.total_matches += 1;
+        if !is_comment {
+            self.total_noncomment += 1;
+        }
 
         let mut line_branches = Vec::new();
         let mut introduces_uncaptured_branch = false;
@@ -697,10 +716,30 @@ impl<'a> Sink for GrepSink<'a> {
             }
         }
 
+        let lnum = mat.line_number().unwrap_or(0);
         let want_capture = self.max_matches > 0
             && (self.captured_matches < self.buffer_cap
                 || (!is_comment && self.captured_noncomment < self.max_matches)
                 || introduces_uncaptured_branch);
+
+        // Collect up to 5 unique enclosing symbol names for `--files-only` / `--inventory`
+        let mut resolved_enclosing: Option<String> = None;
+        if self.collect_inventory_syms && self.inventory_syms.len() < 5 {
+            if let (Some(g), Some(fi)) = (self.graph, self.file_idx) {
+                if let Some(enc) = enclosing_symbol_for_line(g, fi, lnum as u32) {
+                    // Strip `in <name> <start>-<end>` -> `<name>` for compact inventory listing
+                    let short = enc
+                        .strip_prefix("in ")
+                        .and_then(|s| s.split_whitespace().next())
+                        .unwrap_or(&enc)
+                        .to_string();
+                    if !short.is_empty() && !self.inventory_syms.contains(&short) {
+                        self.inventory_syms.push(short);
+                    }
+                    resolved_enclosing = Some(enc);
+                }
+            }
+        }
 
         if want_capture {
             self.captured_matches += 1;
@@ -710,11 +749,10 @@ impl<'a> Sink for GrepSink<'a> {
             for &bi in &line_branches {
                 self.captured_branches[bi] = true;
             }
-            let lnum = mat.line_number().unwrap_or(0);
-            let enclosing = match (self.graph, self.file_idx) {
+            let enclosing = resolved_enclosing.or_else(|| match (self.graph, self.file_idx) {
                 (Some(g), Some(fi)) => enclosing_symbol_for_line(g, fi, lnum as u32),
                 _ => None,
-            };
+            });
             self.records.push(MatchRecord {
                 line: lnum,
                 is_comment,
@@ -985,7 +1023,7 @@ pub fn ranked_grep(
                 let eps = exclude_paths.clone();
                 let exts_c = exts.clone();
                 let types_c = types.clone();
-                walk_root_parallel(r, &skip_set, 2 * 1024 * 1024, move |rel_str, graph_path| {
+                walk_root_parallel(r, &skip_set, 4 * 1024 * 1024, move |rel_str, graph_path| {
                     let base = rel_str.rsplit('/').next().unwrap_or(rel_str);
                     if NONCODE_SKIP_FILES
                         .iter()
@@ -996,7 +1034,10 @@ pub fn ranked_grep(
                     if noncode_only && !is_noncode_config_file(rel_str) {
                         return false;
                     }
-                    if code_only && !is_supported_extension(rel_str) {
+                    if code_only
+                        && !is_supported_extension(rel_str)
+                        && !is_schema_or_idl_extension(rel_str)
+                    {
                         return false;
                     }
                     if !matches_ext_filter(rel_str, &exts_c) || !matches_type_filter(rel_str, &types_c)
@@ -1051,12 +1092,15 @@ pub fn ranked_grep(
     struct ScoredMatch {
         file_hits: TextFileHits,
         is_test_or_fix: bool,
+        is_code_file: bool,
+        repo_idx: usize,
         matched_branches: Vec<usize>,
     }
 
     let prefer_code = !noncode_only && types.is_empty();
     let no_imports = opts.no_imports;
     let no_comments = opts.no_comments;
+    let collect_inventory_syms = opts.files_only;
     let num_branches = branch_regexes.len();
     let buffer_cap = (effective_max_per_file * 8).clamp(32, 64);
 
@@ -1090,15 +1134,18 @@ pub fn ranked_grep(
                 max_matches: effective_max_per_file,
                 buffer_cap,
                 total_matches: 0,
+                total_noncomment: 0,
                 captured_matches: 0,
                 captured_noncomment: 0,
                 no_imports,
                 no_comments,
+                collect_inventory_syms,
                 branch_regexes: &branch_regexes,
                 seen_branches: vec![false; num_branches],
                 captured_branches: vec![false; num_branches],
                 records: Vec::new(),
                 hits: Vec::new(),
+                inventory_syms: Vec::new(),
                 graph,
                 file_idx,
                 last_matched_captured: false,
@@ -1129,15 +1176,36 @@ pub fn ranked_grep(
             );
 
             let is_tf = is_test_or_fixture_path(&graph_path);
+            let is_code_file =
+                is_supported_extension(&graph_path) || is_schema_or_idl_extension(&graph_path);
+            let is_dts = graph_path.to_ascii_lowercase().ends_with(".d.ts");
+            let comment_only_file = sink.total_noncomment == 0;
+
             // Rank runtime source code ahead of `.json`/`.md`/`.yaml` unless `--non-code` or `--type` is requested
-            let mut score = if prefer_code && is_supported_extension(&graph_path) {
+            let mut score = if prefer_code && is_code_file {
                 base_score.max(0.0002) + 0.05
             } else {
                 base_score
             };
+            if is_dts {
+                score *= 0.2;
+            }
+            if comment_only_file {
+                score *= 0.25;
+            }
             if is_tf {
                 score *= 0.15;
             }
+
+            let repo_idx = if roots.len() > 1 {
+                roots
+                    .iter()
+                    .position(|r| graph_path.starts_with(&format!("{}/", r.prefix)))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
             Some(ScoredMatch {
                 file_hits: TextFileHits {
                     file: graph_path,
@@ -1145,8 +1213,11 @@ pub fn ranked_grep(
                     total_hits_in_file: sink.total_matches,
                     rank_score: score,
                     matched_branches: matched_branch_names,
+                    enclosing_syms: sink.inventory_syms,
                 },
                 is_test_or_fix: is_tf,
+                is_code_file,
+                repo_idx,
                 matched_branches,
             })
         })
@@ -1158,6 +1229,27 @@ pub fn ranked_grep(
             .total_cmp(&a.file_hits.rank_score)
             .then_with(|| a.file_hits.file.cmp(&b.file_hits.file))
     });
+
+    // Compute per-branch scope counts (code / non-code / tests) across ALL matched files
+    // BEFORE hiding tests, so agents immediately distinguish 0/0/0 from test/doc-only terms!
+    let mut branch_scope_counts: Vec<(String, usize, usize, usize)> = Vec::new();
+    if num_branches >= 2 {
+        let mut sc = vec![(0usize, 0usize, 0usize); num_branches];
+        for item in &all_scored {
+            for &bi in &item.matched_branches {
+                if item.is_test_or_fix {
+                    sc[bi].2 += 1;
+                } else if item.is_code_file {
+                    sc[bi].0 += 1;
+                } else {
+                    sc[bi].1 += 1;
+                }
+            }
+        }
+        for (i, (label, _)) in branch_regexes.iter().enumerate() {
+            branch_scope_counts.push((label.clone(), sc[i].0, sc[i].1, sc[i].2));
+        }
+    }
 
     // Separate prod vs test/fixture unless `--include-tests` (or `--path` explicitly targets tests)
     let mut prod: Vec<ScoredMatch> = Vec::new();
@@ -1187,17 +1279,13 @@ pub fn ranked_grep(
         }
     }
 
-    // Compute per-repo file counts when multiple `--root`s are active (so agents immediately see
-    // which sibling repos had 0 hits without extra follow-up greps!)
+    // Compute per-repo file counts when multiple `--root`s are active
     let mut repo_counts: Vec<(String, usize)> = Vec::new();
     if roots.len() > 1 {
         let mut rcounts = vec![0usize; roots.len()];
         for item in &prod {
-            for (ri, r) in roots.iter().enumerate() {
-                if item.file_hits.file.starts_with(&format!("{}/", r.prefix)) {
-                    rcounts[ri] += 1;
-                    break;
-                }
+            if item.repo_idx < rcounts.len() {
+                rcounts[item.repo_idx] += 1;
             }
         }
         for (ri, r) in roots.iter().enumerate() {
@@ -1208,51 +1296,120 @@ pub fn ranked_grep(
     let total_files = prod.len();
     let total_hits: usize = prod.iter().map(|m| m.file_hits.total_hits_in_file).sum();
 
-    // Rarest-branch-first round-robin selection so a 164-hit noisy term can NEVER starve
-    // a 2-hit rare term inside `--limit` (or even if output stops early under `--max-chars`)!
-    let selected: Vec<TextFileHits> = if num_branches >= 2 && !prod.is_empty() {
-        let cap = if opts.limit_files > 0 {
-            opts.limit_files.min(prod.len())
-        } else {
-            prod.len()
-        };
+    // Fair round-robin selection across BOTH rarest alternation branches AND multiple `--root` repos
+    // so neither a 164-hit noisy term nor a 20K-file monorepo can starve rare terms or sibling repos!
+    let cap = if opts.limit_files > 0 {
+        opts.limit_files.min(prod.len())
+    } else {
+        prod.len()
+    };
+    let multi_repo = roots.len() > 1;
+    let multi_branch = num_branches >= 2;
+
+    let selected: Vec<TextFileHits> = if (multi_branch || multi_repo) && !prod.is_empty() && cap > 0 {
+        let mut chosen_set = vec![false; prod.len()];
+        let mut chosen_indices: Vec<usize> = Vec::with_capacity(cap);
+
+        // Build per-branch buckets (rarest non-empty branch first)
         let mut per_branch: Vec<Vec<usize>> = vec![Vec::new(); num_branches];
-        for (idx, item) in prod.iter().enumerate() {
-            for &bi in &item.matched_branches {
-                per_branch[bi].push(idx);
+        if multi_branch {
+            for (idx, item) in prod.iter().enumerate() {
+                for &bi in &item.matched_branches {
+                    per_branch[bi].push(idx);
+                }
             }
         }
-        // Order non-empty branches from rarest to most common
         let mut branch_order: Vec<usize> = (0..num_branches)
             .filter(|&bi| !per_branch[bi].is_empty())
             .collect();
         branch_order.sort_by_key(|&bi| per_branch[bi].len());
 
-        let mut chosen_set = vec![false; prod.len()];
-        let mut chosen_indices: Vec<usize> = Vec::with_capacity(cap);
-        let mut cursors = vec![0usize; num_branches];
-
-        loop {
-            let mut progressed = false;
-            for &bi in &branch_order {
-                if chosen_indices.len() >= cap {
-                    break;
+        // Build per-repo buckets (rarest non-empty repo first)
+        let mut per_repo: Vec<Vec<usize>> = vec![Vec::new(); roots.len()];
+        if multi_repo {
+            for (idx, item) in prod.iter().enumerate() {
+                if item.repo_idx < per_repo.len() {
+                    per_repo[item.repo_idx].push(idx);
                 }
-                while cursors[bi] < per_branch[bi].len() {
-                    let cand = per_branch[bi][cursors[bi]];
-                    cursors[bi] += 1;
-                    if !chosen_set[cand] {
-                        chosen_set[cand] = true;
-                        chosen_indices.push(cand);
-                        progressed = true;
+            }
+        }
+        let mut repo_order: Vec<usize> = (0..roots.len())
+            .filter(|&ri| !per_repo[ri].is_empty())
+            .collect();
+        repo_order.sort_by_key(|&ri| per_repo[ri].len());
+
+        let mut b_cursors = vec![0usize; num_branches];
+        let mut r_cursors = vec![0usize; roots.len()];
+
+        // Phase 1: if multi-repo, guarantee every non-empty repo gets its top matches first
+        // (up to floor(cap / active_repos), min 2, max 5 per repo in initial reservation)
+        if multi_repo && repo_order.len() > 1 {
+            let reserve_rounds = (cap / repo_order.len()).clamp(1, 4);
+            for _ in 0..reserve_rounds {
+                for &ri in &repo_order {
+                    if chosen_indices.len() >= cap {
                         break;
+                    }
+                    while r_cursors[ri] < per_repo[ri].len() {
+                        let cand = per_repo[ri][r_cursors[ri]];
+                        r_cursors[ri] += 1;
+                        if !chosen_set[cand] {
+                            chosen_set[cand] = true;
+                            chosen_indices.push(cand);
+                            break;
+                        }
                     }
                 }
             }
-            if !progressed || chosen_indices.len() >= cap {
-                break;
+        }
+
+        // Phase 2: rarest-branch-first round-robin (or repo round-robin if single branch)
+        if multi_branch {
+            loop {
+                let mut progressed = false;
+                for &bi in &branch_order {
+                    if chosen_indices.len() >= cap {
+                        break;
+                    }
+                    while b_cursors[bi] < per_branch[bi].len() {
+                        let cand = per_branch[bi][b_cursors[bi]];
+                        b_cursors[bi] += 1;
+                        if !chosen_set[cand] {
+                            chosen_set[cand] = true;
+                            chosen_indices.push(cand);
+                            progressed = true;
+                            break;
+                        }
+                    }
+                }
+                if !progressed || chosen_indices.len() >= cap {
+                    break;
+                }
+            }
+        } else if multi_repo {
+            loop {
+                let mut progressed = false;
+                for &ri in &repo_order {
+                    if chosen_indices.len() >= cap {
+                        break;
+                    }
+                    while r_cursors[ri] < per_repo[ri].len() {
+                        let cand = per_repo[ri][r_cursors[ri]];
+                        r_cursors[ri] += 1;
+                        if !chosen_set[cand] {
+                            chosen_set[cand] = true;
+                            chosen_indices.push(cand);
+                            progressed = true;
+                            break;
+                        }
+                    }
+                }
+                if !progressed || chosen_indices.len() >= cap {
+                    break;
+                }
             }
         }
+
         // Fill any remaining slots in PageRank order
         if chosen_indices.len() < cap {
             for idx in 0..prod.len() {
@@ -1265,7 +1422,6 @@ pub fn ranked_grep(
                 }
             }
         }
-        // Preserve rarest-first round-robin ordering (each branch's own list is already PageRank-sorted!)
         let mut prod_opt: Vec<Option<ScoredMatch>> = prod.into_iter().map(Some).collect();
         chosen_indices
             .into_iter()
@@ -1273,8 +1429,8 @@ pub fn ranked_grep(
             .collect()
     } else {
         let mut v: Vec<TextFileHits> = prod.into_iter().map(|s| s.file_hits).collect();
-        if opts.limit_files > 0 && v.len() > opts.limit_files {
-            v.truncate(opts.limit_files);
+        if cap < v.len() {
+            v.truncate(cap);
         }
         v
     };
@@ -1287,6 +1443,7 @@ pub fn ranked_grep(
         hidden_test_hits,
         path_matched_zero: false,
         branch_counts,
+        branch_scope_counts,
         repo_counts,
     })
 }
