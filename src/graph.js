@@ -3,11 +3,10 @@ const { MultiDirectedGraph } = graphology;
 import pagerankModule from 'graphology-metrics/centrality/pagerank.js';
 const pagerank = pagerankModule.default || pagerankModule;
 import { writeFile, readFile, mkdir } from 'fs/promises';
-import { dirname, posix } from 'path';
+import { dirname, posix, basename } from 'path';
 import { gzipSync, gunzipSync } from 'zlib';
+import { getLanguageFamily } from './parser.js';
 
-// Max definitions for a name before cross-file wiring is skipped entirely
-// (when no explicit import connects source -> target).
 const AMBIGUITY_CAP = 5;
 
 const IMPORT_RESOLVE_EXTENSIONS = [
@@ -34,14 +33,14 @@ const METHOD_NOISE_NAMES = new Set([
   'trimStart', 'trimEnd', 'replace', 'replaceAll', 'match', 'matchAll',
   'startsWith', 'endsWith', 'toLowerCase', 'toUpperCase', 'substring', 'substr',
   'keys', 'values', 'entries', 'from', 'of', 'isArray', 'assign', 'freeze',
-  'then', 'catch', 'finally', 'bind', 'call', 'apply',
+  'then', 'catch', 'finally', 'bind', 'call', 'apply', 'resolve', 'reject',
   'get', 'set', 'has', 'add', 'delete', 'clear', 'size', 'length', 'prototype',
   'log', 'warn', 'error', 'info', 'debug', 'trace',
   'json', 'text', 'blob', 'arrayBuffer', 'clone', 'headers', 'status',
   'all', 'first', 'run', 'exec', 'test', 'sort', 'reverse', 'fill',
   'emit', 'on', 'off', 'once', 'addEventListener', 'removeEventListener',
   'preventDefault', 'stopPropagation', 'stringify', 'parse', 'append', 'close',
-  'open', 'start', 'stop', 'init', 'copy',
+  'open', 'start', 'stop', 'init', 'copy', 'setdefault', 'update', 'items',
   '__init__', '__repr__', '__str__', '__eq__', '__hash__', '__len__',
   '__iter__', '__next__', '__enter__', '__exit__', '__getitem__', '__setitem__',
 ]);
@@ -61,8 +60,30 @@ const CODE_TO_KIND = Object.fromEntries(
   Object.entries(KIND_TO_CODE).map(([k, v]) => [v, k]),
 );
 
+function encodeKind(kind, exported) {
+  const code = KIND_TO_CODE[kind] || 'o';
+  return exported ? code.toUpperCase() : code;
+}
+
+function decodeKind(code) {
+  if (!code) return { kind: 'other', exported: true };
+  const lower = code.toLowerCase();
+  return {
+    kind: CODE_TO_KIND[lower] || 'other',
+    exported: code !== lower,
+  };
+}
+
 function normalizeFilePath(filePath) {
   return filePath.replace(/\\/g, '/');
+}
+
+function isPythonFile(filePath) {
+  return normalizeFilePath(filePath).endsWith('.py');
+}
+
+function isJsFamilyFile(filePath) {
+  return getLanguageFamily(filePath) === 'js';
 }
 
 function buildDefinitionIndex(graph) {
@@ -89,8 +110,8 @@ function buildFileLookup(graph) {
 }
 
 /**
- * Build a lookup of direct (1-hop) and barrel-forwarded (2-hop) imported files
- * for each file node so reference wiring can prefer explicitly imported targets.
+ * Build import reachability helper with BFS up to `maxHops` along explicit
+ * `IMPORTS` edges (captures direct imports + barrel/workspace re-export chains).
  */
 function buildImportReachability(graph) {
   const directImports = new Map();
@@ -103,78 +124,157 @@ function buildImportReachability(graph) {
     if (targets.size > 0) directImports.set(node, targets);
   });
 
+  const reachCache = new Map();
+
+  function getReachable(file, maxHops = 4) {
+    const cacheKey = `${file}\0${maxHops}`;
+    if (reachCache.has(cacheKey)) return reachCache.get(cacheKey);
+
+    const direct = directImports.get(file);
+    if (!direct || direct.size === 0) {
+      reachCache.set(cacheKey, null);
+      return null;
+    }
+
+    const dist = new Map();
+    const queue = [];
+    for (const t of direct) {
+      dist.set(t, 1);
+      queue.push(t);
+    }
+
+    for (let i = 0; i < queue.length; i++) {
+      const cur = queue[i];
+      const d = dist.get(cur);
+      if (d >= maxHops) continue;
+      const next = directImports.get(cur);
+      if (!next) continue;
+      for (const n of next) {
+        if (n === file || dist.has(n)) continue;
+        dist.set(n, d + 1);
+        queue.push(n);
+      }
+    }
+
+    reachCache.set(cacheKey, dist);
+    return dist;
+  }
+
   return {
     getDirect(file) {
       return directImports.get(file) || null;
     },
-    getTwoHop(file) {
-      const direct = directImports.get(file);
-      if (!direct) return null;
-      const twoHop = new Set();
-      for (const mid of direct) {
-        const next = directImports.get(mid);
-        if (!next) continue;
-        for (const t of next) {
-          if (t !== file && !direct.has(t)) twoHop.add(t);
-        }
-      }
-      return twoHop.size > 0 ? twoHop : null;
-    },
+    getReachable,
   };
 }
 
 /**
- * Disambiguate which targets a reference should wire to.
- *
- * 1. If a same-file definition exists, wire to it only (skip cross-file).
- * 2. If the source file explicitly imports target file(s) (1-hop, then 2-hop),
- *    wire only to those imported targets — even if the name exceeds AMBIGUITY_CAP globally.
- * 3. If the name is unambiguous (1 definition), wire to it.
- * 4. If targets exceed AMBIGUITY_CAP, skip all (too noisy).
- * 5. Otherwise wire to all cross-file targets (low-ambiguity).
+ * Pick targets in the closest import-reachable hop tier (1-hop > 2-hop > 3-hop > 4-hop).
+ */
+function filterClosestReachable(targets, sourceFile, graph, importReach, maxHops = 4) {
+  if (!importReach) return [];
+  const distMap = importReach.getReachable(sourceFile, maxHops);
+  if (!distMap) return [];
+
+  let bestHop = Infinity;
+  const matched = [];
+  for (const t of targets) {
+    let tf;
+    try { tf = graph.getNodeAttribute(t, 'file'); } catch { continue; }
+    const hop = distMap.get(tf);
+    if (hop === undefined) continue;
+    if (hop < bestHop) {
+      bestHop = hop;
+      matched.length = 0;
+      matched.push(t);
+    } else if (hop === bestHop) {
+      matched.push(t);
+    }
+  }
+  return matched;
+}
+
+/**
+ * Disambiguate targets for bare symbol references (kept exported for unit tests).
  */
 function disambiguateTargets(targets, sourceFile, graph, importReach = null) {
   if (targets.length === 0) return [];
-  if (targets.length === 1) return targets;
 
   const sameFile = targets.filter(t => {
     try { return graph.getNodeAttribute(t, 'file') === sourceFile; } catch { return false; }
   });
   if (sameFile.length > 0) return sameFile;
 
-  if (importReach) {
-    const direct = importReach.getDirect(sourceFile);
-    if (direct) {
-      const directMatches = targets.filter(t => {
-        try { return direct.has(graph.getNodeAttribute(t, 'file')); } catch { return false; }
-      });
-      if (directMatches.length > 0) return directMatches;
+  const reachable = filterClosestReachable(targets, sourceFile, graph, importReach, 4);
+  if (reachable.length > 0) return reachable;
 
-      const twoHop = importReach.getTwoHop(sourceFile);
-      if (twoHop) {
-        const twoHopMatches = targets.filter(t => {
-          try { return twoHop.has(graph.getNodeAttribute(t, 'file')); } catch { return false; }
-        });
-        if (twoHopMatches.length > 0) return twoHopMatches;
-      }
-    }
-  }
-
+  if (targets.length === 1) return targets;
   if (targets.length > AMBIGUITY_CAP) return [];
   return targets;
 }
 
-function isPythonFile(filePath) {
-  return normalizeFilePath(filePath).endsWith('.py');
+function resolveExportTarget(entry) {
+  if (!entry) return null;
+  if (typeof entry === 'string') return entry;
+  if (typeof entry === 'object') {
+    return resolveExportTarget(entry.import || entry.default || entry.types || entry.require);
+  }
+  return null;
 }
 
-function resolvePythonImportBase(sourceFile, specifier) {
-  if (!isPythonFile(sourceFile)) return null;
-  if (!specifier) return null;
+function resolveWorkspaceImportBases(specifier, workspacePackages) {
+  if (!workspacePackages || workspacePackages.length === 0) return [];
+  const bases = [];
+
+  for (const pkg of workspacePackages) {
+    if (specifier === pkg.name) {
+      const expRoot = pkg.exports ? resolveExportTarget(pkg.exports['.']) : null;
+      if (expRoot) bases.push(posix.normalize(posix.join(pkg.dir, expRoot)));
+      if (pkg.main) bases.push(posix.normalize(posix.join(pkg.dir, pkg.main)));
+      bases.push(posix.normalize(posix.join(pkg.dir, 'src/index')));
+      bases.push(posix.normalize(posix.join(pkg.dir, 'index')));
+      return bases;
+    }
+
+    if (specifier.startsWith(pkg.name + '/')) {
+      const subpath = specifier.slice(pkg.name.length + 1);
+      const dotSub = `./${subpath}`;
+
+      if (pkg.exports) {
+        if (pkg.exports[dotSub]) {
+          const t = resolveExportTarget(pkg.exports[dotSub]);
+          if (t) bases.push(posix.normalize(posix.join(pkg.dir, t)));
+        }
+        // Handle wildcard exports like `"./*": "./src/*.ts"`
+        for (const [pattern, targetSpec] of Object.entries(pkg.exports)) {
+          if (!pattern.includes('*')) continue;
+          const [pre, post] = pattern.split('*');
+          if (dotSub.startsWith(pre) && dotSub.endsWith(post)) {
+            const matched = dotSub.slice(pre.length, dotSub.length - post.length);
+            const rawTarget = resolveExportTarget(targetSpec);
+            if (rawTarget && rawTarget.includes('*')) {
+              const expanded = rawTarget.replace('*', matched);
+              bases.push(posix.normalize(posix.join(pkg.dir, expanded)));
+            }
+          }
+        }
+      }
+
+      bases.push(posix.normalize(posix.join(pkg.dir, 'src', subpath)));
+      bases.push(posix.normalize(posix.join(pkg.dir, subpath)));
+      return bases;
+    }
+  }
+
+  return bases;
+}
+
+function resolvePythonImportBases(sourceFile, specifier, pythonRoots = ['']) {
+  if (!isPythonFile(sourceFile) || !specifier) return [];
 
   if (specifier.startsWith('.')) {
     const match = specifier.match(/^(\.+)(.*)$/);
-    if (!match) return null;
+    if (!match) return [];
 
     const dots = match[1].length;
     let baseDir = posix.dirname(sourceFile);
@@ -183,78 +283,122 @@ function resolvePythonImportBase(sourceFile, specifier) {
     }
 
     const remainder = match[2].replace(/^\./, '');
-    if (!remainder) return baseDir;
+    if (!remainder) return [baseDir];
 
-    return posix.normalize(posix.join(baseDir, remainder.replace(/\./g, '/')));
+    return [posix.normalize(posix.join(baseDir, remainder.replace(/\./g, '/')))];
   }
 
   if (/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(specifier)) {
-    return specifier.replace(/\./g, '/');
+    const modPath = specifier.replace(/\./g, '/');
+    const bases = [modPath];
+    for (const root of pythonRoots) {
+      if (root) {
+        bases.push(posix.normalize(posix.join(root, modPath)));
+        bases.push(posix.normalize(posix.join(root, 'src', modPath)));
+      } else {
+        bases.push(posix.normalize(posix.join('src', modPath)));
+      }
+    }
+    return bases;
   }
 
-  return null;
+  return [];
 }
 
-function resolveImportBase(sourceFile, specifier) {
+function resolveImportBases(sourceFile, specifier, resolverCtx = {}) {
   const normalizedSource = normalizeFilePath(sourceFile);
   const normalizedSpecifier = normalizeFilePath(specifier);
-  if (!normalizedSpecifier || normalizedSpecifier.startsWith('node:')) return null;
+  if (!normalizedSpecifier || normalizedSpecifier.startsWith('node:')) return [];
+
+  // Python imports use leading dots without slashes (`.helpers`, `..lib.tools`),
+  // so handle Python before JS/TS relative `./` paths.
+  if (isPythonFile(normalizedSource)) {
+    return resolvePythonImportBases(normalizedSource, normalizedSpecifier, resolverCtx.pythonRoots);
+  }
 
   if (normalizedSpecifier.startsWith('.')) {
-    return posix.normalize(posix.join(posix.dirname(normalizedSource), normalizedSpecifier));
+    return [posix.normalize(posix.join(posix.dirname(normalizedSource), normalizedSpecifier))];
   }
 
   if (normalizedSpecifier.startsWith('~/') || normalizedSpecifier.startsWith('@/')) {
-    return posix.normalize(posix.join('src', normalizedSpecifier.slice(2)));
+    const tail = normalizedSpecifier.slice(2);
+    const bases = [];
+    // If inside a monorepo app (e.g. `apps/qa/src/...`), try that app's `src/` first!
+    const srcIdx = normalizedSource.indexOf('/src/');
+    if (srcIdx !== -1) {
+      const appSrc = normalizedSource.slice(0, srcIdx + 4);
+      bases.push(posix.normalize(posix.join(appSrc, tail)));
+    }
+    bases.push(posix.normalize(posix.join('src', tail)));
+    return bases;
   }
 
   if (normalizedSpecifier.startsWith('/')) {
-    return posix.normalize(normalizedSpecifier.slice(1));
+    return [posix.normalize(normalizedSpecifier.slice(1))];
   }
 
   if (normalizedSpecifier.startsWith('src/')) {
-    return posix.normalize(normalizedSpecifier);
+    const bases = [posix.normalize(normalizedSpecifier)];
+    const srcIdx = normalizedSource.indexOf('/src/');
+    if (srcIdx !== -1) {
+      const appRoot = normalizedSource.slice(0, srcIdx);
+      bases.unshift(posix.normalize(posix.join(appRoot, normalizedSpecifier)));
+    }
+    return bases;
   }
 
-  const pythonBase = resolvePythonImportBase(normalizedSource, normalizedSpecifier);
-  if (pythonBase) return pythonBase;
+  // Workspace package imports (`@scope/pkg`, `@scope/pkg/subpath`)
+  const wsBases = resolveWorkspaceImportBases(normalizedSpecifier, resolverCtx.workspacePackages);
+  if (wsBases.length > 0) return wsBases;
 
-  return null;
+  // Python module imports (relative or anchored at any discovered pythonRoot)
+  const pyBases = resolvePythonImportBases(normalizedSource, normalizedSpecifier, resolverCtx.pythonRoots);
+  if (pyBases.length > 0) return pyBases;
+
+  return [];
 }
 
 function hasExplicitImportExtension(filePath) {
   return IMPORT_RESOLVE_EXTENSIONS.some(ext => filePath.endsWith(ext));
 }
 
-function resolveImportTargetFile(sourceFile, specifier, fileLookup) {
-  const importBase = resolveImportBase(sourceFile, specifier);
-  if (!importBase) return null;
+function resolveImportTargetFile(sourceFile, specifier, fileLookup, resolverCtx = {}) {
+  const importBases = resolveImportBases(sourceFile, specifier, resolverCtx);
+  if (importBases.length === 0) return null;
 
-  const candidates = [importBase];
-  if (!hasExplicitImportExtension(importBase)) {
-    for (const ext of IMPORT_RESOLVE_EXTENSIONS) {
-      candidates.push(`${importBase}${ext}`);
-    }
-    const packageEntryNames = isPythonFile(sourceFile) ? ['__init__'] : ['index'];
-    for (const ext of IMPORT_RESOLVE_EXTENSIONS) {
-      for (const entryName of packageEntryNames) {
-        candidates.push(posix.join(importBase, `${entryName}${ext}`));
+  const isPy = isPythonFile(sourceFile);
+  const packageEntryNames = isPy ? ['__init__'] : ['index'];
+
+  for (const importBase of importBases) {
+    const candidates = [importBase];
+    if (!hasExplicitImportExtension(importBase)) {
+      for (const ext of IMPORT_RESOLVE_EXTENSIONS) {
+        candidates.push(`${importBase}${ext}`);
       }
+      for (const ext of IMPORT_RESOLVE_EXTENSIONS) {
+        for (const entryName of packageEntryNames) {
+          candidates.push(posix.join(importBase, `${entryName}${ext}`));
+        }
+      }
+    } else if (importBase.endsWith('.js') || importBase.endsWith('.mjs')) {
+      // TS ESM imports often write `import './foo.js'` pointing to `foo.ts` / `foo.tsx`
+      const stem = importBase.replace(/\.(m?js)$/, '');
+      candidates.push(`${stem}.ts`, `${stem}.tsx`);
     }
-  }
 
-  for (const candidate of candidates) {
-    const resolved = fileLookup.get(normalizeFilePath(candidate));
-    if (resolved) return resolved;
+    for (const candidate of candidates) {
+      const resolved = fileLookup.get(normalizeFilePath(candidate));
+      if (resolved) return resolved;
+    }
   }
 
   return null;
 }
 
-function wireExplicitImportEdges(records, graph, fileLookup, addedImports) {
+function wireExplicitImportEdges(records, graph, fileLookup, addedImports, resolverCtx = {}) {
   for (const { file, imports = [] } of records) {
     for (const entry of imports) {
-      const targetFile = resolveImportTargetFile(file, entry.path, fileLookup);
+      const targetFile = resolveImportTargetFile(file, entry.path, fileLookup, resolverCtx);
       if (!targetFile || targetFile === file) continue;
 
       const impKey = `${file}\0${targetFile}`;
@@ -266,84 +410,170 @@ function wireExplicitImportEdges(records, graph, fileLookup, addedImports) {
   }
 }
 
-function wireSymbolReferences(records, graph, defIndex, addedRefs, addedImports, importReach) {
-  for (const { file, references } of records) {
-    for (const ref of references) {
-      const targets = defIndex.get(ref.name);
-      if (!targets) continue;
+/**
+ * Match a receiver name (e.g. `review` from `api.review.getItem.useQuery()`)
+ * against target files (`routers/review.ts`, `routers/reviewRouter.ts`).
+ */
+function matchPropertyTargetsByReceiver(propTargets, receiver, graph) {
+  if (!receiver) return [];
+  const recvNorm = receiver.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (recvNorm.length < 2) return [];
 
-      let resolvedTargets;
-      let allowSyntheticImport = true;
+  const matches = [];
+  for (const t of propTargets) {
+    let tf;
+    try { tf = graph.getNodeAttribute(t, 'file'); } catch { continue; }
+    const stem = basename(tf).replace(/\.[^.]+$/, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (stem === recvNorm || stem === `${recvNorm}router` || stem === `${recvNorm}procedures`) {
+      matches.push(t);
+    }
+  }
+  return matches;
+}
+
+/**
+ * Wire symbol `REFERENCES` edges using strict import-scoped disambiguation.
+ *
+ * IMPORTANT: Never synthesizes `IMPORTS` edges here — `IMPORTS` edges come
+ * strictly from explicit AST import statements so `deps`, `dependents`, and
+ * `neighborhood` have zero bare-name false positives.
+ */
+function wireSymbolReferences(records, graph, defIndex, addedRefs, importReach, fileLookup, resolverCtx = {}) {
+  for (const { file, references } of records) {
+    const srcFamily = getLanguageFamily(file);
+    const isPy = srcFamily === 'python';
+    const isJs = srcFamily === 'js';
+
+    for (const ref of references) {
+      const rawTargets = defIndex.get(ref.name);
+      if (!rawTargets) continue;
+
+      // Enforce language-family matching and exported-only cross-file wiring
+      const targets = [];
+      for (const t of rawTargets) {
+        let attrs;
+        try { attrs = graph.getNodeAttributes(t); } catch { continue; }
+        if (attrs.file === file) {
+          targets.push(t);
+          continue;
+        }
+        if (getLanguageFamily(attrs.file) !== srcFamily) continue;
+        if (attrs.exported === false) continue;
+        targets.push(t);
+      }
+      if (targets.length === 0) continue;
+
+      let resolvedTargets = [];
 
       if (ref.kind === 'method') {
-        // Only wire `obj.method()` calls to class methods defined in the same
-        // file or in explicitly imported files (1-hop or 2-hop). This avoids
-        // cross-app false positives like `url.search` or `Object.create`.
         if (METHOD_NOISE_NAMES.has(ref.name) || ref.name.length < 3) continue;
-        const methodTargets = targets.filter(target => {
-          try { return graph.getNodeAttribute(target, 'kind') === 'method'; } catch { return false; }
-        });
-        if (methodTargets.length === 0) continue;
 
-        const sameFile = methodTargets.filter(t => {
-          try { return graph.getNodeAttribute(t, 'file') === file; } catch { return false; }
+        const eligible = targets.filter(t => {
+          const k = graph.getNodeAttribute(t, 'kind');
+          if (k === 'method') return true;
+          // Python `mod.fn()` calls module-level functions
+          if (isPy && (k === 'function' || k === 'class')) return true;
+          return false;
         });
+        if (eligible.length === 0) continue;
+
+        // If `ref.receiverModule` resolves directly (e.g. `pool.fn()` or `lib.fn()`),
+        // match targets in that module (or its 1-hop re-exports) first.
+        if (ref.receiverModule) {
+          const modFile = resolveImportTargetFile(file, ref.receiverModule, fileLookup, resolverCtx);
+          if (modFile) {
+            const directMod = eligible.filter(t => graph.getNodeAttribute(t, 'file') === modFile);
+            if (directMod.length > 0) {
+              resolvedTargets = directMod;
+            } else {
+              const modReach = importReach.getReachable(modFile, 2);
+              if (modReach) {
+                resolvedTargets = eligible.filter(t => modReach.has(graph.getNodeAttribute(t, 'file')));
+              }
+            }
+          }
+        }
+
+        if (resolvedTargets.length === 0) {
+          const sameFile = eligible.filter(t => graph.getNodeAttribute(t, 'file') === file);
+          if (sameFile.length > 0) {
+            resolvedTargets = sameFile;
+          } else {
+            resolvedTargets = filterClosestReachable(eligible, file, graph, importReach, 4);
+          }
+        }
+      } else if (ref.kind === 'property') {
+        // Python `mod.CONST` attribute access on an imported module alias
+        if (isPy && ref.receiverModule) {
+          const modFile = resolveImportTargetFile(file, ref.receiverModule, fileLookup, resolverCtx);
+          if (modFile) {
+            const directMod = targets.filter(t => graph.getNodeAttribute(t, 'file') === modFile);
+            if (directMod.length > 0) {
+              resolvedTargets = directMod;
+            } else {
+              const modReach = importReach.getReachable(modFile, 2);
+              if (modReach) {
+                resolvedTargets = targets.filter(t => modReach.has(graph.getNodeAttribute(t, 'file')));
+              }
+            }
+          }
+        }
+
+        if (resolvedTargets.length === 0) {
+          const propTargets = targets.filter(t => graph.getNodeAttribute(t, 'kind') === 'property');
+          if (propTargets.length === 0) continue;
+
+          const sameFile = propTargets.filter(t => graph.getNodeAttribute(t, 'file') === file);
+          if (sameFile.length > 0) {
+            resolvedTargets = sameFile;
+          } else {
+            // Receiver-aware matching for RPC proxies like `api.review.getItem.useQuery()`
+            const recvMatches = matchPropertyTargetsByReceiver(propTargets, ref.receiver, graph);
+            if (recvMatches.length > 0) {
+              resolvedTargets = recvMatches;
+            } else {
+              const reachable = filterClosestReachable(propTargets, file, graph, importReach, 4);
+              if (reachable.length > 0) {
+                resolvedTargets = reachable;
+              } else if (propTargets.length <= AMBIGUITY_CAP) {
+                resolvedTargets = propTargets;
+              }
+            }
+          }
+        }
+      } else {
+        // Lane C: bare symbol refs (`foo()`, `<Comp />`, `Type`, `import { FOO }`)
+        const nonMethodTargets = targets.filter(t => graph.getNodeAttribute(t, 'kind') !== 'method');
+        if (nonMethodTargets.length === 0) continue;
+
+        const sameFile = nonMethodTargets.filter(t => graph.getNodeAttribute(t, 'file') === file);
         if (sameFile.length > 0) {
           resolvedTargets = sameFile;
-        } else if (importReach) {
-          const direct = importReach.getDirect(file);
-          const directMatches = direct
-            ? methodTargets.filter(t => {
-              try { return direct.has(graph.getNodeAttribute(t, 'file')); } catch { return false; }
-            })
-            : [];
-          if (directMatches.length > 0) {
-            resolvedTargets = directMatches;
-          } else {
-            const twoHop = importReach.getTwoHop(file);
-            resolvedTargets = twoHop
-              ? methodTargets.filter(t => {
-                try { return twoHop.has(graph.getNodeAttribute(t, 'file')); } catch { return false; }
-              })
-              : [];
-          }
         } else {
-          resolvedTargets = [];
+          // Require explicit import-chain reachability (up to 4 barrel hops) for JS/TS/Python
+          const reachable = filterClosestReachable(nonMethodTargets, file, graph, importReach, 4);
+          if (reachable.length > 0) {
+            resolvedTargets = reachable;
+          } else if (!isJs && !isPy) {
+            // Non-JS/Python (Go/Java/C#/C/C++): allow same-directory package fallback
+            const srcDir = posix.dirname(file);
+            const sameDir = nonMethodTargets.filter(t => posix.dirname(graph.getNodeAttribute(t, 'file')) === srcDir);
+            if (sameDir.length > 0) {
+              resolvedTargets = sameDir;
+            } else if (nonMethodTargets.length <= AMBIGUITY_CAP) {
+              resolvedTargets = nonMethodTargets;
+            }
+          }
         }
-        allowSyntheticImport = false;
-      } else if (ref.kind === 'property') {
-        const propTargets = targets.filter(target => {
-          try { return graph.getNodeAttribute(target, 'kind') === 'property'; } catch { return false; }
-        });
-        if (propTargets.length === 0) continue;
-        resolvedTargets = disambiguateTargets(propTargets, file, graph, importReach);
-      } else {
-        // Bare symbol refs (`foo()`, `import { Foo }`, type refs) cannot invoke
-        // instance class methods (`obj.foo()`), which are handled via `ref.kind === 'method'`.
-        const nonMethodTargets = targets.filter(target => {
-          try { return graph.getNodeAttribute(target, 'kind') !== 'method'; } catch { return false; }
-        });
-        if (nonMethodTargets.length === 0) continue;
-        resolvedTargets = disambiguateTargets(nonMethodTargets, file, graph, importReach);
       }
 
       if (resolvedTargets.length === 0) continue;
 
       for (const target of resolvedTargets) {
-        const targetFile = graph.getNodeAttribute(target, 'file');
-
         const refKey = `${file}\0${target}`;
         if (!addedRefs.has(refKey)) {
           addedRefs.add(refKey);
           graph.addEdge(file, target, { type: 'REFERENCES' });
-        }
-
-        if (allowSyntheticImport && targetFile !== file) {
-          const impKey = `${file}\0${targetFile}`;
-          if (!addedImports.has(impKey)) {
-            addedImports.add(impKey);
-            graph.addEdge(file, targetFile, { type: 'IMPORTS' });
-          }
         }
       }
     }
@@ -365,6 +595,7 @@ function mergeDefinitions(graph, records) {
       graph.mergeNode(symbolKey, {
         type: 'symbol',
         kind: def.kind,
+        exported: def.exported !== false,
         name: def.name,
         file,
         lineStart: def.lineStart,
@@ -376,7 +607,7 @@ function mergeDefinitions(graph, records) {
   }
 }
 
-function buildGraph(allSymbols) {
+function buildGraph(allSymbols, resolverCtx = {}) {
   const graph = new MultiDirectedGraph({ allowSelfLoops: false });
   mergeDefinitions(graph, allSymbols);
   const defIndex = buildDefinitionIndex(graph);
@@ -384,19 +615,16 @@ function buildGraph(allSymbols) {
 
   const addedRefs = new Set();
   const addedImports = new Set();
-  // Wire explicit imports FIRST so reference/method disambiguation can use them
-  wireExplicitImportEdges(allSymbols, graph, fileLookup, addedImports);
+  // Pass 1: explicit AST imports only
+  wireExplicitImportEdges(allSymbols, graph, fileLookup, addedImports, resolverCtx);
+  // Pass 2: import-scoped symbol & method references (no synthetic IMPORTS)
   const importReach = buildImportReachability(graph);
-  wireSymbolReferences(allSymbols, graph, defIndex, addedRefs, addedImports, importReach);
+  wireSymbolReferences(allSymbols, graph, defIndex, addedRefs, importReach, fileLookup, resolverCtx);
 
   return graph;
 }
 
-/**
- * Incrementally update the graph: remove stale nodes/edges for changed or
- * deleted files, then re-add from fresh parse results.
- */
-function updateGraphFiles(graph, removedFiles, newSymbols) {
+function updateGraphFiles(graph, removedFiles, newSymbols, resolverCtx = {}) {
   const changedFiles = new Map(newSymbols.map(record => [record.file, record]));
 
   for (const filePath of removedFiles) {
@@ -441,9 +669,9 @@ function updateGraphFiles(graph, removedFiles, newSymbols) {
   const fileLookup = buildFileLookup(graph);
   const addedRefs = new Set();
   const addedImports = new Set();
-  wireExplicitImportEdges(newSymbols, graph, fileLookup, addedImports);
+  wireExplicitImportEdges(newSymbols, graph, fileLookup, addedImports, resolverCtx);
   const importReach = buildImportReachability(graph);
-  wireSymbolReferences(newSymbols, graph, defIndex, addedRefs, addedImports, importReach);
+  wireSymbolReferences(newSymbols, graph, defIndex, addedRefs, importReach, fileLookup, resolverCtx);
 }
 
 function removeFileNodes(graph, filePath) {
@@ -514,11 +742,19 @@ const DEFAULT_PATH_TIERS = [
   { pattern: 'qa/', weight: 0.2 },
   { pattern: 'tests/', weight: 0.2 },
   { pattern: 'test/', weight: 0.2 },
+  { pattern: '__tests__/', weight: 0.2 },
   { pattern: 'scripts/', weight: 0.3 },
   { pattern: 'deploy/', weight: 0.3 },
 ];
 
+const TEST_FILE_SUFFIX_RE = /(\.(test|spec)|(_test|_spec))\.[^.]+$/i;
+const TEST_FILE_PREFIX_RE = /^test_/;
+
 function getPathWeight(filePath, pathTiers = DEFAULT_PATH_TIERS) {
+  const base = basename(filePath);
+  if (TEST_FILE_SUFFIX_RE.test(base) || TEST_FILE_PREFIX_RE.test(base)) {
+    return 0.15;
+  }
   for (const { pattern, weight } of pathTiers) {
     if (filePath.startsWith(pattern) || filePath.includes('/' + pattern)) {
       return weight;
@@ -527,11 +763,6 @@ function getPathWeight(filePath, pathTiers = DEFAULT_PATH_TIERS) {
   return 1.0;
 }
 
-/**
- * Compute PageRank scores, optionally biased toward focusFiles.
- * Applies path-tier dampening so source code ranks above scripts/tests.
- * Returns an array of [symbolKey, score] sorted descending.
- */
 function rankedSymbols(graph, focusFiles = [], pathTiers = DEFAULT_PATH_TIERS) {
   if (graph.order === 0) return [];
 
@@ -580,8 +811,8 @@ function rankedSymbols(graph, focusFiles = [], pathTiers = DEFAULT_PATH_TIERS) {
 
 /**
  * Serialize graph + mtimes + precomputed unfocused PageRank into a compact
- * integer-indexed, gzip-compressed v3 cache file (~25-30x smaller than raw
- * graphology JSON).
+ * integer-indexed, gzip-compressed v4 cache file.
+ * Exported flag is encoded in kindCode case (uppercase = exported, lowercase = local).
  */
 async function saveGraph(graph, mtimeMap, cachePath, { precomputedRanked = null } = {}) {
   await mkdir(dirname(cachePath), { recursive: true });
@@ -589,15 +820,12 @@ async function saveGraph(graph, mtimeMap, cachePath, { precomputedRanked = null 
   const files = [];
   const fileIndex = new Map();
 
-  // Indexed file nodes first
   graph.forEachNode((node, attrs) => {
     if (attrs.type !== 'file') return;
     fileIndex.set(node, files.length);
     files.push([node, mtimeMap.get(node) || 0, attrs.symbolCount || 0]);
   });
 
-  // Also persist mtimes for skipped (e.g. minified) files with symbolCount = -1
-  // so warm runs don't re-read and re-check them on every query.
   for (const [path, mtimeMs] of mtimeMap) {
     if (fileIndex.has(path)) continue;
     fileIndex.set(path, files.length);
@@ -614,7 +842,7 @@ async function saveGraph(graph, mtimeMap, cachePath, { precomputedRanked = null 
     symbols.push([
       fIdx,
       attrs.name,
-      KIND_TO_CODE[attrs.kind] || 'o',
+      encodeKind(attrs.kind, attrs.exported !== false),
       attrs.lineStart,
       attrs.lineEnd,
       attrs.signature || '',
@@ -635,7 +863,6 @@ async function saveGraph(graph, mtimeMap, cachePath, { precomputedRanked = null 
     }
   });
 
-  // Precompute & store unfocused PageRank aligned with symbols[]
   const ranked = precomputedRanked || rankedSymbols(graph);
   const pr = new Array(symbols.length).fill(0);
   for (const [symKey, score] of ranked) {
@@ -645,14 +872,13 @@ async function saveGraph(graph, mtimeMap, cachePath, { precomputedRanked = null 
     }
   }
 
-  const payload = JSON.stringify({ v: 3, f: files, s: symbols, r: refs, i: imports, pr });
+  const payload = JSON.stringify({ v: 4, f: files, s: symbols, r: refs, i: imports, pr });
   const compressed = gzipSync(Buffer.from(payload), { level: 1 });
   await writeFile(cachePath, compressed);
 }
 
 /**
- * Load compact v3 (gzipped) graph cache from disk.
- * Returns { graph, mtimes, cachedRanked } or null if missing/incompatible.
+ * Load compact v4 (gzipped) graph cache from disk.
  */
 async function loadGraph(cachePath) {
   try {
@@ -662,7 +888,7 @@ async function loadGraph(cachePath) {
       : buf.toString('utf-8');
     const raw = JSON.parse(jsonStr);
 
-    if (raw.v !== 3) return null;
+    if (raw.v !== 4) return null;
 
     const graph = new MultiDirectedGraph({ allowSelfLoops: false });
     const mtimes = new Map();
@@ -692,9 +918,11 @@ async function loadGraph(cachePath) {
       used.add(key);
       symKeys[idx] = key;
 
+      const { kind, exported } = decodeKind(kindCode);
       graph.addNode(key, {
         type: 'symbol',
-        kind: CODE_TO_KIND[kindCode] || 'other',
+        kind,
+        exported,
         name,
         file,
         lineStart,
@@ -745,4 +973,5 @@ export {
   rankedSymbols,
   saveGraph,
   loadGraph,
+  buildImportReachability,
 };

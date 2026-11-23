@@ -1,5 +1,5 @@
-import { readdir, stat } from 'fs/promises';
-import { join, relative } from 'path';
+import { readdir, stat, readFile, open, unlink, mkdir } from 'fs/promises';
+import { dirname, join, posix } from 'path';
 
 const MINIFIED_FILENAME_RE = /\.(min|bundle|chunk)\.(js|mjs|cjs|ts|css)$/i;
 const MAX_SOURCE_BYTES = 1024 * 1024; // 1 MB
@@ -108,8 +108,6 @@ export function compileIgnoreMatcher(patterns) {
     rules.push({ negated, regex: globToRegExp(body), raw: body });
   }
 
-  // Exact single-segment directory patterns like "**/node_modules/**" can be
-  // pruned before regex testing as long as no negation rule could re-include them.
   if (!hasNegations) {
     for (const rule of rules) {
       const m = rule.raw.match(/^\*\*\/([^/*?]+)\/\*\*$/);
@@ -140,7 +138,7 @@ export function compileIgnoreMatcher(patterns) {
  * Walk `rootDir` in parallel using native fs.readdir({ withFileTypes: true }),
  * pruning ignored directories before descending and filtering by extension.
  *
- * Returns POSIX-normalized relative paths sorted deterministically.
+ * Returns POSIX-normalized relative paths.
  */
 export async function walkFiles(rootDir, { extensions, ignorePatterns = [] }) {
   const extSet = new Set(extensions);
@@ -208,4 +206,160 @@ export async function statFilesBatched(rootDir, relPaths, concurrency = 64) {
   await Promise.all(workers);
 
   return out.filter(Boolean);
+}
+
+const SKIP_META_DIRS = new Set([
+  'node_modules', '.git', '.next', '.nuxt', '.turbo', 'dist', 'build', 'out',
+  'coverage', '__pycache__', '.venv', 'venv', 'Pods', 'target', '.cache',
+]);
+
+/**
+ * Discover workspace JS/TS packages (`package.json` with a `name`) and Python
+ * package roots (`pyproject.toml`, `setup.py`, `setup.cfg`) up to depth 3
+ * inside a root directory.
+ *
+ * Used by graph.js to resolve workspace aliases like `@scope/pkg` and Python
+ * package imports under single-repo or multi-repo roots.
+ */
+export async function discoverRootMetadata(rootDir, prefix = '') {
+  const workspacePackages = [];
+  const pythonRoots = [];
+  const prefixNorm = prefix ? prefix.replace(/\\/g, '/').replace(/\/+$/, '') : '';
+
+  if (prefixNorm) {
+    pythonRoots.push(prefixNorm);
+  } else {
+    pythonRoots.push('');
+  }
+
+  async function scan(absDir, relDir, depth) {
+    let entries;
+    try {
+      entries = await readdir(absDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    let hasPackageJson = false;
+    let hasPyProject = false;
+    const subdirs = [];
+
+    for (const entry of entries) {
+      if (entry.isFile()) {
+        if (entry.name === 'package.json') hasPackageJson = true;
+        else if (entry.name === 'pyproject.toml' || entry.name === 'setup.py' || entry.name === 'setup.cfg') {
+          hasPyProject = true;
+        }
+      } else if (entry.isDirectory() && depth < 3 && !SKIP_META_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+        subdirs.push([join(absDir, entry.name), relDir ? `${relDir}/${entry.name}` : entry.name]);
+      }
+    }
+
+    const fullRelDir = prefixNorm
+      ? (relDir ? `${prefixNorm}/${relDir}` : prefixNorm)
+      : relDir;
+
+    if (hasPyProject && !pythonRoots.includes(fullRelDir)) {
+      pythonRoots.push(fullRelDir);
+    }
+
+    if (hasPackageJson && relDir) {
+      try {
+        const pkg = JSON.parse(await readFile(join(absDir, 'package.json'), 'utf-8'));
+        if (pkg.name && typeof pkg.name === 'string') {
+          workspacePackages.push({
+            name: pkg.name,
+            dir: fullRelDir,
+            main: typeof pkg.main === 'string' ? pkg.main : null,
+            exports: pkg.exports && typeof pkg.exports === 'object' ? pkg.exports : null,
+          });
+        }
+      } catch {
+        // ignore invalid package.json
+      }
+    }
+
+    if (subdirs.length > 0) {
+      await Promise.all(subdirs.map(([abs, rel]) => scan(abs, rel, depth + 1)));
+    }
+  }
+
+  await scan(rootDir, '', 0);
+  return { workspacePackages, pythonRoots };
+}
+
+function isPidAlive(pid) {
+  if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+/**
+ * Acquire an exclusive per-cache lockfile so concurrent CLI processes targeting
+ * the same uncached root don't run duplicate cold builds simultaneously.
+ *
+ * Returns `{ acquired, waited, release }`.
+ * - If another live process held the lock and released it while we waited,
+ *   `waited` is `true` so the caller can immediately reload the fresh cache.
+ */
+export async function acquireCacheLock(cachePath, { timeoutMs = 120000, pollMs = 100 } = {}) {
+  const lockPath = `${cachePath}.lock`;
+  await mkdir(dirname(lockPath), { recursive: true }).catch(() => {});
+
+  const deadline = Date.now() + timeoutMs;
+  let waited = false;
+
+  while (true) {
+    try {
+      const handle = await open(lockPath, 'wx');
+      await handle.writeFile(JSON.stringify({ pid: process.pid, ts: Date.now() }));
+      await handle.close();
+
+      let released = false;
+      const release = async () => {
+        if (released) return;
+        released = true;
+        await unlink(lockPath).catch(() => {});
+      };
+      return { acquired: true, waited, release };
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        return { acquired: false, waited, release: async () => {} };
+      }
+
+      // Check for stale lock (dead PID or older than 2 minutes)
+      let stale = false;
+      try {
+        const raw = await readFile(lockPath, 'utf-8');
+        const info = JSON.parse(raw);
+        if (!isPidAlive(info.pid) || (Date.now() - (info.ts || 0)) > 120000) {
+          stale = true;
+        }
+      } catch {
+        // Lock file may be mid-write or vanished; check mtime
+        try {
+          const st = await stat(lockPath);
+          if (Date.now() - st.mtimeMs > 120000) stale = true;
+        } catch {
+          continue;
+        }
+      }
+
+      if (stale) {
+        await unlink(lockPath).catch(() => {});
+        continue;
+      }
+
+      if (Date.now() >= deadline) {
+        return { acquired: false, waited, release: async () => {} };
+      }
+
+      waited = true;
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+  }
 }

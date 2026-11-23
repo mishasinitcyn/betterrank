@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
 import { CodeIndex } from './index.js';
-import { resolve, relative, isAbsolute } from 'path';
+import { resolve, relative, isAbsolute, dirname, join } from 'path';
 import { readFile } from 'fs/promises';
+import { fileURLToPath } from 'url';
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_LIMIT = 50;
 const DEFAULT_DEPTH = 3;
 
@@ -11,8 +13,8 @@ const USAGE = `
 betterrank <command> [options]
 
 Commands:
-  outline     <file> [symbol1,symbol2] [--annotate]  File skeleton (--annotate for caller counts)
-  map         [--focus file1,file2]                 Repo map (ranked by PageRank)
+  outline     <file> [symbol1,symbol2] [--annotate]  File skeleton (--annotate, --lines, --no-comments, --depth)
+  map         [--focus file1,file2] [--include-tests] Repo map (ranked by PageRank, excludes tests by default)
   search      <query> [--kind type]                 Substring search on symbol names + signatures (ranked by PageRank)
   structure   [--depth N]                           File tree with symbol counts (default depth: ${DEFAULT_DEPTH})
   symbols     [--file path] [--kind type]           List definitions (ranked by PageRank)
@@ -31,38 +33,34 @@ Commands:
   stats                                             Index statistics
 
 Global flags:
-  --root <path>     Project root (default: cwd). Always pass this explicitly.
+  --root <path>     Project root (repeatable for multi-root: --root repoA --root repoB)
   --count           Return counts only (no content)
   --offset N        Skip first N results
   --limit N         Max results to return (default: ${DEFAULT_LIMIT} for list commands)
+  --version, -v     Print version and exit
   --help            Show help for a command (e.g. betterrank search --help)
 `.trim();
 
 const COMMAND_HELP = {
-  outline: `betterrank outline <file> [symbol1,symbol2,...] [--annotate --root <path>]
+  outline: `betterrank outline <file> [symbol1,symbol2,...] [--annotate --lines A-B --no-comments --depth N --root <path>]
 
-View a file's structure with function/class bodies collapsed, or expand
-specific symbols to see their full source.
-
-Without symbol names: shows the file skeleton — imports, constants, and
-function/class signatures with bodies replaced by "... (N lines)".
-
-With symbol names (comma-separated): shows the full source of those
-specific functions/classes with line numbers.
-
-Also works well for indexed JS/TS object members like router procedures:
-use \`outline file.ts getTeamStatistics\` instead of expanding a whole giant
-\`createTRPCRouter({ ... })\` blob.
+View a file's structure with function/method bodies collapsed (classes and
+router objects stay open to show member signatures), or expand specific symbols.
 
 Options:
-  --root <path>     Resolve file path relative to this directory
-  --annotate        Show caller counts next to each function (requires --root)
+  --root <path>       Resolve file path relative to this directory
+  --annotate          Show caller counts next to each class/function/method (requires --root)
+  --lines A-B         Slice specific 1-indexed line range (also accepts A:B)
+  --no-comments       Strip single-line and multi-line comments/docstrings
+  --depth N           Container expansion depth (default: 1; use 2 for inner handlers inside large components)
+  --collapse-imports  Collapse top-of-file import block (visible by default)
 
 Examples:
   betterrank outline src/auth.py
   betterrank outline src/auth.py authenticate_user
   betterrank outline src/auth.py validate,process
-  betterrank outline src/handlers.ts --root ./backend
+  betterrank outline src/giant.tsx --depth 2 --no-comments
+  betterrank outline src/giant.tsx --lines 100-220
   betterrank outline src/auth.py --annotate --root ./backend`,
 
   map: `betterrank map [--focus file1,file2] [--root <path>]
@@ -87,7 +85,7 @@ Substring search on symbol names + full signatures (param names, types, defaults
 Results ranked by PageRank (most structurally important first).
 
 Options:
-  --kind <type>    Filter: function, class, type, variable, property, namespace, import
+  --kind <type>    Filter: function, method, class, type, variable, property, namespace
   --count          Return match count only
   --offset N       Skip first N results
   --limit N        Max results (default: ${DEFAULT_LIMIT})
@@ -120,7 +118,7 @@ Results ranked by PageRank (most structurally important first).
 
 Options:
   --file <path>    Filter to a specific file (relative to --root)
-  --kind <type>    Filter: function, class, type, variable, property, namespace, import
+  --kind <type>    Filter: function, method, class, type, variable, property, namespace
   --count          Return count only
   --offset N       Skip first N results
   --limit N        Max results (default: ${DEFAULT_LIMIT})
@@ -330,6 +328,11 @@ async function main() {
     console.log(USAGE);
     process.exit(0);
   }
+  if (args[0] === '--version' || args[0] === '-v') {
+    const pkg = JSON.parse(await readFile(join(__dirname, '..', 'package.json'), 'utf-8'));
+    console.log(pkg.version);
+    process.exit(0);
+  }
 
   const command = args[0];
   const flags = parseFlags(args.slice(1));
@@ -468,18 +471,24 @@ async function main() {
   if (command === 'outline') {
     const filePath = flags._positional[0];
     if (!filePath) {
-      console.error('Usage: betterrank outline <file> [symbol1,symbol2] [--annotate --root <path>]');
+      console.error('Usage: betterrank outline <file> [symbol1,symbol2] [--annotate --lines A-B --no-comments --depth N --root <path>]');
       process.exit(1);
     }
     const expandSymbols = flags._positional[1] ? flags._positional[1].split(',') : [];
     const annotate = flags.annotate === true;
+    const noComments = flags['no-comments'] === true;
+    const collapseImports = flags['collapse-imports'] === true;
+    const depth = flags.depth !== undefined ? parseInt(flags.depth, 10) : 1;
 
     if (annotate && !flags.root) {
       console.error('outline --annotate requires --root for graph data');
       process.exit(1);
     }
 
-    const root = flags.root ? resolve(flags.root) : process.cwd();
+    const roots = flags._roots && flags._roots.length > 0
+      ? flags._roots.map(r => resolve(r))
+      : [flags.root ? resolve(flags.root) : process.cwd()];
+    const root = roots[0];
     const absPath = isAbsolute(filePath) ? filePath : resolve(root, filePath);
 
     let source;
@@ -492,37 +501,63 @@ async function main() {
     }
 
     const relPath = relative(root, absPath);
-    const { buildOutline } = await import('./outline.js');
+    const { buildOutline, parseLineRange } = await import('./outline.js');
+    const lineRange = flags.lines ? parseLineRange(flags.lines) : null;
+    if (flags.lines && !lineRange) {
+      console.error(`Invalid --lines range "${flags.lines}". Expected format: START-END or START:END (e.g. 100-220)`);
+      process.exit(1);
+    }
 
     let callerCounts;
     if (annotate) {
-      const idx = new CodeIndex(resolve(flags.root));
-      callerCounts = await idx.getCallerCounts(relPath);
+      const idx = new CodeIndex(roots.length > 1 ? roots : root);
+      const graphPath = roots.length > 1 ? `${idx.roots[0].prefix}/${relPath}` : relPath;
+      callerCounts = await idx.getCallerCounts(graphPath);
     }
 
-    const result = buildOutline(source, relPath, expandSymbols, { callerCounts });
+    const result = buildOutline(source, relPath, expandSymbols, {
+      callerCounts,
+      lineRange,
+      noComments,
+      depth,
+      collapseImports,
+    });
     console.log(result);
     return;
   }
 
-  const projectRoot = resolve(flags.root || process.cwd());
-  if (!flags.root) {
+  const roots = flags._roots && flags._roots.length > 0
+    ? flags._roots.map(r => resolve(r))
+    : [resolve(flags.root || process.cwd())];
+  const projectRoot = roots[0];
+  if (!flags.root && (!flags._roots || flags._roots.length === 0)) {
     process.stderr.write(`⚠ No --root specified, using cwd: ${projectRoot}\n`);
   }
-  const idx = new CodeIndex(projectRoot);
+  const idx = new CodeIndex(roots.length > 1 ? roots : projectRoot);
 
   const countMode = flags.count === true;
   const offset = flags.offset !== undefined ? parseInt(flags.offset, 10) : undefined;
   const userLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : undefined;
 
-  // Normalize a file path argument relative to projectRoot.
-  // Handles cases like `neighborhood gravity-engine/src/foo.py --root gravity-engine`
-  // where the graph stores `src/foo.py` but the user passes the full path.
   function normalizeFilePath(filePath) {
     if (!filePath) return filePath;
+    if (roots.length > 1) {
+      // Check if filePath already starts with a multi-root prefix
+      for (const r of idx.roots) {
+        if (filePath.startsWith(`${r.prefix}/`)) return filePath;
+      }
+      // Or resolve absolute/cwd path into the matching root's prefixed path
+      const abs = resolve(filePath);
+      for (const r of idx.roots) {
+        const rel = relative(r.path, abs);
+        if (!rel.startsWith('..') && !isAbsolute(rel)) {
+          return `${r.prefix}/${rel}`;
+        }
+      }
+      return filePath;
+    }
     const abs = resolve(filePath);
     const rel = relative(projectRoot, abs);
-    // If the result starts with '..' the file is outside projectRoot — return as-is
     if (rel.startsWith('..')) return filePath;
     return rel;
   }
@@ -558,9 +593,19 @@ async function main() {
 
   switch (command) {
     case 'map': {
-      const focusFiles = flags.focus ? flags.focus.split(',') : [];
+      const focusFiles = flags.focus ? flags.focus.split(',').map(f => normalizeFilePath(f.trim())).filter(Boolean) : [];
+      const includeTests = flags['include-tests'] === true;
       const effectiveLimit = countMode ? undefined : (userLimit !== undefined ? userLimit : DEFAULT_LIMIT);
-      const result = await idx.map({ focusFiles, count: countMode, offset, limit: effectiveLimit });
+      const result = await idx.map({ focusFiles, count: countMode, offset, limit: effectiveLimit, includeTests });
+      if (result.missingFocusFiles && result.missingFocusFiles.length > 0) {
+        for (const miss of result.missingFocusFiles) {
+          process.stderr.write(`⚠ Focus path not found in index: "${miss.path}"`);
+          if (miss.suggestions && miss.suggestions.length > 0) {
+            process.stderr.write(` (did you mean: ${miss.suggestions.join(', ')}?)`);
+          }
+          process.stderr.write('\n');
+        }
+      }
       if (countMode) {
         console.log(`total: ${result.total}`);
       } else {
@@ -1020,16 +1065,23 @@ async function main() {
 }
 
 function parseFlags(args) {
-  const flags = { _positional: [] };
+  const flags = { _positional: [], _roots: [] };
   let i = 0;
   while (i < args.length) {
     if (args[i] === '-h') {
       flags.help = true;
       i++;
+    } else if (args[i] === '-v') {
+      flags.version = true;
+      i++;
     } else if (args[i].startsWith('--')) {
       const key = args[i].substring(2);
       if (i + 1 < args.length && !args[i + 1].startsWith('--')) {
-        flags[key] = args[i + 1];
+        const val = args[i + 1];
+        if (key === 'root') {
+          flags._roots.push(val);
+        }
+        flags[key] = val;
         i += 2;
       } else {
         flags[key] = true;

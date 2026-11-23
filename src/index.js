@@ -1,8 +1,8 @@
 import { readFile } from 'fs/promises';
 import { join, dirname, relative, sep, basename } from 'path';
 import { CodeIndexCache } from './cache.js';
-import { rankedSymbols } from './graph.js';
-import { parseFile } from './parser.js';
+import { rankedSymbols, buildImportReachability } from './graph.js';
+import { parseFile, getLanguageFamily, STDLIB_RECEIVERS } from './parser.js';
 
 /**
  * Collapse unchanged context lines in git log -L diff output.
@@ -261,11 +261,16 @@ function escapeRegExp(value) {
 }
 
 class CodeIndex {
-  constructor(projectRoot, opts = {}) {
-    this.projectRoot = projectRoot;
-    this.cache = new CodeIndexCache(projectRoot, opts);
+  constructor(projectRootOrRoots, opts = {}) {
+    this.cache = new CodeIndexCache(projectRootOrRoots, opts);
+    this.projectRoot = this.cache.projectRoot;
+    this.roots = this.cache.roots;
     this._rankedCache = null;
     this._fileScoresCache = null;
+  }
+
+  _absPath(graphFilePath) {
+    return this.cache.resolveAbsPath(graphFilePath);
   }
 
   async _ensureReady() {
@@ -329,7 +334,7 @@ class CodeIndex {
    * @param {boolean} [opts.count] - If true, return only { total }
    * @returns {{content, shownFiles, shownSymbols, totalFiles, totalSymbols}|{total: number}}
    */
-  async map({ focusFiles = [], offset, limit, count = false, structured = false } = {}) {
+  async map({ focusFiles = [], offset, limit, count = false, structured = false, includeTests = false } = {}) {
     const ensureResult = await this._ensureReady();
     const graph = this.cache.getGraph();
     if (!graph || graph.order === 0) {
@@ -343,17 +348,30 @@ class CodeIndex {
       return { content: '(empty index)', shownFiles: 0, shownSymbols: 0, totalFiles: 0, totalSymbols: 0, diagnostics };
     }
 
+    // Detect any --focus paths that do not exist in the indexed graph
+    const missingFocusFiles = [];
+    for (const f of focusFiles) {
+      if (!graph.hasNode(f) || graph.getNodeAttribute(f, 'type') !== 'file') {
+        missingFocusFiles.push({ path: f, suggestions: findSimilarFiles(graph, f, 3) });
+      }
+    }
+
     // Count totals from the graph
     let totalFiles = 0;
     let totalSymbols = 0;
     graph.forEachNode((_node, attrs) => {
-      if (attrs.type === 'file') totalFiles++;
-      else if (attrs.type === 'symbol') totalSymbols++;
+      if (attrs.type === 'file') {
+        if (!includeTests && isTestFile(_node)) return;
+        totalFiles++;
+      } else if (attrs.type === 'symbol') {
+        if (!includeTests && isTestFile(attrs.file)) return;
+        totalSymbols++;
+      }
     });
 
     const ranked = this._getRanked(focusFiles);
 
-    // Collect all symbol entries ranked by PageRank (rich data for both formats)
+    // Collect all symbol entries ranked by PageRank (skip test files unless --include-tests)
     const allEntries = [];
     for (const [symbolKey, _score] of ranked) {
       let attrs;
@@ -363,6 +381,7 @@ class CodeIndex {
         continue;
       }
       if (attrs.type !== 'symbol') continue;
+      if (!includeTests && isTestFile(attrs.file)) continue;
 
       allEntries.push({
         file: attrs.file,
@@ -374,7 +393,7 @@ class CodeIndex {
       });
     }
 
-    if (count) return { total: allEntries.length };
+    if (count) return { total: allEntries.length, missingFocusFiles };
 
     const { items } = paginate(allEntries, { offset, limit });
 
@@ -397,6 +416,7 @@ class CodeIndex {
         shownSymbols: items.length,
         totalFiles,
         totalSymbols,
+        missingFocusFiles,
       };
     }
 
@@ -421,6 +441,7 @@ class CodeIndex {
       shownSymbols: items.length,
       totalFiles,
       totalSymbols,
+      missingFocusFiles,
     };
   }
 
@@ -608,45 +629,48 @@ class CodeIndex {
     const paged = paginate(results, { offset, limit }).items;
 
     if (context > 0) {
-      // Match call sites: symbol followed by ( — avoids string literals and definitions
       const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const callPattern = new RegExp(`(?<![a-zA-Z0-9_])${escaped}\\s*\\(`);
       const jsxPattern = new RegExp(`<\\s*${escaped}(?=[\\s>/.]|$)`);
       const memberPattern = new RegExp(`\\.\\s*${escaped}\\b`);
       const bracketPattern = new RegExp(`\\[\\s*['"\`]${escaped}['"\`]\\s*\\]`);
-      // Fallback: import/from lines that reference the symbol
       const importPattern = new RegExp(`(?:import|from)\\s.*\\b${escaped}\\b`);
+      const identPattern = new RegExp(`(?<![a-zA-Z0-9_])${escaped}(?![a-zA-Z0-9_])`);
 
-      // Collect the target symbol's own definition ranges to exclude
+      // Collect the target symbol's own definition ranges & kinds
       const defRanges = [];
+      let isNonCallableTarget = false;
       for (const tk of targetKeys) {
         try {
           const attrs = graph.getNodeAttributes(tk);
-          if (attrs.type === 'symbol') defRanges.push({ file: attrs.file, start: attrs.lineStart, end: attrs.lineEnd });
+          if (attrs.type === 'symbol') {
+            defRanges.push({ file: attrs.file, start: attrs.lineStart, end: attrs.lineEnd });
+            if (attrs.kind === 'variable' || attrs.kind === 'type') isNonCallableTarget = true;
+          }
         } catch { /* skip */ }
       }
 
       for (const entry of paged) {
         entry.sites = [];
         try {
-          const absPath = join(this.projectRoot, entry.file);
+          const absPath = this._absPath(entry.file);
           const source = await readFile(absPath, 'utf-8');
           const lines = source.split('\n');
 
           for (let i = 0; i < lines.length; i++) {
             const lineNum = i + 1;
-            // Skip lines inside the symbol's own definition
             const inDef = defRanges.some(r => r.file === entry.file && lineNum >= r.start && lineNum <= r.end);
             if (inDef) continue;
 
             const line = lines[i];
-            if (
-              !callPattern.test(line) &&
-              !jsxPattern.test(line) &&
-              !memberPattern.test(line) &&
-              !bracketPattern.test(line) &&
-              !importPattern.test(line)
-            ) continue;
+            const matched =
+              callPattern.test(line) ||
+              jsxPattern.test(line) ||
+              memberPattern.test(line) ||
+              bracketPattern.test(line) ||
+              importPattern.test(line) ||
+              (isNonCallableTarget && identPattern.test(line));
+            if (!matched) continue;
 
             const start = Math.max(0, i - context);
             const end = Math.min(lines.length - 1, i + context);
@@ -1084,22 +1108,25 @@ class CodeIndex {
     // Read the source file
     let source, lines;
     try {
-      const absPath = join(this.projectRoot, target.file);
+      const absPath = this._absPath(target.file);
       source = await readFile(absPath, 'utf-8');
       lines = source.split('\n');
     } catch {
       return null;
     }
 
-    // Extract the function body text
     const bodyLines = lines.slice(target.lineStart - 1, target.lineEnd);
-    const bodyText = bodyLines.join('\n');
+    const targetFamily = getLanguageFamily(target.file);
+    const importReach = buildImportReachability(graph);
+    const reachableFiles = importReach.getReachable(target.file, 4);
 
-    // Build a set of all symbol names in the graph.
-    const allSymbols = new Map(); // name -> [{ file, kind, signature, lineStart, score }]
+    // Build same-language-family symbol lookup, preferring same-file and imported targets.
+    const allSymbols = new Map();
     graph.forEachNode((node, attrs) => {
       if (attrs.type !== 'symbol') return;
-      if (attrs.file === target.file && attrs.name === target.name) return; // skip self
+      if (attrs.file === target.file && attrs.name === target.name) return;
+      if (getLanguageFamily(attrs.file) !== targetFamily) return;
+      if (attrs.file !== target.file && attrs.exported === false) return;
       if (!allSymbols.has(attrs.name)) allSymbols.set(attrs.name, []);
       allSymbols.get(attrs.name).push({
         key: node,
@@ -1109,21 +1136,23 @@ class CodeIndex {
         lineStart: attrs.lineStart,
         lineEnd: attrs.lineEnd,
         score: scoreMap.get(node) || 0,
+        hop: attrs.file === target.file ? 0 : (reachableFiles?.get(attrs.file) ?? 99),
       });
     });
 
     for (const defs of allSymbols.values()) {
       defs.sort((a, b) =>
-        Number(b.file === target.file) - Number(a.file === target.file)
+        a.hop - b.hop
         || (b.score || 0) - (a.score || 0)
         || a.file.localeCompare(b.file)
         || a.lineStart - b.lineStart,
       );
     }
 
-    // Parse the single target file on-demand for exact AST-scoped local refs
-    // (saves ~25% of persisted index cache size without losing context accuracy).
+    // Parse the single target file on-demand for AST-only local refs (never
+    // regex-scanning docstrings, comments, or string literals).
     let scopedLocalRefs = [];
+    let localBindings = new Set();
     try {
       const parsedTarget = parseFile(target.file, source, { includeLocalRefs: true });
       if (parsedTarget) {
@@ -1131,30 +1160,22 @@ class CodeIndex {
           d => d.name === target.name && d.lineStart === target.lineStart,
         ) || parsedTarget.definitions.find(d => d.name === target.name);
         if (matchedDef?.localRefs) scopedLocalRefs = matchedDef.localRefs;
+        if (matchedDef?.localBindings) localBindings = new Set(matchedDef.localBindings);
       }
     } catch {
-      // fall through to regex fallback
+      // Unparseable target — return empty usedSymbols rather than noisy regex matches
     }
 
-    // Find symbols referenced in the body, preferring parser-scoped local refs.
     const referenceNames = new Set();
     for (const name of scopedLocalRefs) {
       if (!name || name.length < 3) continue;
       if (CONTEXT_NOISE_NAMES.has(name)) continue;
-      if (!allSymbols.has(name)) continue;
+      if (localBindings.has(name)) continue;
+      const defs = allSymbols.get(name);
+      if (!defs || defs.length === 0) continue;
+      // Only include same-file or import-reachable definitions (or unique property/type)
+      if (defs[0].hop > 4 && defs[0].kind !== 'property') continue;
       referenceNames.add(name);
-    }
-
-    // Fallback for older caches or definitions without scoped refs.
-    if (referenceNames.size === 0) {
-      for (const name of allSymbols.keys()) {
-        if (name.length < 3) continue;
-        if (CONTEXT_NOISE_NAMES.has(name)) continue;
-        const pattern = new RegExp(`(?<![a-zA-Z0-9_])${escapeRegExp(name)}(?![a-zA-Z0-9_])`);
-        if (pattern.test(bodyText)) {
-          referenceNames.add(name);
-        }
-      }
     }
 
     const usedSymbols = [];
@@ -1166,7 +1187,6 @@ class CodeIndex {
     usedSymbols.sort((a, b) => (CONTEXT_KIND_ORDER[a.kind] ?? 9) - (CONTEXT_KIND_ORDER[b.kind] ?? 9) || a.name.localeCompare(b.name));
 
     // Resolve type annotations in the signature
-    // Extract type-like tokens from the signature (capitalized words, common patterns)
     const typeRefs = [];
     const sigText = target.signature || '';
     const typePattern = /(?<![a-zA-Z0-9_])([A-Z][a-zA-Z0-9_]+)(?![a-zA-Z0-9_])/g;
@@ -1178,17 +1198,15 @@ class CodeIndex {
       seenTypes.add(typeName);
       const typeDefs = allSymbols.get(typeName);
       if (!typeDefs) continue;
-      // Find the type definition and get its fields (expand its body)
       const best = typeDefs[0];
       if (best.kind === 'class' || best.kind === 'type') {
         let fields = null;
         try {
-          const typeAbsPath = join(this.projectRoot, best.file);
+          const typeAbsPath = this._absPath(best.file);
           const typeSource = await readFile(typeAbsPath, 'utf-8');
           const typeLines = typeSource.split('\n');
-          // Extract the body lines (up to 15 lines to keep it compact)
           const maxPreview = 15;
-          const bodyStart = best.lineStart; // 1-indexed
+          const bodyStart = best.lineStart;
           const bodyEnd = Math.min(best.lineEnd, best.lineStart + maxPreview - 1);
           fields = typeLines.slice(bodyStart - 1, bodyEnd).map(l => l);
           if (best.lineEnd > bodyEnd) {
@@ -1261,21 +1279,33 @@ class CodeIndex {
     candidates.sort((a, b) => (scoreMap.get(b.key) || 0) - (scoreMap.get(a.key) || 0));
     const target = candidates[0];
 
+    // Resolve git root and file path relative to its owning root (multi-root safe)
+    let gitCwd = this.projectRoot;
+    let gitRelFile = target.file;
+    if (this.cache.isMultiRoot) {
+      for (const r of this.roots) {
+        const pfx = `${r.prefix}/`;
+        if (target.file.startsWith(pfx)) {
+          gitCwd = r.path;
+          gitRelFile = target.file.slice(pfx.length);
+          break;
+        }
+      }
+    }
+
     const { execSync } = await import('child_process');
     try {
       if (patch) {
         const raw = execSync(
-          `git log -L ${target.lineStart},${target.lineEnd}:${target.file} --skip=${offset} -n ${limit}`,
-          { cwd: this.projectRoot, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 }
+          `git log -L ${target.lineStart},${target.lineEnd}:${gitRelFile} --skip=${offset} -n ${limit}`,
+          { cwd: gitCwd, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 }
         ).trim();
-        // Collapse unchanged context lines in diffs — keep 2 lines around changes
         const collapsed = _collapseDiffContext(raw, 2);
         return { definition: target, commits: [], raw: collapsed };
       }
-      // Summary only
       const output = execSync(
-        `git log -L ${target.lineStart},${target.lineEnd}:${target.file} --no-patch --format="%h  %ad  %s" --date=short --skip=${offset} -n ${limit}`,
-        { cwd: this.projectRoot, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 }
+        `git log -L ${target.lineStart},${target.lineEnd}:${gitRelFile} --no-patch --format="%h  %ad  %s" --date=short --skip=${offset} -n ${limit}`,
+        { cwd: gitCwd, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 }
       ).trim();
       const commits = output ? output.split('\n').filter(Boolean) : [];
       return { definition: target, commits };
@@ -1322,14 +1352,35 @@ class CodeIndex {
 
     // Cache of file -> definitions (avoid re-parsing the same file)
     const defCache = new Map();
+    const sourceCache = new Map();
+
+    const getFileSource = async (filePath) => {
+      if (sourceCache.has(filePath)) return sourceCache.get(filePath);
+      try {
+        const source = await readFile(this._absPath(filePath), 'utf-8');
+        sourceCache.set(filePath, source);
+        return source;
+      } catch {
+        sourceCache.set(filePath, null);
+        return null;
+      }
+    };
 
     const getFileDefs = async (filePath) => {
       if (defCache.has(filePath)) return defCache.get(filePath);
+      const source = await getFileSource(filePath);
+      if (!source) {
+        defCache.set(filePath, []);
+        return [];
+      }
       try {
-        const absPath = join(this.projectRoot, filePath);
-        const source = await readFile(absPath, 'utf-8');
         const parsed = parseFile(filePath, source);
-        const defs = parsed ? parsed.definitions.sort((a, b) => a.lineStart - b.lineStart) : [];
+        // Sort by start line asc, then span desc so innermost containing def is last
+        const defs = parsed
+          ? parsed.definitions
+            .filter(d => d.kind !== 'class' && d.kind !== 'type')
+            .sort((a, b) => a.lineStart - b.lineStart || (b.lineEnd - b.lineStart) - (a.lineEnd - a.lineStart))
+          : [];
         defCache.set(filePath, defs);
         return defs;
       } catch {
@@ -1338,7 +1389,6 @@ class CodeIndex {
       }
     };
 
-    // Find which definition in a file contains a given line
     const findContainingDef = (defs, line) => {
       for (let i = defs.length - 1; i >= 0; i--) {
         if (line >= defs[i].lineStart && line <= defs[i].lineEnd) return defs[i];
@@ -1346,8 +1396,7 @@ class CodeIndex {
       return null;
     };
 
-    // BFS upward through callers
-    const visited = new Set(); // "file::symbol" keys to prevent cycles
+    const visited = new Set();
 
     const buildNode = async (symbolName, symbolFile, symbolLine, currentDepth) => {
       const nodeKey = `${symbolFile}::${symbolName}`;
@@ -1357,61 +1406,71 @@ class CodeIndex {
       if (visited.has(nodeKey)) return node;
       visited.add(nodeKey);
 
-      // Find this symbol in the graph
       const symKeys = [];
+      let selfRange = null;
       graph.forEachNode((gNode, attrs) => {
         if (attrs.type !== 'symbol') return;
         if (attrs.name !== symbolName) return;
         if (attrs.file !== symbolFile) return;
         symKeys.push(gNode);
+        if (!selfRange || attrs.lineStart === symbolLine) {
+          selfRange = { start: attrs.lineStart, end: attrs.lineEnd };
+        }
       });
 
-      // Collect caller files
-      const callerFiles = new Set();
+      // Collect caller files — INCLUDING intra-file callers (symbolFile itself)
+      const callerFiles = new Set([symbolFile]);
       for (const sk of symKeys) {
         graph.forEachInEdge(sk, (_edge, attrs, source) => {
           if (attrs.type !== 'REFERENCES') return;
           const sourceAttrs = graph.getNodeAttributes(source);
           const sf = sourceAttrs.file || source;
-          if (sf !== symbolFile) callerFiles.add(sf);
+          callerFiles.add(sf);
         });
       }
 
-      // For each caller file, find which function contains the call
-      const callPattern = new RegExp(
-        `(?<![a-zA-Z0-9_])${symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`
-      );
+      const escaped = escapeRegExp(symbolName);
+      const callPattern = new RegExp(`(?<![a-zA-Z0-9_])${escaped}\\s*\\(`);
+      const memberCallPattern = new RegExp(`\\.\\s*${escaped}\\s*\\(`);
+      const addedCallers = new Set();
 
       for (const callerFile of callerFiles) {
-        try {
-          const absPath = join(this.projectRoot, callerFile);
-          const source = await readFile(absPath, 'utf-8');
-          const lines = source.split('\n');
-          const defs = await getFileDefs(callerFile);
+        const source = await getFileSource(callerFile);
+        if (!source) continue;
+        const lines = source.split('\n');
+        const defs = await getFileDefs(callerFile);
 
-          // Find the first call site line
-          let callLine = null;
-          for (let i = 0; i < lines.length; i++) {
-            if (callPattern.test(lines[i])) { callLine = i + 1; break; }
+        // Scan ALL call sites in this caller file so multiple enclosing callers
+        // (and intra-file callers outside selfRange) are discovered.
+        let foundAnyInFile = false;
+        let moduleCallLine = null;
+        for (let i = 0; i < lines.length; i++) {
+          const lineNum = i + 1;
+          if (callerFile === symbolFile && selfRange && lineNum >= selfRange.start && lineNum <= selfRange.end) {
+            continue;
           }
+          if (!callPattern.test(lines[i]) && !memberCallPattern.test(lines[i])) continue;
 
-          // Resolve to containing function
-          const containingDef = callLine ? findContainingDef(defs, callLine) : null;
-
+          const containingDef = findContainingDef(defs, lineNum);
           if (containingDef) {
+            if (callerFile === symbolFile && containingDef.name === symbolName) continue;
+            const cKey = `${callerFile}::${containingDef.name}`;
+            if (addedCallers.has(cKey)) continue;
+            addedCallers.add(cKey);
+            foundAnyInFile = true;
             const callerNode = await buildNode(containingDef.name, callerFile, containingDef.lineStart, currentDepth + 1);
             node.callers.push(callerNode);
-          } else {
-            // Top-level call (not inside any function) — show as file-level
-            node.callers.push({ name: `<module>`, file: callerFile, line: callLine, callers: [] });
+          } else if (moduleCallLine === null) {
+            moduleCallLine = lineNum;
           }
-        } catch {
-          // Skip unreadable files
+        }
+
+        if (!foundAnyInFile && moduleCallLine !== null && callerFile !== symbolFile) {
+          node.callers.push({ name: '<module>', file: callerFile, line: moduleCallLine, callers: [] });
         }
       }
 
-      // Sort callers by file for deterministic output
-      node.callers.sort((a, b) => a.file.localeCompare(b.file));
+      node.callers.sort((a, b) => a.file.localeCompare(b.file) || a.name.localeCompare(b.name));
       return node;
     };
 
@@ -1457,14 +1516,13 @@ class CodeIndex {
     // by looking at REFERENCES edges from the symbol's file to other symbols,
     // then filtering to references that occur within the symbol's line range.
 
-    // Cache of file -> definitions
+    // Cache of file -> parsed definitions (with AST-only localRefs & localBindings)
     const defCache = new Map();
     const getFileDefs = async (filePath) => {
       if (defCache.has(filePath)) return defCache.get(filePath);
       try {
-        const absPath = join(this.projectRoot, filePath);
-        const source = await readFile(absPath, 'utf-8');
-        const parsed = parseFile(filePath, source);
+        const source = await readFile(this._absPath(filePath), 'utf-8');
+        const parsed = parseFile(filePath, source, { includeLocalRefs: true });
         const defs = parsed ? parsed.definitions.sort((a, b) => a.lineStart - b.lineStart) : [];
         defCache.set(filePath, defs);
         return defs;
@@ -1484,60 +1542,42 @@ class CodeIndex {
       if (visited.has(nodeKey)) return node;
       visited.add(nodeKey);
 
-      // Find the definition's line range so we know which references belong to it
       const defs = await getFileDefs(symbolFile);
       const thisDef = defs.find(d => d.name === symbolName && d.lineStart === symbolLine)
         || defs.find(d => d.name === symbolName);
       if (!thisDef) return node;
 
-      // Get the source to find call sites within this function's body
-      let sourceLines;
-      try {
-        const absPath = join(this.projectRoot, symbolFile);
-        const source = await readFile(absPath, 'utf-8');
-        sourceLines = source.split('\n');
-      } catch {
-        return node;
-      }
+      const localRefSet = new Set(thisDef.localRefs || []);
+      const localBindingSet = new Set(thisDef.localBindings || []);
+      if (localRefSet.size === 0) return node;
 
-      // Find the file node in the graph for this symbol's file
       const fileNodeKey = symbolFile;
-
-      // Collect all symbols that this file references (outgoing REFERENCES from file node)
-      const referencedSymbols = new Map(); // name -> {file, line, name}
+      const referencedSymbols = new Map();
       if (graph.hasNode(fileNodeKey)) {
         graph.forEachOutEdge(fileNodeKey, (_edge, attrs, _source, target) => {
           if (attrs.type !== 'REFERENCES') return;
           const targetAttrs = graph.getNodeAttributes(target);
           if (targetAttrs.type !== 'symbol') return;
-          // Skip self-references
           if (targetAttrs.name === symbolName && targetAttrs.file === symbolFile) return;
+          if (targetAttrs.kind !== 'function' && targetAttrs.kind !== 'method' && targetAttrs.kind !== 'class' && targetAttrs.kind !== 'property') return;
           referencedSymbols.set(`${targetAttrs.file}::${targetAttrs.name}`, {
             name: targetAttrs.name,
             file: targetAttrs.file,
-            line: targetAttrs.lineStart
+            line: targetAttrs.lineStart,
           });
         });
       }
 
-      // Filter to references that appear within this function's line range
-      for (const [key, ref] of referencedSymbols) {
-        const callPattern = new RegExp(
-          `(?<![a-zA-Z0-9_])${ref.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`
-        );
+      for (const [_key, ref] of referencedSymbols) {
+        if (!localRefSet.has(ref.name)) continue;
+        // Skip local lexical variable bindings (e.g. `const apply = () => ...`)
+        if (localBindingSet.has(ref.name)) continue;
+        if (STDLIB_RECEIVERS.has(ref.name)) continue;
 
-        let found = false;
-        for (let i = thisDef.lineStart - 1; i < Math.min(thisDef.lineEnd, sourceLines.length); i++) {
-          if (callPattern.test(sourceLines[i])) { found = true; break; }
-        }
-
-        if (found) {
-          const calleeNode = await buildNode(ref.name, ref.file, ref.line, currentDepth + 1);
-          node.callees.push(calleeNode);
-        }
+        const calleeNode = await buildNode(ref.name, ref.file, ref.line, currentDepth + 1);
+        node.callees.push(calleeNode);
       }
 
-      // Sort callees by file then name for deterministic output
       node.callees.sort((a, b) => a.file.localeCompare(b.file) || a.name.localeCompare(b.name));
       return node;
     };

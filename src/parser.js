@@ -78,7 +78,6 @@ const LANG_MAP = {
   '.php': 'php',
 };
 
-// Only include extensions for grammars that are actually installed
 const SUPPORTED_EXTENSIONS = Object.keys(LANG_MAP).filter(ext =>
   AVAILABLE_LANGUAGES.has(LANG_MAP[ext]),
 );
@@ -99,6 +98,16 @@ function getLanguage(ext) {
 
 function getLangName(ext) {
   return LANG_MAP[ext] || null;
+}
+
+function getLanguageFamily(filePath) {
+  const dotIdx = filePath.lastIndexOf('.');
+  if (dotIdx === -1) return 'other';
+  const lang = LANG_MAP[filePath.substring(dotIdx)];
+  if (!lang) return 'other';
+  if (lang === 'javascript' || lang === 'typescript' || lang === 'tsx') return 'js';
+  if (lang === 'c' || lang === 'cpp') return 'c';
+  return lang;
 }
 
 function getCachedParser(langName, lang) {
@@ -136,12 +145,7 @@ const DEF_QUERIES = {
     (method_definition name: (property_identifier) @name) @definition
     (export_statement declaration: (function_declaration name: (identifier) @name) @definition)
     (export_statement declaration: (class_declaration name: (identifier) @name) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (call_expression) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (new_expression) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (object) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (array) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name)) @definition)
   `,
 
   typescript: `
@@ -154,12 +158,7 @@ const DEF_QUERIES = {
     (enum_declaration name: (identifier) @name) @definition
     (export_statement declaration: (function_declaration name: (identifier) @name) @definition)
     (export_statement declaration: (class_declaration name: (type_identifier) @name) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (function_expression) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (call_expression) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (new_expression) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (object) @_val)) @definition)
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (array) @_val)) @definition)
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name)) @definition)
     (export_statement declaration: (interface_declaration name: (type_identifier) @name) @definition)
     (export_statement declaration: (type_alias_declaration name: (type_identifier) @name) @definition)
     (export_statement declaration: (enum_declaration name: (identifier) @name) @definition)
@@ -235,10 +234,11 @@ DEF_QUERIES.tsx = DEF_QUERIES.typescript;
 const REF_QUERIES = {
   javascript: `
     (call_expression function: (identifier) @ref)
-    (call_expression function: (member_expression property: (property_identifier) @method_ref))
-    (import_specifier name: (identifier) @ref)
-    (import_clause (identifier) @ref)
-    (member_expression property: (property_identifier) @prop_ref)
+    (call_expression function: (member_expression object: (_) @method_recv property: (property_identifier) @method_ref))
+    (import_specifier name: (identifier) @import_ref)
+    (import_clause (identifier) @import_ref)
+    (export_specifier name: (identifier) @import_ref)
+    (member_expression object: (_) @prop_recv property: (property_identifier) @prop_ref)
     (jsx_opening_element (identifier) @jsx_ref)
     (jsx_self_closing_element (identifier) @jsx_ref)
     (jsx_opening_element (member_expression (identifier) @jsx_ref))
@@ -247,19 +247,21 @@ const REF_QUERIES = {
 
   typescript: `
     (call_expression function: (identifier) @ref)
-    (call_expression function: (member_expression property: (property_identifier) @method_ref))
-    (import_specifier name: (identifier) @ref)
-    (import_clause (identifier) @ref)
-    (member_expression property: (property_identifier) @prop_ref)
+    (call_expression function: (member_expression object: (_) @method_recv property: (property_identifier) @method_ref))
+    (import_specifier name: (identifier) @import_ref)
+    (import_clause (identifier) @import_ref)
+    (export_specifier name: (identifier) @import_ref)
+    (member_expression object: (_) @prop_recv property: (property_identifier) @prop_ref)
     (type_identifier) @ref
   `,
 
   tsx: `
     (call_expression function: (identifier) @ref)
-    (call_expression function: (member_expression property: (property_identifier) @method_ref))
-    (import_specifier name: (identifier) @ref)
-    (import_clause (identifier) @ref)
-    (member_expression property: (property_identifier) @prop_ref)
+    (call_expression function: (member_expression object: (_) @method_recv property: (property_identifier) @method_ref))
+    (import_specifier name: (identifier) @import_ref)
+    (import_clause (identifier) @import_ref)
+    (export_specifier name: (identifier) @import_ref)
+    (member_expression object: (_) @prop_recv property: (property_identifier) @prop_ref)
     (type_identifier) @ref
     (jsx_opening_element (identifier) @jsx_ref)
     (jsx_self_closing_element (identifier) @jsx_ref)
@@ -269,7 +271,8 @@ const REF_QUERIES = {
 
   python: `
     (call function: (identifier) @ref)
-    (call function: (attribute attribute: (identifier) @method_ref))
+    (call function: (attribute object: (_) @method_recv attribute: (identifier) @method_ref))
+    (attribute object: (_) @prop_recv attribute: (identifier) @prop_ref)
     (decorator (identifier) @ref)
   `,
 
@@ -297,18 +300,41 @@ const REF_QUERIES = {
 const IMPORT_QUERIES = {
   javascript: `
     (import_statement source: (string) @import_path)
-    (export_statement source: (string) @import_path)
+    (export_statement source: (string) @reexport_path)
     (call_expression function: (identifier) @require_fn arguments: (arguments (string) @import_path))
   `,
 
   typescript: `
     (import_statement source: (string) @import_path)
-    (export_statement source: (string) @import_path)
+    (export_statement source: (string) @reexport_path)
     (call_expression function: (identifier) @require_fn arguments: (arguments (string) @import_path))
+  `,
+
+  python: `
+    (import_statement) @py_import
+    (import_from_statement) @py_import_from
   `,
 };
 
 IMPORT_QUERIES.tsx = IMPORT_QUERIES.typescript;
+
+// Standard-library / builtin receivers whose methods should never wire to user code.
+const STDLIB_RECEIVERS = new Set([
+  // JS / TS builtins
+  'Promise', 'Object', 'Array', 'Math', 'JSON', 'Number', 'String', 'Boolean',
+  'Date', 'Map', 'Set', 'WeakMap', 'WeakSet', 'RegExp', 'Symbol', 'Reflect',
+  'Proxy', 'Error', 'TypeError', 'RangeError', 'Buffer', 'Uint8Array', 'BigInt',
+  'console', 'process', 'window', 'document', 'globalThis', 'URL', 'URLSearchParams',
+  'Intl', 'Response', 'Request', 'Headers', 'FormData', 'AbortController', 'crypto',
+  // Test frameworks
+  'vi', 'jest', 'expect', 'assert', 'describe', 'it', 'test', 'pytest', 'unittest',
+  // Python builtins / stdlib
+  'dict', 'list', 'set', 'tuple', 'str', 'int', 'float', 'bool', 'bytes',
+  'os', 'sys', 're', 'json', 'math', 'time', 'datetime', 'pathlib', 'Path',
+  'logging', 'logger', 'typing', 'collections', 'itertools', 'functools',
+  'asyncio', 'subprocess', 'shutil', 'tempfile', 'copy', 'dataclasses', 'enum',
+  'hashlib', 'hmac', 'base64', 'uuid', 'urllib', 'io', 'csv', 'struct', 'random',
+]);
 
 const KIND_MAP = {
   function_declaration: 'function',
@@ -372,18 +398,14 @@ const LITERAL_VALUE_TYPES = new Set([
   'regex',
 ]);
 
-const OUTLINE_EXTRA_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
-const INDEX_EXTRA_LANGUAGES = new Set(['javascript', 'typescript', 'tsx']);
+const JS_LANGS = new Set(['javascript', 'typescript', 'tsx']);
 const OUTLINE_BODY_TYPES = new Set(['statement_block', 'class_body', 'object', 'array']);
 const OUTLINE_CALL_TYPES = new Set(['call_expression', 'new_expression']);
 const SEMANTIC_CONTAINER_NAME_RE = /(router|routes|handlers|actions|reducers|selectors|queries|mutations|registry|registries|map|maps|config|configs|options|endpoints|procedures)$/i;
-const NON_SEMANTIC_CONTAINER_NAME_RE = /(schema|shape|validator|payload|params?|props?|input|output|response|request|dto)$/i;
-const NON_SEMANTIC_CALLEE_NAME_RE = /^(object|array|enum|union|literal|record|tuple|pick|omit|extend|merge|intersection|partial|strictObject|looseObject)$/i;
+const NON_SEMANTIC_CONTAINER_NAME_RE = /(schema|shape|validator|payload|params?|props?|input|output|response|request|dto|mock|fixture|stub|fake|test)$/i;
+const NON_SEMANTIC_CALLEE_NAME_RE = /^(object|array|enum|union|literal|record|tuple|pick|omit|extend|merge|intersection|partial|strictObject|looseObject|createMock.*|mock.*|vi|jest)$/i;
+const PY_CONSTANT_NAME_RE = /^[A-Z][A-Z0-9_]+$/;
 
-/**
- * Check whether a definition node is nested inside another function/method body
- * (e.g., local helper arrows like `const helper = () => ...` inside a function).
- */
 function isNestedInsideFunction(node) {
   let cur = node.parent;
   while (cur) {
@@ -393,9 +415,6 @@ function isNestedInsideFunction(node) {
   return false;
 }
 
-/**
- * Check whether a function node is directly inside a class body (e.g., Python methods).
- */
 function isDirectClassMethod(node) {
   let cur = node.parent;
   while (cur) {
@@ -406,10 +425,98 @@ function isDirectClassMethod(node) {
   return false;
 }
 
+function isNodeExported(node, langName) {
+  if (!JS_LANGS.has(langName)) return true;
+  let cur = node;
+  while (cur) {
+    if (cur.type === 'export_statement') return true;
+    cur = cur.parent;
+  }
+  return false;
+}
+
 /**
- * Extract parameter names from a function's tree-sitter node.
- * Used by compare.js; skipped during normal indexing for speed/footprint.
+ * Collect names re-exported at the bottom of a JS/TS file:
+ *   export { foo, bar as baz }
+ *   export default Foo
+ *   module.exports = { foo, bar }
  */
+function collectJsBottomExports(rootNode) {
+  const exported = new Set();
+  for (let i = 0; i < rootNode.namedChildCount; i++) {
+    const stmt = rootNode.namedChild(i);
+    if (stmt.type === 'export_statement') {
+      // Skip `export ... from '...'` (re-export of another file)
+      if (stmt.childForFieldName('source')) continue;
+      for (let j = 0; j < stmt.namedChildCount; j++) {
+        const ch = stmt.namedChild(j);
+        if (ch.type === 'export_clause') {
+          for (let k = 0; k < ch.namedChildCount; k++) {
+            const spec = ch.namedChild(k);
+            if (spec.type === 'export_specifier') {
+              const nameNode = spec.childForFieldName('name') || spec.namedChild(0);
+              if (nameNode) exported.add(nameNode.text);
+            }
+          }
+        } else if (ch.type === 'identifier') {
+          exported.add(ch.text);
+        }
+      }
+    } else if (stmt.type === 'expression_statement') {
+      const expr = stmt.namedChild(0);
+      if (expr?.type === 'assignment_expression') {
+        const left = expr.childForFieldName('left');
+        const right = expr.childForFieldName('right');
+        if (left?.text === 'module.exports' || left?.text?.startsWith('exports.')) {
+          if (right?.type === 'identifier') {
+            exported.add(right.text);
+          } else if (right?.type === 'object') {
+            for (let k = 0; k < right.namedChildCount; k++) {
+              const p = right.namedChild(k);
+              if (p.type === 'shorthand_property_identifier') exported.add(p.text);
+              else if (p.type === 'pair') {
+                const v = p.childForFieldName('value');
+                if (v?.type === 'identifier') exported.add(v.text);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return exported;
+}
+
+/**
+ * Collect JS/TS import aliases (`import { orig as local }`) so calls to `local()`
+ * also resolve back to `orig`.
+ */
+function collectJsImportAliases(rootNode) {
+  const aliases = new Map(); // localName -> originalName
+  for (let i = 0; i < rootNode.namedChildCount; i++) {
+    const stmt = rootNode.namedChild(i);
+    if (stmt.type !== 'import_statement') continue;
+    for (let j = 0; j < stmt.namedChildCount; j++) {
+      const clause = stmt.namedChild(j);
+      if (clause.type !== 'import_clause') continue;
+      for (let k = 0; k < clause.namedChildCount; k++) {
+        const named = clause.namedChild(k);
+        if (named.type !== 'named_imports') continue;
+        for (let m = 0; m < named.namedChildCount; m++) {
+          const spec = named.namedChild(m);
+          if (spec.type !== 'import_specifier') continue;
+          const orig = spec.childForFieldName('name');
+          const alias = spec.childForFieldName('alias');
+          if (orig && alias && orig.text !== alias.text) {
+            aliases.set(alias.text, orig.text);
+          }
+        }
+      }
+    }
+  }
+  return aliases;
+}
+
 function extractParamNames(node) {
   const params = [];
   const paramNodes = [];
@@ -460,7 +567,7 @@ function findCallArgumentBody(node, depth) {
 }
 
 function findBodyNode(node, depth = 0) {
-  if (!node || depth > 12) return null;
+  if (!node || depth > 8) return null;
   if (OUTLINE_BODY_TYPES.has(node.type)) return node;
 
   const body = node.childForFieldName('body');
@@ -491,7 +598,6 @@ function findBodyNode(node, depth = 0) {
 
 function computeBodyStartLine(node, bodyNode) {
   if (!bodyNode) return null;
-
   const bodyRow = bodyNode.startPosition.row;
   const defRow = node.startPosition.row;
   return bodyRow === defRow ? bodyRow + 2 : bodyRow + 1;
@@ -516,14 +622,16 @@ function createDefinition(
   node,
   filePath,
   langName,
-  { bodyStartLine = null, kind, includeParamNames = false } = {},
+  { bodyStartLine = null, kind, exported, includeParamNames = false } = {},
 ) {
   const bodyNode = findBodyNode(node);
   const resolvedBodyStartLine = bodyStartLine ?? computeBodyStartLine(node, bodyNode);
+  const resolvedExported = exported !== undefined ? exported : isNodeExported(node, langName);
 
   const def = {
     name,
     kind: resolveKind(node, kind),
+    exported: resolvedExported,
     file: filePath,
     lineStart: node.startPosition.row + 1,
     lineEnd: node.endPosition.row + 1,
@@ -547,7 +655,10 @@ function extractPairName(node) {
   }
 
   if (keyNode.type === 'string') {
-    return keyNode.text.replace(/^['"`]|['"`]$/g, '');
+    const cleaned = keyNode.text.replace(/^['"`]|['"`]$/g, '');
+    // Skip MongoDB / JSON-schema operator keys like `$expr`, `$in`, `$match`
+    if (cleaned.startsWith('$')) return null;
+    return cleaned;
   }
 
   return null;
@@ -566,14 +677,6 @@ function hasMultilinePairChildren(node) {
   return false;
 }
 
-function isTopLevelVariableDeclarator(node) {
-  if (!node || node.type !== 'variable_declarator') return false;
-  const decl = node.parent;
-  if (!decl || decl.type !== 'lexical_declaration') return false;
-  const container = decl.parent;
-  return !!container && (container.type === 'program' || container.type === 'export_statement');
-}
-
 function extractDeclaratorName(node) {
   const nameNode = node?.childForFieldName('name');
   return nameNode?.type === 'identifier' ? nameNode.text : null;
@@ -586,8 +689,8 @@ function extractCalleeLeafName(node) {
     return node.text;
   }
 
-  if (node.type === 'member_expression') {
-    const propertyNode = node.childForFieldName('property');
+  if (node.type === 'member_expression' || node.type === 'attribute') {
+    const propertyNode = node.childForFieldName('property') || node.childForFieldName('attribute');
     if (propertyNode) return extractCalleeLeafName(propertyNode);
     return extractCalleeLeafName(node.namedChild(node.namedChildCount - 1));
   }
@@ -604,17 +707,22 @@ function extractCallLikeCalleeName(node) {
   return extractCalleeLeafName(calleeNode);
 }
 
-function shouldIndexSemanticObjectMembers(node) {
-  if (!isTopLevelVariableDeclarator(node)) return false;
-
-  const variableName = extractDeclaratorName(node);
-  const valueNode = node.childForFieldName('value');
+function shouldIndexSemanticObjectMembers(declaratorNode, isExported) {
+  const variableName = extractDeclaratorName(declaratorNode);
+  const valueNode = declaratorNode.childForFieldName('value');
   const calleeName = extractCallLikeCalleeName(valueNode);
 
+  if (variableName && NON_SEMANTIC_CONTAINER_NAME_RE.test(variableName)) return false;
+
   const hasSemanticVariableName = !!variableName
-    && SEMANTIC_CONTAINER_NAME_RE.test(variableName)
-    && !NON_SEMANTIC_CONTAINER_NAME_RE.test(variableName);
+    && SEMANTIC_CONTAINER_NAME_RE.test(variableName);
   const hasSemanticCalleeName = !!calleeName && !NON_SEMANTIC_CALLEE_NAME_RE.test(calleeName);
+
+  // Only index object-literal members of non-exported containers if the variable name
+  // explicitly looks like a router/handler container; avoid indexing test mock fixtures.
+  if (!isExported) {
+    return valueNode?.type === 'object' && hasSemanticVariableName;
+  }
 
   if (valueNode?.type === 'object') {
     return hasSemanticVariableName;
@@ -639,13 +747,13 @@ function collectDirectPairDefinitions(node, filePath, langName, opts = {}) {
     if (!name) continue;
     if (child.endPosition.row <= child.startPosition.row) continue;
 
-    // Skip plain literal entries (e.g. query string maps like REF_QUERIES = { default: `...` })
     const valueNode = child.childForFieldName('value');
     if (valueNode && LITERAL_VALUE_TYPES.has(valueNode.type)) continue;
 
     definitions.push(createDefinition(name, child, filePath, langName, {
       bodyStartLine: child.startPosition.row + 2,
       kind: 'property',
+      exported: opts.exported ?? true,
       includeParamNames: opts.includeParamNames,
     }));
   }
@@ -653,31 +761,90 @@ function collectDirectPairDefinitions(node, filePath, langName, opts = {}) {
   return definitions;
 }
 
+/**
+ * Fast top-level-only collector for semantic object members (e.g. tRPC routers,
+ * exported handler maps). Inspects ONLY direct top-level statements of `rootNode`
+ * instead of recursively walking the entire AST across the N-API boundary.
+ */
 function collectIndexDefinitions(rootNode, filePath, langName, opts = {}) {
-  if (!INDEX_EXTRA_LANGUAGES.has(langName)) return [];
+  if (!JS_LANGS.has(langName)) return [];
 
   const definitions = [];
 
-  function visit(node) {
-    if (node.type === 'variable_declarator' && shouldIndexSemanticObjectMembers(node)) {
-      const bodyNode = findBodyNode(node);
-      if (bodyNode && bodyNode.type === 'object') {
-        definitions.push(...collectDirectPairDefinitions(bodyNode, filePath, langName, opts));
-      }
-      return;
+  for (let i = 0; i < rootNode.namedChildCount; i++) {
+    let stmt = rootNode.namedChild(i);
+    let isExported = false;
+    if (stmt.type === 'export_statement') {
+      isExported = true;
+      stmt = stmt.childForFieldName('declaration');
+      if (!stmt) continue;
     }
+    if (stmt.type !== 'lexical_declaration' && stmt.type !== 'variable_declaration') continue;
 
-    for (let i = 0; i < node.namedChildCount; i++) {
-      visit(node.namedChild(i));
+    for (let j = 0; j < stmt.namedChildCount; j++) {
+      const decl = stmt.namedChild(j);
+      if (decl.type !== 'variable_declarator') continue;
+      if (!shouldIndexSemanticObjectMembers(decl, isExported)) continue;
+
+      const bodyNode = findBodyNode(decl);
+      if (bodyNode && bodyNode.type === 'object') {
+        definitions.push(...collectDirectPairDefinitions(bodyNode, filePath, langName, {
+          ...opts,
+          exported: isExported,
+        }));
+      }
     }
   }
 
-  visit(rootNode);
+  return definitions;
+}
+
+/**
+ * Collect Python module-level constants (UPPER_CASE assignments and names listed
+ * in `__all__`) directly from top-level statements of `rootNode`.
+ */
+function collectPythonTopLevelConstants(rootNode, filePath) {
+  const definitions = [];
+  const allExports = new Set();
+  const topAssignments = [];
+
+  for (let i = 0; i < rootNode.namedChildCount; i++) {
+    const stmt = rootNode.namedChild(i);
+    if (stmt.type !== 'expression_statement') continue;
+    const assign = stmt.namedChild(0);
+    if (!assign || assign.type !== 'assignment') continue;
+
+    const left = assign.childForFieldName('left');
+    const right = assign.childForFieldName('right');
+    if (!left || left.type !== 'identifier') continue;
+
+    if (left.text === '__all__' && right && (right.type === 'list' || right.type === 'tuple')) {
+      for (let k = 0; k < right.namedChildCount; k++) {
+        const el = right.namedChild(k);
+        if (el.type === 'string') {
+          const name = el.text.replace(/^['"]|['"]$/g, '');
+          if (name) allExports.add(name);
+        }
+      }
+      continue;
+    }
+
+    topAssignments.push({ name: left.text, node: assign });
+  }
+
+  for (const { name, node } of topAssignments) {
+    if (!PY_CONSTANT_NAME_RE.test(name) && !allExports.has(name)) continue;
+    definitions.push(createDefinition(name, node, filePath, 'python', {
+      kind: 'variable',
+      exported: true,
+    }));
+  }
+
   return definitions;
 }
 
 function collectOutlineDefinitions(rootNode, filePath, langName) {
-  if (!OUTLINE_EXTRA_LANGUAGES.has(langName)) return [];
+  if (!JS_LANGS.has(langName)) return [];
 
   const definitions = [];
 
@@ -718,6 +885,10 @@ function collectOutlineDefinitions(rootNode, filePath, langName) {
 function extractSignature(node, langName, bodyNode = null) {
   const text = node.text;
   if (langName === 'python') {
+    if (node.type === 'assignment') {
+      const firstLine = text.split('\n')[0].trim();
+      return firstLine.length > 200 ? firstLine.substring(0, 200) + '...' : firstLine;
+    }
     const parenClose = text.indexOf(')');
     let colonIdx;
     if (parenClose !== -1) {
@@ -733,8 +904,6 @@ function extractSignature(node, langName, bodyNode = null) {
     return firstLine.trim();
   }
 
-  // Use tree-sitter's bodyNode start offset for functions/methods/classes so
-  // destructured parameters like `function foo({ a, b }) {` aren't truncated at `{`.
   if (
     bodyNode &&
     (bodyNode.type === 'statement_block' || bodyNode.type === 'class_body' || bodyNode.type === 'block') &&
@@ -771,50 +940,180 @@ function normalizeImportPathCapture(capture) {
   return text.replace(/^['"`]|['"`]$/g, '');
 }
 
-function createImportEntry(path, filePath, node) {
+function createImportEntry(path, filePath, node, { isReexport = false } = {}) {
   if (!path || !filePath || !node) return null;
   return {
     path,
     file: filePath,
     line: node.startPosition.row + 1,
+    isReexport,
   };
 }
 
-function collectPythonImports(rootNode, filePath) {
+/**
+ * Collect Python imports, submodule imports (`from . import taxonomy as tax`),
+ * imported symbol references (`from .catalog import CONST`, `from mod import fn as alias`),
+ * and local alias mappings (`alias -> original` and `alias -> modulePath`).
+ */
+function collectPythonImportsAndAliases(rootNode, filePath, lang) {
   const imports = [];
+  const importRefs = [];
+  const symbolAliases = new Map(); // localName -> originalSymbolName
+  const moduleAliases = new Map(); // localName -> moduleSpecifier
 
-  function push(path, node) {
+  function pushImport(path, node) {
     const entry = createImportEntry(path, filePath, node);
     if (entry) imports.push(entry);
   }
 
-  function visit(node) {
-    if (node.type === 'import_statement') {
+  function joinPythonMod(base, sub) {
+    if (!base) return sub;
+    if (/^\.+$/.test(base)) return `${base}${sub}`;
+    return `${base}.${sub}`;
+  }
+
+  const pyImportQuery = getCachedQuery('python', 'import', lang, IMPORT_QUERIES.python);
+  if (!pyImportQuery) {
+    return { imports, importRefs, symbolAliases, moduleAliases };
+  }
+
+  for (const match of pyImportQuery.matches(rootNode)) {
+    const capture = match.captures[0];
+    if (!capture) continue;
+    const node = capture.node;
+
+    if (capture.name === 'py_import') {
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child.type === 'dotted_name') {
-          push(child.text, child);
+          pushImport(child.text, child);
+          const leaf = child.text.split('.').pop();
+          if (leaf) moduleAliases.set(leaf, child.text);
           continue;
         }
         if (child.type === 'aliased_import') {
-          const moduleNode = child.namedChild(0);
+          const moduleNode = child.childForFieldName('name') || child.namedChild(0);
+          const aliasNode = child.childForFieldName('alias') || child.namedChild(1);
           if (moduleNode?.type === 'dotted_name') {
-            push(moduleNode.text, moduleNode);
+            pushImport(moduleNode.text, moduleNode);
+            if (aliasNode?.type === 'identifier') {
+              moduleAliases.set(aliasNode.text, moduleNode.text);
+            }
           }
         }
       }
-    } else if (node.type === 'import_from_statement') {
+    } else if (capture.name === 'py_import_from') {
       const moduleNode = node.childForFieldName('module_name');
-      if (moduleNode) push(moduleNode.text, moduleNode);
-    }
+      const modulePath = moduleNode ? moduleNode.text : null;
+      if (modulePath) {
+        pushImport(modulePath, moduleNode);
+      }
 
-    for (let i = 0; i < node.namedChildCount; i++) {
-      visit(node.namedChild(i));
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child === moduleNode) continue;
+
+        let origName = null;
+        let localName = null;
+        if (child.type === 'dotted_name' || child.type === 'identifier') {
+          origName = child.text;
+          localName = origName;
+        } else if (child.type === 'aliased_import') {
+          const n = child.childForFieldName('name') || child.namedChild(0);
+          const a = child.childForFieldName('alias') || child.namedChild(1);
+          if (n) origName = n.text;
+          if (a) localName = a.text;
+        }
+
+        if (!origName) continue;
+
+        if (modulePath) {
+          const subPath = joinPythonMod(modulePath, origName);
+          pushImport(subPath, child);
+          if (localName) moduleAliases.set(localName, subPath);
+        }
+
+        importRefs.push({
+          name: origName,
+          kind: 'symbol',
+          file: filePath,
+          line: child.startPosition.row + 1,
+        });
+
+        if (localName && localName !== origName) {
+          symbolAliases.set(localName, origName);
+        }
+      }
     }
   }
 
-  visit(rootNode);
-  return imports;
+  return { imports, importRefs, symbolAliases, moduleAliases };
+}
+
+/**
+ * Collect AST-only identifier references and local lexical bindings inside a
+ * definition node (skipping strings, docstrings, and comments).
+ * Used on-demand by `context()` and `callees()`.
+ */
+function collectLocalAstInfo(defNode) {
+  const refs = new Set();
+  const localBindings = new Set();
+
+  const SKIP_TYPES = new Set([
+    'string', 'string_content', 'string_fragment', 'template_string',
+    'comment', 'regex', 'number',
+  ]);
+
+  function walk(node, isRoot = false) {
+    if (!node || SKIP_TYPES.has(node.type)) return;
+
+    if (!isRoot) {
+      // Track local variable / parameter / inner function bindings so callees()
+      // doesn't confuse `const apply = () => ...` with an external symbol.
+      if (node.type === 'variable_declarator') {
+        const n = node.childForFieldName('name');
+        if (n?.type === 'identifier') localBindings.add(n.text);
+      } else if (node.type === 'assignment') {
+        const l = node.childForFieldName('left');
+        if (l?.type === 'identifier') localBindings.add(l.text);
+      } else if (node.type === 'required_parameter' || node.type === 'optional_parameter') {
+        const p = node.childForFieldName('pattern');
+        if (p?.type === 'identifier') localBindings.add(p.text);
+      } else if (node.type === 'parameters' || node.type === 'formal_parameters') {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const ch = node.namedChild(i);
+          if (ch.type === 'identifier') localBindings.add(ch.text);
+        }
+      }
+
+      if (node.type === 'identifier' || node.type === 'type_identifier') {
+        // Skip declaration names and property keys
+        const parent = node.parent;
+        const isDeclKey =
+          (parent?.type === 'pair' && parent.childForFieldName('key') === node) ||
+          (parent?.type === 'property_signature' && parent.childForFieldName('name') === node);
+        if (!isDeclKey) {
+          refs.add(node.text);
+        }
+      } else if (node.type === 'property_identifier') {
+        // Only include if receiver is NOT a stdlib object
+        const parent = node.parent;
+        if (parent?.type === 'member_expression') {
+          const recv = extractCalleeLeafName(parent.childForFieldName('object'));
+          if (!recv || !STDLIB_RECEIVERS.has(recv)) {
+            refs.add(node.text);
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+      walk(node.namedChild(i), false);
+    }
+  }
+
+  walk(defNode, true);
+  return { localRefs: [...refs], localBindings: [...localBindings] };
 }
 
 /**
@@ -841,8 +1140,10 @@ function parseFile(
   const tree = parser.parse(source);
 
   const definitions = [];
+  const defNodeByDef = includeLocalRefs ? new Map() : null;
   const references = [];
   const imports = [];
+  const jsBottomExports = JS_LANGS.has(langName) ? collectJsBottomExports(tree.rootNode) : null;
 
   const defQueryStr = DEF_QUERIES[langName] || null;
   if (defQueryStr) {
@@ -855,27 +1156,50 @@ function parseFile(
         if (!nameCapture) continue;
         const defNode = (defCapture || nameCapture).node;
 
-        // Skip local nested helper functions/arrows inside other function bodies
-        // when indexing the repo graph (keep them available for outline expansion).
         if (!includeOutlineDefinitions && isNestedInsideFunction(defNode)) continue;
 
-        // Deduplicate overlapping captures (e.g. export_statement + inner function_declaration)
-        const dedupKey = `${nameCapture.node.text}:${defNode.startPosition.row}`;
+        const name = nameCapture.node.text;
+        const dedupKey = `${name}:${defNode.startPosition.row}`;
         if (seenDefKeys.has(dedupKey)) continue;
         seenDefKeys.add(dedupKey);
 
-        definitions.push(
-          createDefinition(nameCapture.node.text, defNode, filePath, langName, {
-            includeParamNames,
-          }),
-        );
+        const exported = isNodeExported(defNode, langName)
+          || (jsBottomExports ? jsBottomExports.has(name) : false);
+
+        const def = createDefinition(name, defNode, filePath, langName, {
+          exported,
+          includeParamNames,
+        });
+        definitions.push(def);
+        if (defNodeByDef) defNodeByDef.set(def, defNode);
       }
     }
   }
 
-  definitions.push(
-    ...collectIndexDefinitions(tree.rootNode, filePath, langName, { includeParamNames }),
-  );
+  // Mark methods of bottom-exported JS/TS classes as exported
+  if (JS_LANGS.has(langName)) {
+    const exportedClassRanges = definitions
+      .filter(d => d.kind === 'class' && d.exported)
+      .map(d => [d.lineStart, d.lineEnd]);
+    if (exportedClassRanges.length > 0) {
+      for (const d of definitions) {
+        if (d.kind === 'method' && !d.exported) {
+          if (exportedClassRanges.some(([s, e]) => d.lineStart >= s && d.lineEnd <= e)) {
+            d.exported = true;
+          }
+        }
+      }
+    }
+  }
+
+  // Fast top-level-only semantic container members (tRPC routers, exported handler maps)
+  const extraIndexDefs = collectIndexDefinitions(tree.rootNode, filePath, langName, { includeParamNames });
+  definitions.push(...extraIndexDefs);
+
+  // Python module-level constants (`UPPER_CASE` and `__all__` members)
+  if (langName === 'python') {
+    definitions.push(...collectPythonTopLevelConstants(tree.rootNode, filePath));
+  }
 
   if (includeOutlineDefinitions) {
     definitions.push(...collectOutlineDefinitions(tree.rootNode, filePath, langName));
@@ -883,28 +1207,80 @@ function parseFile(
 
   // Skip reference & import queries when only generating a file outline
   if (!includeOutlineDefinitions) {
+    let symbolAliases = null;
+    let moduleAliases = null;
+
+    if (JS_LANGS.has(langName)) {
+      symbolAliases = collectJsImportAliases(tree.rootNode);
+    }
+
+    if (langName === 'python') {
+      const py = collectPythonImportsAndAliases(tree.rootNode, filePath, lang);
+      imports.push(...py.imports);
+      references.push(...py.importRefs);
+      symbolAliases = py.symbolAliases;
+      moduleAliases = py.moduleAliases;
+    }
+
     const refQueryStr = REF_QUERIES[langName] || REF_QUERIES.default;
     if (refQueryStr) {
       const refQuery = getCachedQuery(langName, 'ref', lang, refQueryStr);
       if (refQuery) {
         for (const match of refQuery.matches(tree.rootNode)) {
+          let methodRecv = null;
+          let propRecv = null;
+          for (const capture of match.captures) {
+            if (capture.name === 'method_recv') methodRecv = extractCalleeLeafName(capture.node);
+            else if (capture.name === 'prop_recv') propRecv = extractCalleeLeafName(capture.node);
+          }
+
           for (const capture of match.captures) {
             if (
               capture.name !== 'ref' &&
+              capture.name !== 'import_ref' &&
               capture.name !== 'jsx_ref' &&
               capture.name !== 'prop_ref' &&
               capture.name !== 'method_ref'
             ) continue;
-            const name = normalizeReferenceCapture(capture);
+            let name = normalizeReferenceCapture(capture);
             if (!name) continue;
-            const kind = capture.name === 'method_ref'
-              ? 'method'
-              : capture.name === 'prop_ref'
-                ? 'property'
-                : 'symbol';
+
+            if (capture.name === 'method_ref') {
+              if (methodRecv && STDLIB_RECEIVERS.has(methodRecv)) continue;
+              const receiverModule = moduleAliases?.get(methodRecv) || null;
+              references.push({
+                name,
+                kind: 'method',
+                receiver: methodRecv,
+                receiverModule,
+                file: filePath,
+                line: capture.node.startPosition.row + 1,
+              });
+              continue;
+            }
+
+            if (capture.name === 'prop_ref') {
+              if (propRecv && STDLIB_RECEIVERS.has(propRecv)) continue;
+              const receiverModule = moduleAliases?.get(propRecv) || null;
+              references.push({
+                name,
+                kind: 'property',
+                receiver: propRecv,
+                receiverModule,
+                file: filePath,
+                line: capture.node.startPosition.row + 1,
+              });
+              continue;
+            }
+
+            // Resolve import aliases (e.g. `fn_impl()` -> `compute_quality_metrics`)
+            if (capture.name === 'ref' && symbolAliases?.has(name)) {
+              name = symbolAliases.get(name);
+            }
+
             references.push({
               name,
-              kind,
+              kind: 'symbol',
               file: filePath,
               line: capture.node.startPosition.row + 1,
             });
@@ -913,7 +1289,7 @@ function parseFile(
       }
     }
 
-    const importQueryStr = IMPORT_QUERIES[langName] || null;
+    const importQueryStr = langName === 'python' ? null : (IMPORT_QUERIES[langName] || null);
     if (importQueryStr) {
       const importQuery = getCachedQuery(langName, 'import', lang, importQueryStr);
       if (importQuery) {
@@ -921,7 +1297,8 @@ function parseFile(
           const requireCapture = match.captures.find(c => c.name === 'require_fn');
           if (requireCapture && requireCapture.node.text !== 'require') continue;
 
-          const pathCapture = match.captures.find(c => c.name === 'import_path');
+          const reexportCapture = match.captures.find(c => c.name === 'reexport_path');
+          const pathCapture = reexportCapture || match.captures.find(c => c.name === 'import_path');
           const path = normalizeImportPathCapture(pathCapture);
           if (!path) continue;
 
@@ -929,19 +1306,25 @@ function parseFile(
             path,
             file: filePath,
             line: pathCapture.node.startPosition.row + 1,
+            isReexport: !!reexportCapture,
           });
         }
       }
     }
-
-    if (langName === 'python') {
-      imports.push(...collectPythonImports(tree.rootNode, filePath));
-    }
   }
 
-  if (includeLocalRefs && references.length > 0 && definitions.length > 0) {
+  // On-demand AST-only local references & lexical bindings (no docstring/string noise)
+  if (includeLocalRefs && definitions.length > 0) {
+    if (defNodeByDef) {
+      for (const [def, defNode] of defNodeByDef) {
+        const info = collectLocalAstInfo(defNode);
+        def.localRefs = info.localRefs;
+        def.localBindings = info.localBindings;
+      }
+    }
+    // Also attach line-scoped references for extra definitions (properties/constants)
     const sortedDefs = [...definitions].sort((a, b) => a.lineStart - b.lineStart);
-    const localRefSets = new Map();
+    const extraRefSets = new Map();
     for (const ref of references) {
       let enclosing = null;
       for (const def of sortedDefs) {
@@ -949,16 +1332,16 @@ function parseFile(
           enclosing = def;
         }
       }
-      if (enclosing) {
-        let set = localRefSets.get(enclosing);
+      if (enclosing && !enclosing.localRefs) {
+        let set = extraRefSets.get(enclosing);
         if (!set) {
           set = new Set();
-          localRefSets.set(enclosing, set);
+          extraRefSets.set(enclosing, set);
         }
         set.add(ref.name);
       }
     }
-    for (const [def, set] of localRefSets) {
+    for (const [def, set] of extraRefSets) {
       def.localRefs = [...set];
     }
   }
@@ -966,4 +1349,11 @@ function parseFile(
   return { file: filePath, definitions, references, imports };
 }
 
-export { parseFile, extractParamNames, SUPPORTED_EXTENSIONS, LANG_MAP };
+export {
+  parseFile,
+  extractParamNames,
+  getLanguageFamily,
+  STDLIB_RECEIVERS,
+  SUPPORTED_EXTENSIONS,
+  LANG_MAP,
+};

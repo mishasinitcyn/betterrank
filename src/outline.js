@@ -4,35 +4,63 @@ import { extname } from 'path';
 const MIN_COLLAPSE_LINES = 2;
 
 /**
+ * Parse a `--lines` range string such as `"120-260"` or `"120:260"`.
+ * Returns `[start, end]` (1-indexed inclusive) or null if invalid.
+ */
+export function parseLineRange(spec) {
+  if (!spec || typeof spec !== 'string') return null;
+  const m = spec.trim().match(/^(\d+)\s*[-:]\s*(\d+)$/);
+  if (!m) return null;
+  const start = parseInt(m[1], 10);
+  const end = parseInt(m[2], 10);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < start) return null;
+  return [start, end];
+}
+
+/**
  * Build an outline view of a source file.
- *
- * Without expandSymbols: returns a skeleton with function/method bodies collapsed
- * (classes and structural object containers stay expanded to reveal member signatures).
- * With expandSymbols: returns the full source of the specified symbols.
  *
  * @param {string} source - File contents
  * @param {string} filePath - File path (for language detection)
  * @param {string[]} expandSymbols - Symbol names to expand (empty = outline mode)
  * @param {object} [opts]
- * @param {Map<string,number>} [opts.callerCounts] - Map of symbol name -> caller file count (for --annotate)
+ * @param {Map<string,number>} [opts.callerCounts] - Symbol name -> caller file count (--annotate)
+ * @param {[number,number]|null} [opts.lineRange] - Optional [start, end] 1-indexed line slice
+ * @param {boolean} [opts.noComments=false] - Strip multi-line doc comments / docstrings
+ * @param {number} [opts.depth=1] - Container expansion depth (1 = classes/routers, 2 = also inner helpers inside functions/components)
+ * @param {boolean} [opts.collapseImports=false] - Collapse top-of-file import block (default false: keep imports visible)
  * @returns {string} Formatted output with line numbers
  */
-export function buildOutline(source, filePath, expandSymbols = [], { callerCounts } = {}) {
+export function buildOutline(
+  source,
+  filePath,
+  expandSymbols = [],
+  { callerCounts, lineRange = null, noComments = false, depth = 1, collapseImports = false } = {},
+) {
   const lines = source.split('\n');
   const pad = Math.max(String(lines.length).length, 4);
 
+  if (lineRange && expandSymbols.length === 0) {
+    const [start, end] = lineRange;
+    const clampedStart = Math.max(1, start);
+    const clampedEnd = Math.min(lines.length, end);
+    const out = [];
+    for (let i = clampedStart; i <= clampedEnd; i++) {
+      out.push(`${String(i).padStart(pad)}│ ${lines[i - 1]}`);
+    }
+    return out.join('\n');
+  }
+
   const ext = extname(filePath);
   if (!SUPPORTED_EXTENSIONS.includes(ext)) {
-    return rawView(lines, pad);
+    return rawView(lines, pad, lineRange);
   }
 
   const parsed = parseFile(filePath, source, { includeOutlineDefinitions: true });
   if (!parsed || parsed.definitions.length === 0) {
-    return rawView(lines, pad);
+    return rawView(lines, pad, lineRange);
   }
 
-  // Deduplicate definitions by lineStart (decorated_definition / export_statement can cause dupes).
-  // Prefer richer kinds (class/method/function) over generic variable duplicates on the same line.
   const kindPriority = { class: 5, namespace: 4, method: 3, function: 3, type: 2, property: 2, variable: 1, other: 0 };
   const byLine = new Map();
   for (const d of parsed.definitions) {
@@ -44,16 +72,22 @@ export function buildOutline(source, filePath, expandSymbols = [], { callerCount
   const defs = [...byLine.values()].sort((a, b) => a.lineStart - b.lineStart);
 
   if (expandSymbols.length > 0) {
-    return expandMode(lines, defs, filePath, expandSymbols, pad);
+    return expandMode(lines, defs, filePath, expandSymbols, pad, lineRange);
   }
-  return outlineMode(lines, defs, pad, callerCounts);
+  return outlineMode(lines, defs, pad, { callerCounts, noComments, depth, collapseImports, ext });
 }
 
-function rawView(lines, pad) {
-  return lines.map((l, i) => `${String(i + 1).padStart(pad)}│ ${l}`).join('\n');
+function rawView(lines, pad, lineRange = null) {
+  const start = lineRange ? Math.max(1, lineRange[0]) : 1;
+  const end = lineRange ? Math.min(lines.length, lineRange[1]) : lines.length;
+  const out = [];
+  for (let i = start; i <= end; i++) {
+    out.push(`${String(i).padStart(pad)}│ ${lines[i - 1]}`);
+  }
+  return out.join('\n');
 }
 
-function expandMode(lines, defs, filePath, expandSymbols, pad) {
+function expandMode(lines, defs, filePath, expandSymbols, pad, lineRange = null) {
   const output = [];
 
   for (const symName of expandSymbols) {
@@ -63,12 +97,12 @@ function expandMode(lines, defs, filePath, expandSymbols, pad) {
       output.push(`Symbol "${symName}" not found in ${filePath}`);
       const similar = [...new Set(
         defs.filter(d => d.name.toLowerCase().includes(symName.toLowerCase()))
-          .map(d => d.name)
+          .map(d => d.name),
       )].slice(0, 5);
       if (similar.length > 0) {
         output.push(`Did you mean: ${similar.join(', ')}`);
       } else {
-        output.push(`Available: ${defs.map(d => d.name).join(', ')}`);
+        output.push(`Available: ${defs.map(d => d.name).slice(0, 40).join(', ')}`);
       }
       continue;
     }
@@ -77,7 +111,9 @@ function expandMode(lines, defs, filePath, expandSymbols, pad) {
       if (matches.length > 1 || expandSymbols.length > 1) {
         output.push(`── ${def.name} (${filePath}:${def.lineStart}-${def.lineEnd}) ──`);
       }
-      for (let i = def.lineStart; i <= def.lineEnd; i++) {
+      const start = lineRange ? Math.max(def.lineStart, lineRange[0]) : def.lineStart;
+      const end = lineRange ? Math.min(def.lineEnd, lineRange[1]) : def.lineEnd;
+      for (let i = start; i <= end; i++) {
         output.push(`${String(i).padStart(pad)}│ ${lines[i - 1]}`);
       }
       if (matches.length > 1) output.push('');
@@ -131,6 +167,57 @@ function detectImportBlock(lines) {
   return { start: firstImportLine + 1, end: lastImportLine + 1, lineCount, name: null };
 }
 
+/**
+ * Identify multi-line block comment lines (`/* ... * /` in JS/TS/C/Rust/Java,
+ * or triple-quoted docstrings in Python) for `--no-comments`.
+ */
+function detectCommentLines(lines, ext) {
+  const skipped = new Set();
+  const isPython = ext === '.py';
+
+  if (isPython) {
+    let inQuote = null;
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (!inQuote) {
+        if (trimmed.startsWith('#')) {
+          skipped.add(i + 1);
+          continue;
+        }
+        for (const q of ['"""', "'''"]) {
+          if (trimmed.startsWith(q)) {
+            skipped.add(i + 1);
+            const rest = trimmed.slice(3);
+            if (!rest.includes(q)) inQuote = q;
+            break;
+          }
+        }
+      } else {
+        skipped.add(i + 1);
+        if (trimmed.includes(inQuote)) inQuote = null;
+      }
+    }
+    return skipped;
+  }
+
+  let inBlock = false;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!inBlock) {
+      if (trimmed.startsWith('//')) {
+        skipped.add(i + 1);
+      } else if (trimmed.startsWith('/*')) {
+        skipped.add(i + 1);
+        if (!trimmed.includes('*/')) inBlock = true;
+      }
+    } else {
+      skipped.add(i + 1);
+      if (trimmed.includes('*/')) inBlock = false;
+    }
+  }
+  return skipped;
+}
+
 function findImmediateParents(defs) {
   const parents = new Map();
 
@@ -157,12 +244,7 @@ function findImmediateParents(defs) {
   return parents;
 }
 
-/**
- * Find container definitions whose bodies should stay open so their direct
- * children (class methods or router object properties) are shown individually
- * instead of collapsing the entire container into one line.
- */
-function findDelegatingContainers(defs, parentMap) {
+function findDelegatingContainers(defs, parentMap, depth = 1) {
   const childCounts = new Map();
 
   for (const def of defs) {
@@ -173,8 +255,13 @@ function findDelegatingContainers(defs, parentMap) {
     const isClassMemberChild =
       (parent.kind === 'class' || parent.kind === 'namespace') &&
       (def.kind === 'method' || def.kind === 'function' || def.kind === 'property' || def.kind === 'class');
+    const isDeepFunctionChild =
+      depth >= 2 &&
+      (parent.kind === 'function' || parent.kind === 'method' || parent.kind === 'variable') &&
+      !parentMap.get(parent) &&
+      (def.kind === 'function' || def.kind === 'variable');
 
-    if (isObjectRouterChild || isClassMemberChild) {
+    if (isObjectRouterChild || isClassMemberChild || isDeepFunctionChild) {
       childCounts.set(parent, (childCounts.get(parent) || 0) + 1);
     }
   }
@@ -193,11 +280,10 @@ function appendAnnotation(line, count) {
   return line + padding + annotation;
 }
 
-function outlineMode(lines, defs, pad, callerCounts) {
+function outlineMode(lines, defs, pad, { callerCounts, noComments = false, depth = 1, collapseImports = false, ext = '' } = {}) {
   const parentMap = findImmediateParents(defs);
-  const delegatingContainers = findDelegatingContainers(defs, parentMap);
+  const delegatingContainers = findDelegatingContainers(defs, parentMap, depth);
 
-  // A definition is swallowed if ANY ancestor along its parent chain is NOT a delegating container.
   const nested = new Set();
   for (const def of defs) {
     let ancestor = parentMap.get(def);
@@ -211,16 +297,17 @@ function outlineMode(lines, defs, pad, callerCounts) {
   }
 
   const collapseRanges = [];
-  const inlineAnnotations = new Map(); // lineNum -> callerCount
+  const inlineAnnotations = new Map();
 
-  const importCollapse = detectImportBlock(lines);
-  if (importCollapse) collapseRanges.push(importCollapse);
+  if (collapseImports) {
+    const importCollapse = detectImportBlock(lines);
+    if (importCollapse) collapseRanges.push(importCollapse);
+  }
 
   for (const def of defs) {
     if (nested.has(def)) continue;
 
     if (delegatingContainers.has(def)) {
-      // Annotate the class / container header line itself since its body stays open
       if (callerCounts && callerCounts.has(def.name)) {
         inlineAnnotations.set(def.lineStart, callerCounts.get(def.name));
       }
@@ -233,7 +320,6 @@ function outlineMode(lines, defs, pad, callerCounts) {
       (def.lineEnd - def.bodyStartLine + 1) >= MIN_COLLAPSE_LINES;
 
     if (!canCollapse) {
-      // Short/one-line function or method — annotate its declaration line directly
       if (callerCounts && callerCounts.has(def.name)) {
         inlineAnnotations.set(def.lineStart, callerCounts.get(def.name));
       }
@@ -249,13 +335,13 @@ function outlineMode(lines, defs, pad, callerCounts) {
   }
 
   collapseRanges.sort((a, b) => a.start - b.start);
+  const commentLines = noComments ? detectCommentLines(lines, ext) : null;
 
   const output = [];
   let lineNum = 1;
   let rangeIdx = 0;
 
   while (lineNum <= lines.length) {
-    // Advance past any overlapping range already skipped
     while (rangeIdx < collapseRanges.length && collapseRanges[rangeIdx].start < lineNum) {
       rangeIdx++;
     }
@@ -273,6 +359,11 @@ function outlineMode(lines, defs, pad, callerCounts) {
       output.push(marker);
       lineNum = range.end + 1;
       rangeIdx++;
+      continue;
+    }
+
+    if (commentLines && commentLines.has(lineNum)) {
+      lineNum++;
       continue;
     }
 
