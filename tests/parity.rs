@@ -13,6 +13,14 @@ fn temp_dir(name: &str) -> PathBuf {
     p
 }
 
+fn write_file(root: &std::path::Path, rel: &str, content: &str) {
+    let p = root.join(rel);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(p, content).unwrap();
+}
+
 #[test]
 fn multiroot_ts_workspace_and_parse_cache_reuse() {
     let base = temp_dir("multiroot-ts");
@@ -1455,8 +1463,8 @@ fn v054_universal_fixes_and_grep_outline_upgrades() {
         "expected intact quoted route-group path in resume hint, got:\n{ps}"
     );
 
-    // B. `:ALL --full-under 50` on 122-line file falls back to compact skeleton!
-    let fu = Command::new(bin_path())
+    // B. Explicit `:ALL` overrides `--full-under 50`, while bare file respects `--full-under 50`!
+    let fu_all = Command::new(bin_path())
         .args([
             "outline",
             "apps/web/src/app/(dashboard)/item/[id]/page.tsx:ALL",
@@ -1467,10 +1475,26 @@ fn v054_universal_fixes_and_grep_outline_upgrades() {
         ])
         .output()
         .unwrap();
-    let fus = String::from_utf8_lossy(&fu.stdout);
+    let fus_all = String::from_utf8_lossy(&fu_all.stdout);
     assert!(
-        fus.contains("[function]") && !fus.contains("row_050"),
-        ":ALL --full-under 50 on 122-line file should return compact skeleton, got:\n{fus}"
+        fus_all.contains("row_050"),
+        "explicit :ALL must override --full-under 50, got:\n{fus_all}"
+    );
+    let fu_bare = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/web/src/app/(dashboard)/item/[id]/page.tsx",
+            "--full-under",
+            "50",
+            "--root",
+            base.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let fus_bare = String::from_utf8_lossy(&fu_bare.stdout);
+    assert!(
+        fus_bare.contains("[function]") && !fus_bare.contains("row_050"),
+        "bare file with --full-under 50 on 122-line file should return compact skeleton, got:\n{fus_bare}"
     );
 
     // C. `.prisma` block slicing + `--around` asymmetric `-B 0 -A 2` + import-redirect hint
@@ -1757,6 +1781,275 @@ fn v055_bugfixes_around_ranges_path_boundaries_and_inventory_branches() {
     assert!(
         ginvs.contains("apps/qa/src/alpha.ts (1) [BRANCH_ALPHA]: runAlpha"),
         "inventory should include branch tag + enclosing symbol, got:\n{ginvs}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn v056_batching_scoping_json_imports_and_callers_fixes() {
+    let base = temp_dir("v056-fixes");
+    let cache_dir = base.join(".cache");
+    let repo_a = base.join("repos/repo-a");
+    let repo_b = base.join("repos/repo-b");
+    fs::create_dir_all(repo_a.join(".git")).unwrap();
+    fs::create_dir_all(repo_b.join(".git")).unwrap();
+
+    // 1. JSON & YAML array-of-objects configs (>40 lines)
+    let mut cron_json = String::from("{\n  \"crons\": [\n");
+    for i in 0..15 {
+        let comma = if i + 1 < 15 { "," } else { "" };
+        cron_json.push_str(&format!(
+            "    {{\n      \"path\": \"/api/cron/job-{i}\",\n      \"schedule\": \"0 {i} * * 1\"\n    }}{comma}\n"
+        ));
+    }
+    cron_json.push_str("  ]\n}\n");
+    write_file(&repo_a, "config/schedule.json", &cron_json);
+
+    let mut rules_yaml = String::from("rules:\n");
+    for i in 0..16 {
+        rules_yaml.push_str(&format!(
+            "  - path: /rules/item-{i}\n    role: role_{i}\n    mode: strict\n"
+        ));
+    }
+    write_file(&repo_a, "config/rules.yaml", &rules_yaml);
+
+    // 2. File with >=6 import lines + local imports used in body (for collapsed-imports footer)
+    write_file(&repo_a, "src/helper.ts", "export function computeTotal(x: number) { return x * 2; }\n");
+    write_file(&repo_a, "src/unused.ts", "export function unusedHelper() { return 0; }\n");
+    write_file(
+        &repo_a,
+        "src/feature.ts",
+        r#"import React from 'react';
+import { z } from 'zod';
+import { computeTotal } from './helper';
+import { unusedHelper } from './unused';
+import { sharedUtil } from '@acme/core';
+import type { Foo } from '@types/node';
+
+export function runFeature(n: number) {
+  return computeTotal(n) + sharedUtil(n);
+}
+"#,
+    );
+
+    // 3. Multi-target `outline fileA --around "needle" fileB:targetFn`
+    let mut file_a = String::new();
+    for i in 1..=60 {
+        if i == 30 {
+            file_a.push_str("const hit = 'AROUND_BATCH_NEEDLE';\n");
+        } else {
+            file_a.push_str(&format!("const pad_{i} = {i};\n"));
+        }
+    }
+    write_file(&repo_a, "src/scan.ts", &file_a);
+    write_file(
+        &repo_a,
+        "src/target.ts",
+        "export function targetFn() {\n  return 'TARGET_FN_BODY_OK';\n}\nexport function otherFn() {\n  return 1;\n}\n",
+    );
+
+    // 4. Multi-file `dependents` + `callers` line numbers + `--path` auto-root from non-git parent
+    write_file(&repo_a, "apps/svc/lib-a.ts", "export function sharedA() { return 1; }\n");
+    write_file(&repo_a, "apps/svc/lib-b.ts", "export function sharedB() { return 2; }\n");
+    write_file(
+        &repo_a,
+        "apps/svc/consumer.ts",
+        "import { sharedA } from './lib-a';\nimport { sharedB } from './lib-b';\nexport function runBoth() {\n  return sharedA() + sharedB();\n}\n",
+    );
+    write_file(&repo_b, "src/other.ts", "export function unrelated() { return 99; }\n");
+
+    // 5. Multi-dir `files` rollup without collapsing back up to `apps/`
+    for sub in ["alpha", "beta", "gamma"] {
+        for i in 1..=3 {
+            write_file(
+                &repo_a,
+                &format!("apps/{sub}/mod/f{i}.ts"),
+                &format!("export const {sub}_{i} = {i};\n"),
+            );
+        }
+    }
+
+    // 6. Single-file `grep` with 35 matches (should not cap at 5/25/30!)
+    let mut dense = String::from("export function denseFn() {\n");
+    for i in 1..=35 {
+        dense.push_str(&format!("  const v{i} = 'DENSE_SINGLE_FILE_TOKEN_{i}';\n"));
+    }
+    dense.push_str("  return v1;\n}\n");
+    write_file(&repo_a, "src/dense.ts", &dense);
+
+    // 7. `grep --all-scopes` with Python docstring-only files + Dockerfile + CI YAML
+    for i in 1..=12 {
+        write_file(
+            &repo_a,
+            &format!("py/doc_{i}.py"),
+            &format!(
+                "def fn_{i}():\n    \"\"\"\n    Mentions DEPLOY_MARKER_XYZ only in a docstring.\n    \"\"\"\n    return {i}\n"
+            ),
+        );
+    }
+    write_file(&repo_a, "Dockerfile", "FROM python:3.11\nRUN echo DEPLOY_MARKER_XYZ\n");
+    write_file(
+        &repo_a,
+        ".github/workflows/ci.yml",
+        "name: ci\njobs:\n  build:\n    steps:\n      - run: echo DEPLOY_MARKER_XYZ\n",
+    );
+
+    // Verify 1: JSON & YAML array-of-objects compact previews (not bare repeated keys!)
+    let jo = Command::new(bin_path())
+        .args(["outline", "config/schedule.json", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let jos = String::from_utf8_lossy(&jo.stdout);
+    assert!(
+        jos.contains("[0] path=\"/api/cron/job-0\"") && jos.contains("schedule=\"0 0 * * 1\""),
+        "JSON array-of-objects outline should show compact key=val previews, got:\n{jos}"
+    );
+    let yo = Command::new(bin_path())
+        .args(["outline", "config/rules.yaml", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let yos = String::from_utf8_lossy(&yo.stdout);
+    assert!(
+        yos.contains("- path: /rules/item-0, role: role_0"),
+        "YAML list-of-objects outline should show compact key: val previews, got:\n{yos}"
+    );
+
+    // Verify 2: Collapsed imports footer lists used local imports, skips external & unused
+    let imp_o = Command::new(bin_path())
+        .args(["outline", "src/feature.ts:ALL", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let imp_s = String::from_utf8_lossy(&imp_o.stdout);
+    assert!(
+        imp_s.contains("local imports used:")
+            && imp_s.contains("./helper (computeTotal)")
+            && imp_s.contains("@acme/core (sharedUtil)")
+            && !imp_s.contains("unusedHelper")
+            && !imp_s.contains("'react'"),
+        "collapsed imports should show used local imports only, got:\n{imp_s}"
+    );
+
+    // Verify 3: Mixed multi-target `outline fileA --around "re" fileB:sym` does NOT zero out fileB:sym
+    let mix = Command::new(bin_path())
+        .args([
+            "outline",
+            "src/scan.ts",
+            "src/target.ts:targetFn",
+            "--around",
+            "AROUND_BATCH_NEEDLE",
+            "-C",
+            "2",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let mixs = String::from_utf8_lossy(&mix.stdout);
+    assert!(
+        mixs.contains("AROUND_BATCH_NEEDLE") && mixs.contains("TARGET_FN_BODY_OK"),
+        "mixed multi-target --around must keep explicit sibling symbol slice, got:\n{mixs}"
+    );
+
+    // Verify 4a: Multi-file `dependents fileA fileB` handles BOTH files
+    let deps = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "dependents",
+            "apps/svc/lib-a.ts",
+            "apps/svc/lib-b.ts",
+            "--no-noncode",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let depss = String::from_utf8_lossy(&deps.stdout);
+    assert!(
+        depss.contains("=== dependents: apps/svc/lib-a.ts ===")
+            && depss.contains("=== dependents: apps/svc/lib-b.ts ===")
+            && depss.contains("apps/svc/consumer.ts"),
+        "dependents should support multiple files, got:\n{depss}"
+    );
+
+    // Verify 4b: `callers` without `--context` includes line numbers AND auto-roots from non-git parent via `--path`
+    let call_auto = Command::new(bin_path())
+        .current_dir(&base)
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["callers", "sharedA", "--path", "apps/svc", "--no-noncode"])
+        .output()
+        .unwrap();
+    let call_s = String::from_utf8_lossy(&call_auto.stdout);
+    let call_e = String::from_utf8_lossy(&call_auto.stderr);
+    assert!(
+        call_s.contains("apps/svc/consumer.ts") && call_s.contains("L4"),
+        "callers without --context should print line numbers and auto-scope from non-git parent:\nstdout:\n{call_s}\nstderr:\n{call_e}"
+    );
+    assert!(
+        call_e.contains("Auto-detected --root from --path"),
+        "expected auto-root note on stderr, got:\n{call_e}"
+    );
+
+    // Verify 4c: `files apps/alpha apps/beta apps/gamma --limit 4` rolls up per dir, NEVER parent `apps/`
+    let fmulti = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "files",
+            "apps/alpha",
+            "apps/beta",
+            "apps/gamma",
+            "--limit",
+            "4",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let fms = String::from_utf8_lossy(&fmulti.stdout);
+    assert!(
+        fms.contains("apps/alpha/mod/")
+            && fms.contains("apps/beta/mod/")
+            && fms.contains("apps/gamma/mod/"),
+        "multi-dir files rollup must stay under each requested dir, got:\n{fms}"
+    );
+
+    // Verify 5a: Single-file `grep --path src/dense.ts` shows all 35 matches (no `(+N more in file)`)
+    let gdense = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "DENSE_SINGLE_FILE_TOKEN",
+            "--path",
+            "src/dense.ts",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gds = String::from_utf8_lossy(&gdense.stdout);
+    assert!(
+        gds.contains("DENSE_SINGLE_FILE_TOKEN_35") && !gds.contains("more in file"),
+        "single-file grep --path must not cap at 5/25/30 matches, got:\n{gds}"
+    );
+
+    // Verify 5b: `grep --all-scopes --limit 5` surfaces Dockerfile & ci.yml ahead of Python docstrings
+    let gas = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "DEPLOY_MARKER_XYZ",
+            "--all-scopes",
+            "--limit",
+            "5",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gass = String::from_utf8_lossy(&gas.stdout);
+    assert!(
+        gass.contains("Dockerfile") && gass.contains(".github/workflows/ci.yml"),
+        "grep --all-scopes must surface Dockerfile and CI YAML instead of drowning in Python docstrings, got:\n{gass}"
     );
 
     let _ = fs::remove_dir_all(&base);

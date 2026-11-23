@@ -639,22 +639,30 @@ pub fn cmd_search(
 
 fn rollup_directories(
     filtered: &[&str],
-    pattern: Option<&str>,
+    patterns: &[&str],
     depth: usize,
 ) -> Vec<(String, usize)> {
-    let base_prefix = pattern
+    // Collect all non-glob directory prefixes sorted longest-first so multi-dir queries like
+    // `files apps/qa apps/web apps/admin --limit 100` roll up inside each requested dir
+    // instead of collapsing back up to parent `apps/`!
+    let mut base_prefixes: Vec<String> = patterns
+        .iter()
         .map(|p| p.trim_start_matches("./").trim_end_matches('/'))
         .filter(|p| !p.is_empty() && !p.contains('*') && !p.contains('?'))
-        .map(|p| format!("{p}/"));
+        .map(|p| format!("{p}/"))
+        .collect();
+    base_prefixes.sort_by(|a, b| b.len().cmp(&a.len()));
+    base_prefixes.dedup();
 
     let d = depth.max(1);
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for &path in filtered {
-        // Strip base_prefix per-file whenever matched so we NEVER collapse back up to a parent dir!
-        let (active_pfx, rel) = match base_prefix.as_deref() {
-            Some(pfx) if path.starts_with(pfx) => (Some(pfx), &path[pfx.len()..]),
-            _ => (None, path),
-        };
+        let path_low = path.to_ascii_lowercase();
+        let (active_pfx, rel) = base_prefixes
+            .iter()
+            .find(|pfx| path_low.starts_with(pfx.as_str()))
+            .map(|pfx| (Some(&path[..pfx.len()]), &path[pfx.len()..]))
+            .unwrap_or((None, path));
         let parts: Vec<&str> = rel.split('/').collect();
         let key = if parts.len() <= 1 {
             match active_pfx {
@@ -807,17 +815,17 @@ pub fn cmd_files(
     let auto_rollup = !show_all && offset == 0 && filtered.len() > limit;
     if dirs_only || auto_rollup {
         let mut rollup_depth = depth.unwrap_or(1);
-        let single_pat = if compiled_pats.len() == 1 {
-            Some(compiled_pats[0].0.as_str())
-        } else {
-            None
-        };
-        let mut dirs = rollup_directories(&filtered, single_pat, rollup_depth);
+        let dir_pats: Vec<&str> = compiled_pats
+            .iter()
+            .filter(|(_, re_opt, _)| re_opt.is_none())
+            .map(|(pl, _, _)| pl.as_str())
+            .collect();
+        let mut dirs = rollup_directories(&filtered, &dir_pats, rollup_depth);
         // If auto-rolling up a subtree like `apps/qa` and depth=1 collapsed everything into a single
         // intermediate folder (e.g. `apps/qa/src/`), step 1 level deeper automatically!
         if depth.is_none() && dirs.len() == 1 && !dirs[0].0.ends_with("(direct)") {
             rollup_depth += 1;
-            let deeper = rollup_directories(&filtered, single_pat, rollup_depth);
+            let deeper = rollup_directories(&filtered, &dir_pats, rollup_depth);
             if deeper.len() > 1 {
                 dirs = deeper;
             }
@@ -1127,36 +1135,65 @@ pub fn cmd_callers(
         &[]
     };
 
-    if context_lines > 0 {
-        let escaped = regex::escape(symbol);
-        let call_re = Regex::new(&format!(r"(^|[^A-Za-z0-9_]){escaped}\s*\(")).unwrap();
-        let jsx_re = Regex::new(&format!(r"<\s*{escaped}([\s>/.]|$)")).unwrap();
-        let member_re = Regex::new(&format!(r"\.\s*{escaped}\b")).unwrap();
-        let bracket_re = Regex::new(&format!(r#"\[\s*['"`]{escaped}['"`]\s*\]"#)).unwrap();
-        let import_re = Regex::new(&format!(r"(?:import|from)\s.*\b{escaped}\b")).unwrap();
-        let type_annot_re =
-            Regex::new(&format!(r"(?::|->|\[|,|\|)\s*{escaped}([^A-Za-z0-9_]|$)")).unwrap();
-        let ident_re = Regex::new(&format!(r"(^|[^A-Za-z0-9_]){escaped}([^A-Za-z0-9_]|$)")).unwrap();
+    let escaped = regex::escape(symbol);
+    let call_re = Regex::new(&format!(r"(^|[^A-Za-z0-9_]){escaped}\s*\(")).unwrap();
+    let jsx_re = Regex::new(&format!(r"<\s*{escaped}([\s>/.]|$)")).unwrap();
+    let member_re = Regex::new(&format!(r"\.\s*{escaped}\b")).unwrap();
+    let bracket_re = Regex::new(&format!(r#"\[\s*['"`]{escaped}['"`]\s*\]"#)).unwrap();
+    let import_re = Regex::new(&format!(r"(?:import|from)\s.*\b{escaped}\b")).unwrap();
+    let type_annot_re =
+        Regex::new(&format!(r"(?::|->|\[|,|\|)\s*{escaped}([^A-Za-z0-9_]|$)")).unwrap();
+    let ident_re = Regex::new(&format!(r"(^|[^A-Za-z0-9_]){escaped}([^A-Za-z0-9_]|$)")).unwrap();
 
-        let mut def_ranges: Vec<(u32, u32, u32)> = Vec::new();
-        let mut is_non_callable = false;
-        let mut is_class = false;
-        for &si in &target_syms {
-            let sym = &g.symbols[si as usize];
-            def_ranges.push((
-                sym.file_idx.to_native(),
-                sym.line_start.to_native(),
-                sym.line_end.to_native(),
-            ));
-            let k = SymbolKind::from_u8(sym.kind);
-            if matches!(k, SymbolKind::Variable | SymbolKind::Type) {
-                is_non_callable = true;
+    let mut def_ranges: Vec<(u32, u32, u32)> = Vec::new();
+    let mut is_non_callable = false;
+    let mut is_class = false;
+    for &si in &target_syms {
+        let sym = &g.symbols[si as usize];
+        def_ranges.push((
+            sym.file_idx.to_native(),
+            sym.line_start.to_native(),
+            sym.line_end.to_native(),
+        ));
+        let k = SymbolKind::from_u8(sym.kind);
+        if matches!(k, SymbolKind::Variable | SymbolKind::Type) {
+            is_non_callable = true;
+        }
+        if k == SymbolKind::Class {
+            is_class = true;
+        }
+    }
+
+    let find_match_indices = |fi: u32, lines: &[&str]| -> Vec<usize> {
+        let mut matched_indices: Vec<usize> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let lnum = i as u32 + 1;
+            // Skip only the declaration line (`lnum == ds`) so recursive self-calls inside the body still show!
+            if def_ranges
+                .iter()
+                .any(|&(dfi, ds, _de)| dfi == fi && lnum == ds)
+            {
+                continue;
             }
-            if k == SymbolKind::Class {
-                is_class = true;
+            let matched = if let Some(ref rre) = recv_call_re {
+                rre.is_match(line)
+            } else {
+                call_re.is_match(line)
+                    || jsx_re.is_match(line)
+                    || member_re.is_match(line)
+                    || bracket_re.is_match(line)
+                    || import_re.is_match(line)
+                    || (is_class && type_annot_re.is_match(line))
+                    || (is_non_callable && ident_re.is_match(line))
+            };
+            if matched {
+                matched_indices.push(i);
             }
         }
+        matched_indices
+    };
 
+    if context_lines > 0 {
         for &(fi, _) in slice {
             let path = g.files[fi as usize].path.as_str();
             println!("{path}:");
@@ -1166,31 +1203,7 @@ pub fn cmd_callers(
                 continue;
             };
             let lines: Vec<&str> = source.split('\n').collect();
-            let mut matched_indices: Vec<usize> = Vec::new();
-            for (i, line) in lines.iter().enumerate() {
-                let lnum = i as u32 + 1;
-                // Skip only the declaration line (`lnum == ds`) so recursive self-calls inside the body still show!
-                if def_ranges
-                    .iter()
-                    .any(|&(dfi, ds, _de)| dfi == fi && lnum == ds)
-                {
-                    continue;
-                }
-                let matched = if let Some(ref rre) = recv_call_re {
-                    rre.is_match(line)
-                } else {
-                    call_re.is_match(line)
-                        || jsx_re.is_match(line)
-                        || member_re.is_match(line)
-                        || bracket_re.is_match(line)
-                        || import_re.is_match(line)
-                        || (is_class && type_annot_re.is_match(line))
-                        || (is_non_callable && ident_re.is_match(line))
-                };
-                if matched {
-                    matched_indices.push(i);
-                }
-            }
+            let matched_indices = find_match_indices(fi, &lines);
             if matched_indices.is_empty() {
                 println!("  (no call sites found in source)\n");
                 continue;
@@ -1223,7 +1236,31 @@ pub fn cmd_callers(
         }
     } else {
         for &(fi, _) in slice {
-            println!("{}", g.files[fi as usize].path.as_str());
+            let path = g.files[fi as usize].path.as_str();
+            let abs = idx.resolve_abs_path(path);
+            let line_suffix = fs::read_to_string(&abs)
+                .ok()
+                .map(|src| {
+                    let lines: Vec<&str> = src.split('\n').collect();
+                    let idxs = find_match_indices(fi, &lines);
+                    if idxs.is_empty() {
+                        String::new()
+                    } else {
+                        let shown: Vec<String> = idxs
+                            .iter()
+                            .take(5)
+                            .map(|&i| format!("L{}", i + 1))
+                            .collect();
+                        let more = if idxs.len() > 5 {
+                            format!(" (+{})", idxs.len() - 5)
+                        } else {
+                            String::new()
+                        };
+                        format!("  {}{more}", shown.join(", "))
+                    }
+                })
+                .unwrap_or_default();
+            println!("{path}{line_suffix}");
         }
         if slice.is_empty() && (hidden_tests.is_empty() || no_tests_explicit) {
             println!("(no callers found)");

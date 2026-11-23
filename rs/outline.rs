@@ -335,7 +335,19 @@ fn structured_config_outline(
         }
     };
 
-    let mut entries: Vec<(u32, usize, String)> = Vec::new();
+    let mut entries: Vec<(u32, u32, usize, String)> = Vec::new();
+    let trunc_preview = |s: &str, max_len: usize| -> String {
+        let trimmed = s.trim().trim_end_matches(',');
+        if trimmed.len() <= max_len {
+            trimmed.to_string()
+        } else {
+            let mut cut = max_len.saturating_sub(3);
+            while cut > 0 && !trimmed.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}...", &trimmed[..cut])
+        }
+    };
     if lower_ext == ".toml" {
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
@@ -343,53 +355,153 @@ fn structured_config_outline(
                 continue;
             }
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                entries.push((i as u32 + 1, 0, trimmed.to_string()));
+                entries.push((i as u32 + 1, 0, 0, trimmed.to_string()));
             } else if !line.starts_with(' ') && !line.starts_with('\t') {
-                if let Some((k, _)) = trimmed.split_once('=') {
+                if let Some((k, v)) = trimmed.split_once('=') {
                     let key = k.trim();
+                    let val = v.trim();
                     if !key.is_empty() {
-                        entries.push((i as u32 + 1, 1, key.to_string()));
+                        let label = if !val.is_empty() && !val.starts_with('[') && !val.starts_with('{') {
+                            format!("{key} = {}", trunc_preview(val, 50))
+                        } else {
+                            key.to_string()
+                        };
+                        entries.push((i as u32 + 1, 0, 1, label));
                     }
                 }
             }
         }
     } else if lower_ext == ".yml" || lower_ext == ".yaml" {
-        for (i, line) in lines.iter().enumerate() {
+        let mut i = 0usize;
+        while i < lines.len() {
+            let line = lines[i];
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" {
+                i += 1;
                 continue;
             }
             let indent = line.bytes().take_while(|&b| b == b' ').count();
             if indent > 2 {
+                i += 1;
                 continue;
             }
-            let body = trimmed.strip_prefix("- ").unwrap_or(trimmed);
-            if let Some((k, _)) = body.split_once(':') {
+            if let Some(after_dash) = trimmed.strip_prefix("- ") {
+                // Aggregate list-of-objects items into one compact `key: val, key2: val2` row
+                // instead of emitting N repeated bare keys without values!
+                let start_ln = i as u32 + 1;
+                let mut end_ln = start_ln;
+                let mut pairs: Vec<String> = Vec::new();
+                if let Some((k, v)) = after_dash.split_once(':') {
+                    let key = k.trim().trim_matches(|c| c == '"' || c == '\'');
+                    let val = v.trim();
+                    if !key.is_empty() && !key.contains(' ') {
+                        if !val.is_empty() && !matches!(val, "|" | ">" | "|-" | ">-") {
+                            pairs.push(format!("{key}: {}", trunc_preview(val, 36)));
+                        } else {
+                            pairs.push(key.to_string());
+                        }
+                    }
+                } else if !after_dash.is_empty() {
+                    pairs.push(trunc_preview(after_dash, 60));
+                }
+                let item_child_indent = indent + 2;
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let jline = lines[j];
+                    let jtrim = jline.trim();
+                    if jtrim.is_empty() || jtrim.starts_with('#') {
+                        j += 1;
+                        continue;
+                    }
+                    let jindent = jline.bytes().take_while(|&b| b == b' ').count();
+                    if jindent < item_child_indent || (jindent == indent && jtrim.starts_with("- ")) {
+                        break;
+                    }
+                    end_ln = j as u32 + 1;
+                    if jindent == item_child_indent && pairs.len() < 4 && !jtrim.starts_with("- ") {
+                        if let Some((k, v)) = jtrim.split_once(':') {
+                            let key = k.trim().trim_matches(|c| c == '"' || c == '\'');
+                            let val = v.trim();
+                            if !key.is_empty() && !key.contains(' ') {
+                                if !val.is_empty() && !matches!(val, "|" | ">" | "|-" | ">-") {
+                                    pairs.push(format!("{key}: {}", trunc_preview(val, 36)));
+                                } else {
+                                    pairs.push(key.to_string());
+                                }
+                            }
+                        }
+                    }
+                    j += 1;
+                }
+                if !pairs.is_empty() {
+                    let level = if indent == 0 { 0 } else { 1 };
+                    let label = format!("- {}", trunc_preview(&pairs.join(", "), 115));
+                    entries.push((start_ln, end_ln, level, label));
+                }
+                i = j;
+                continue;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
                 let key = k.trim().trim_matches(|c| c == '"' || c == '\'');
+                let val = v.trim();
                 if !key.is_empty() && !key.contains(' ') {
                     let level = if indent == 0 { 0 } else { 1 };
-                    entries.push((i as u32 + 1, level, key.to_string()));
+                    let label = if !val.is_empty() && !matches!(val, "|" | ">" | "|-" | ">-") {
+                        format!("{key}: {}", trunc_preview(val, 50))
+                    } else {
+                        key.to_string()
+                    };
+                    entries.push((i as u32 + 1, 0, level, label));
                 }
             }
+            i += 1;
         }
     } else {
-        // JSON: track brace depth / shallow indentation (level 0 = depth 1, level 1 = depth 2)
-        let mut depth: i32 = 0;
+        // JSON: track container stack (`{` vs `[`) so arrays of objects emit compact
+        // `[i] key=val, key2=val2` previews instead of hundreds of bare repeated keys!
+        let mut stack: Vec<u8> = Vec::new();
+        let mut array_item_idx: Vec<usize> = Vec::new();
+        let mut in_arr_obj: Option<(u32, usize, usize, usize, Vec<String>)> = None; // (start_ln, stack_depth_of_obj, level, item_idx, pairs)
+
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
-            if depth >= 1 && depth <= 2 && trimmed.starts_with('"') {
-                if let Some(end_q) = trimmed[1..].find('"') {
+            let line_no = i as u32 + 1;
+
+            // Extract key: value if this line starts with `"key":`
+            let kv_opt: Option<(&str, &str)> = if trimmed.starts_with('"') {
+                trimmed[1..].find('"').and_then(|end_q| {
                     let key = &trimmed[1..1 + end_q];
                     let after = trimmed[2 + end_q..].trim_start();
-                    if after.starts_with(':') {
-                        let level = (depth - 1) as usize;
-                        entries.push((i as u32 + 1, level, key.to_string()));
+                    after.strip_prefix(':').map(|v| (key, v.trim()))
+                })
+            } else {
+                None
+            };
+
+            let obj_depth = stack.iter().filter(|&&c| c == b'{').count();
+            if let Some((_, obj_stack_len, _, _, ref mut pairs)) = in_arr_obj {
+                if stack.len() == obj_stack_len && pairs.len() < 4 {
+                    if let Some((key, val)) = kv_opt {
+                        let is_scalar = !val.is_empty()
+                            && !val.starts_with('{')
+                            && !val.starts_with('[');
+                        if is_scalar {
+                            pairs.push(format!("{key}={}", trunc_preview(val, 36)));
+                        } else if val == "{}" || val == "[]" || val == "{}," || val == "[]," {
+                            pairs.push(format!("{key}={}", val.trim_end_matches(',')));
+                        }
                     }
                 }
+            } else if (1..=2).contains(&obj_depth) {
+                if let Some((key, _val)) = kv_opt {
+                    let level = obj_depth - 1;
+                    entries.push((line_no, 0, level, key.to_string()));
+                }
             }
+
             let mut in_str = false;
             let mut esc = false;
-            for b in trimmed.bytes() {
+            for (bi, b) in trimmed.bytes().enumerate() {
                 if esc {
                     esc = false;
                     continue;
@@ -403,10 +515,58 @@ fn structured_config_outline(
                     continue;
                 }
                 if !in_str {
-                    if b == b'{' {
-                        depth += 1;
-                    } else if b == b'}' {
-                        depth = (depth - 1).max(0);
+                    match b {
+                        b'[' => {
+                            stack.push(b'[');
+                            array_item_idx.push(0);
+                        }
+                        b']' => {
+                            if stack.last() == Some(&b'[') {
+                                stack.pop();
+                                array_item_idx.pop();
+                            }
+                        }
+                        b'{' => {
+                            let parent_is_arr = stack.last() == Some(&b'[');
+                            let cur_obj_depth = stack.iter().filter(|&&c| c == b'{').count();
+                            stack.push(b'{');
+                            if parent_is_arr && in_arr_obj.is_none() && cur_obj_depth <= 1 {
+                                let idx = array_item_idx.last_mut().map(|c| {
+                                    let v = *c;
+                                    *c += 1;
+                                    v
+                                }).unwrap_or(0);
+                                let level = if cur_obj_depth == 0 { 0 } else { 1 };
+                                let mut init_pairs = Vec::new();
+                                // Handle single-line `{ "a": 1, "b": "x" }` array objects
+                                let rest = &trimmed[bi + 1..];
+                                if let Some(close_rel) = rest.find('}') {
+                                    let inner = rest[..close_rel].trim();
+                                    if !inner.is_empty() {
+                                        init_pairs.push(trunc_preview(inner, 100));
+                                    }
+                                }
+                                in_arr_obj = Some((line_no, stack.len(), level, idx, init_pairs));
+                            }
+                        }
+                        b'}' => {
+                            let cur_len = stack.len();
+                            if stack.last() == Some(&b'{') {
+                                stack.pop();
+                            }
+                            if let Some((start_ln, obj_stack_len, level, idx, pairs)) = in_arr_obj.as_ref() {
+                                if cur_len == *obj_stack_len {
+                                    let preview = if pairs.is_empty() {
+                                        format!("[{idx}] {{...}}")
+                                    } else {
+                                        format!("[{idx}] {}", trunc_preview(&pairs.join(", "), 115))
+                                    };
+                                    entries.push((*start_ln, line_no, *level, preview));
+                                    in_arr_obj = None;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -421,17 +581,22 @@ fn structured_config_outline(
     let build_rows = |max_level: usize| -> Vec<String> {
         let mut rows: Vec<String> = Vec::new();
         for idx in 0..entries.len() {
-            let (start, level, ref label) = entries[idx];
+            let (start, explicit_end, level, ref label) = entries[idx];
             if level > max_level || !matches_filter(label) {
                 continue;
             }
-            let mut end = total_lines;
-            for next in &entries[idx + 1..] {
-                if next.1 <= level {
-                    end = next.0.saturating_sub(1).max(start);
-                    break;
+            let end = if explicit_end >= start {
+                explicit_end
+            } else {
+                let mut e = total_lines;
+                for next in &entries[idx + 1..] {
+                    if next.2 <= level {
+                        e = next.0.saturating_sub(1).max(start);
+                        break;
+                    }
                 }
-            }
+                e
+            };
             let indent = if level == 0 { "  " } else { "    " };
             let range = if end > start {
                 format!("L{start}-{end}")
@@ -501,40 +666,32 @@ fn build_outline_inner(
     let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
 
     // Support `file:ALL` to explicitly expand the entire file cleanly on any file type.
-    // If `--full-under N` was ALSO passed and the file exceeds N lines, fall through to the
-    // compact/structured skeleton instead of dumping thousands of lines!
-    let mut eff_expand: Vec<String> = expand_symbols.to_vec();
-    if eff_expand.len() == 1 && eff_expand[0].eq_ignore_ascii_case("ALL") {
-        let within_full_under = opts.full_under.map_or(true, |n| lines.len() <= n);
-        if within_full_under {
-            if let Some(pat) = opts.around {
-                return around_mode(
-                    &lines,
-                    file_path,
-                    pat,
-                    opts.around_before,
-                    opts.around_after,
-                    None,
-                    pad,
-                    opts.no_comments,
-                    ext,
-                );
-            }
-            return raw_view(
+    // Explicit `:ALL` always takes precedence over `--full-under N` (which only applies to bare files).
+    if expand_symbols.len() == 1 && expand_symbols[0].eq_ignore_ascii_case("ALL") {
+        if let Some(pat) = opts.around {
+            return around_mode(
                 &lines,
                 file_path,
+                pat,
+                opts.around_before,
+                opts.around_after,
+                None,
                 pad,
-                opts.line_range,
                 opts.no_comments,
-                opts.show_imports,
-                opts.cap_long_lines,
                 ext,
             );
-        } else {
-            eff_expand.clear();
         }
+        return raw_view(
+            &lines,
+            file_path,
+            pad,
+            opts.line_range,
+            opts.no_comments,
+            opts.show_imports,
+            opts.cap_long_lines,
+            ext,
+        );
     }
-    let expand_symbols = &eff_expand;
 
     // Fast path: if all expand targets are explicit line ranges (e.g. `outline schema.prisma 100-140,800-830`),
     // work cleanly on ANY file (including Prisma, YAML, JSON, Dockerfiles) without AST parsing!
@@ -1006,6 +1163,221 @@ fn compact_outline_mode(
     out.join("\n")
 }
 
+/// Extract compact local/workspace import paths from a collapsed import block (`imp_start..=imp_end`)
+/// whose bindings are actually referenced in the printed slice body (`body_start..=body_end`).
+fn summarize_used_local_imports(
+    lines: &[&str],
+    imp_start: usize,
+    imp_end: usize,
+    body_start: usize,
+    body_end: usize,
+) -> Option<String> {
+    if imp_start == 0 || imp_end < imp_start || body_start > body_end || body_start > lines.len() {
+        return None;
+    }
+    let b_end = body_end.min(lines.len());
+    let mut body_idents: FxHashSet<&str> = FxHashSet::default();
+    for line in &lines[body_start - 1..b_end] {
+        let bytes = line.as_bytes();
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            let c = bytes[idx];
+            if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
+                let s = idx;
+                idx += 1;
+                while idx < bytes.len()
+                    && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'$')
+                {
+                    idx += 1;
+                }
+                if idx - s >= 2 {
+                    body_idents.insert(&line[s..idx]);
+                }
+            } else {
+                idx += 1;
+            }
+        }
+    }
+    if body_idents.is_empty() {
+        return None;
+    }
+
+    const EXTERNAL_SCOPES: &[&str] = &[
+        "@types/", "@testing-library/", "@tanstack/", "@radix-ui/", "@trpc/", "@prisma/",
+        "@next/", "@vercel/", "@hookform/", "@sentry/", "@aws-sdk/", "@google-cloud/",
+        "@mui/", "@chakra-ui/", "@emotion/", "@babel/", "@eslint/", "@playwright/",
+        "@vitest/", "@jest/", "@stripe/", "@clerk/", "@supabase/", "@posthog/",
+        "@lucide/", "@heroicons/", "@headlessui/", "@octokit/", "@storybook/", "@opentelemetry/",
+    ];
+    let is_local_js_spec = |spec: &str| -> bool {
+        if spec.starts_with("./")
+            || spec.starts_with("../")
+            || spec.starts_with("~/")
+            || spec.starts_with("@/")
+        {
+            return true;
+        }
+        if spec.starts_with('@') && spec.contains('/') {
+            return !EXTERNAL_SCOPES.iter().any(|ex| spec.starts_with(ex));
+        }
+        false
+    };
+    const PY_COMMON_EXTERNAL: &[&str] = &[
+        "os", "sys", "re", "json", "typing", "pathlib", "datetime", "collections",
+        "functools", "itertools", "logging", "math", "time", "uuid", "asyncio",
+        "dataclasses", "enum", "abc", "io", "copy", "hashlib", "subprocess",
+        "tempfile", "unittest", "pytest", "pydantic", "fastapi", "starlette",
+        "numpy", "pandas", "requests", "httpx", "yaml", "toml", "tomllib",
+        "urllib", "http", "shutil", "glob", "inspect", "contextlib", "decimal",
+        "fractions", "random", "statistics", "string", "textwrap", "traceback",
+        "warnings", "weakref", "concurrent", "multiprocessing", "threading",
+        "socket", "ssl", "csv", "gzip", "zipfile", "tarfile", "base64", "struct",
+        "__future__", "sqlalchemy", "boto3", "botocore", "click", "typer", "rich",
+        "aiohttp", "celery", "redis", "pymongo", "motor", "anthropic", "openai",
+    ];
+
+    let extract_idents = |s: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes = s.as_bytes();
+        let mut idx = 0usize;
+        while idx < bytes.len() {
+            let c = bytes[idx];
+            if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
+                let st = idx;
+                idx += 1;
+                while idx < bytes.len()
+                    && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_' || bytes[idx] == b'$')
+                {
+                    idx += 1;
+                }
+                let tok = &s[st..idx];
+                if !matches!(
+                    tok,
+                    "import" | "type" | "from" | "as" | "default" | "const" | "let" | "var" | "require" | "use"
+                ) {
+                    out.push(tok.to_string());
+                }
+            } else {
+                idx += 1;
+            }
+        }
+        out
+    };
+
+    let imp_slice = &lines[imp_start - 1..imp_end.min(lines.len())];
+    let mut stmts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut brace_depth = 0i32;
+    let mut paren_depth = 0i32;
+    for raw in imp_slice {
+        let t = raw.trim();
+        if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+            continue;
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(t);
+        for b in t.bytes() {
+            match b {
+                b'{' => brace_depth += 1,
+                b'}' => brace_depth = (brace_depth - 1).max(0),
+                b'(' => paren_depth += 1,
+                b')' => paren_depth = (paren_depth - 1).max(0),
+                _ => {}
+            }
+        }
+        if brace_depth == 0 && paren_depth == 0 {
+            stmts.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        stmts.push(cur);
+    }
+
+    let mut items: Vec<String> = Vec::new();
+    let mut seen_specs: FxHashSet<String> = FxHashSet::default();
+
+    for stmt in &stmts {
+        if stmt.starts_with("import ") || stmt.starts_with("import{") {
+            if let Some(from_pos) = stmt.rfind(" from ") {
+                let lhs = &stmt[..from_pos];
+                let rhs = stmt[from_pos + 6..].trim().trim_end_matches(';').trim();
+                let spec = rhs.trim_matches(|c| c == '\'' || c == '"');
+                if is_local_js_spec(spec) && !spec.is_empty() {
+                    let used: Vec<String> = extract_idents(lhs)
+                        .into_iter()
+                        .filter(|id| body_idents.contains(id.as_str()))
+                        .collect();
+                    if !used.is_empty() && seen_specs.insert(spec.to_string()) {
+                        let shown = if used.len() > 3 {
+                            format!("{}, +{}", used[..3].join(", "), used.len() - 3)
+                        } else {
+                            used.join(", ")
+                        };
+                        items.push(format!("{spec} ({shown})"));
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = stmt.strip_prefix("from ") {
+            if let Some((mod_part, imp_part)) = rest.split_once(" import ") {
+                let mod_spec = mod_part.trim();
+                let top_pkg = mod_spec.trim_start_matches('.').split('.').next().unwrap_or("");
+                let is_local_py = mod_spec.starts_with('.')
+                    || (!top_pkg.is_empty() && !PY_COMMON_EXTERNAL.contains(&top_pkg));
+                if is_local_py {
+                    let used: Vec<String> = extract_idents(imp_part)
+                        .into_iter()
+                        .filter(|id| body_idents.contains(id.as_str()))
+                        .collect();
+                    if !used.is_empty() && seen_specs.insert(mod_spec.to_string()) {
+                        let shown = if used.len() > 3 {
+                            format!("{}, +{}", used[..3].join(", "), used.len() - 3)
+                        } else {
+                            used.join(", ")
+                        };
+                        items.push(format!("{mod_spec} ({shown})"));
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = stmt.strip_prefix("use ") {
+            let spec = rest.trim().trim_end_matches(';');
+            if spec.starts_with("crate::") || spec.starts_with("super::") {
+                let used: Vec<String> = extract_idents(spec)
+                    .into_iter()
+                    .filter(|id| body_idents.contains(id.as_str()))
+                    .collect();
+                if !used.is_empty() && seen_specs.insert(spec.to_string()) {
+                    items.push(spec.to_string());
+                }
+            }
+        }
+    }
+
+    if items.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    let mut shown_cnt = 0usize;
+    for item in &items {
+        let sep = if out.is_empty() { "" } else { ", " };
+        if shown_cnt > 0 && out.len() + sep.len() + item.len() > 260 {
+            let rem = items.len() - shown_cnt;
+            out.push_str(&format!(", (+{rem} more)"));
+            break;
+        }
+        out.push_str(sep);
+        out.push_str(item);
+        shown_cnt += 1;
+    }
+    Some(out)
+}
+
 fn emit_line_range(
     out: &mut Vec<String>,
     lines: &[&str],
@@ -1039,6 +1411,18 @@ fn emit_line_range(
                     imp.start,
                     imp.end
                 ));
+                if let Some(local_summary) = summarize_used_local_imports(
+                    lines,
+                    imp.start as usize,
+                    imp.end as usize,
+                    (imp.end as usize) + 1,
+                    end,
+                ) {
+                    out.push(format!(
+                        "{}│     local imports used: {local_summary}",
+                        " ".repeat(pad)
+                    ));
+                }
                 i = (imp.end as usize) + 1;
                 continue;
             }

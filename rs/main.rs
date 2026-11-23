@@ -275,6 +275,57 @@ fn find_root_for_existing_path(p: &Path) -> Option<PathBuf> {
     Some(find_default_root(start_dir))
 }
 
+fn has_enclosing_git(start_dir: &Path) -> bool {
+    let start = fs::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
+    let mut dir = start.as_path();
+    loop {
+        if dir.join(".git").exists() {
+            return true;
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent,
+            _ => return false,
+        }
+    }
+}
+
+fn find_child_git_repos(base: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut repos = Vec::new();
+    let mut stack = vec![(base.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > max_depth {
+            continue;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let ns = name.to_string_lossy();
+            if ns.starts_with('.')
+                || matches!(
+                    ns.as_ref(),
+                    "node_modules" | "target" | "dist" | "build" | "__pycache__" | ".venv" | "venv"
+                )
+            {
+                continue;
+            }
+            if p.join(".git").exists() {
+                repos.push(fs::canonicalize(&p).unwrap_or(p));
+            } else if depth + 1 <= max_depth {
+                stack.push((p, depth + 1));
+            }
+        }
+    }
+    repos.sort();
+    repos.dedup();
+    repos
+}
+
 fn resolve_roots(flags: &Flags, target_file_hint: Option<&str>) -> Vec<PathBuf> {
     if !flags.roots.is_empty() {
         return flags.roots.iter().map(PathBuf::from).collect();
@@ -289,6 +340,52 @@ fn resolve_roots(flags: &Flags, target_file_hint: Option<&str>) -> Vec<PathBuf> 
         };
         if let Some(root) = find_root_for_existing_path(&probe) {
             return vec![root];
+        }
+    }
+    // If `--path` filters were provided without `--root`, check if they exist directly on disk
+    // or live inside child git repos when `cwd` is a non-git parent directory (e.g. `/agent`)!
+    if !flags.paths.is_empty() {
+        let mut inferred: Vec<PathBuf> = Vec::new();
+        for pf in &flags.paths {
+            let p = Path::new(pf);
+            let probe = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            };
+            if let Some(root) = find_root_for_existing_path(&probe) {
+                if !inferred.contains(&root) {
+                    inferred.push(root);
+                }
+            }
+        }
+        if !inferred.is_empty() {
+            return inferred;
+        }
+        if !has_enclosing_git(&cwd) {
+            let child_repos = find_child_git_repos(&cwd, 2);
+            if !child_repos.is_empty() {
+                let mut matched_repos: Vec<PathBuf> = Vec::new();
+                for repo in &child_repos {
+                    for pf in &flags.paths {
+                        let clean = pf.trim_start_matches("./").trim_end_matches('/');
+                        if !clean.is_empty() && repo.join(clean).exists() {
+                            if !matched_repos.contains(repo) {
+                                matched_repos.push(repo.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+                if !matched_repos.is_empty() {
+                    let names: Vec<String> = matched_repos
+                        .iter()
+                        .map(|r| r.display().to_string())
+                        .collect();
+                    eprintln!("ℹ Auto-detected --root from --path: {}", names.join(", "));
+                    return matched_repos;
+                }
+            }
         }
     }
     vec![find_default_root(&cwd)]
@@ -510,6 +607,12 @@ fn main() {
         let show_imports = flags.has("show-imports") || flags.has("with-imports");
         let cap_long_lines = max_chars.is_some();
         let multi_target = targets.len() > 1;
+        // In multi-target batches mixing bare/unscoped files with explicit `:sym`/`:Lstart-end` slices
+        // (e.g. `outline fileA --around "re" fileB:sym`), scope `--around` to the unscoped targets
+        // so explicit sibling symbol/range slices are NOT zeroed out!
+        let has_unscoped_target = targets.iter().any(|(_, syms)| {
+            syms.is_empty() || syms.iter().any(|s| s.eq_ignore_ascii_case("ALL"))
+        });
 
         struct RenderedTarget {
             rel_path: String,
@@ -574,6 +677,11 @@ fn main() {
             // Explicit small line ranges / symbol slices get priority over `:ALL` full-file dumps
             let is_explicit_slice = !expand_syms.is_empty()
                 && !expand_syms.iter().any(|s| s.eq_ignore_ascii_case("ALL"));
+            let target_around = if multi_target && has_unscoped_target && is_explicit_slice {
+                None
+            } else {
+                around_pat
+            };
 
             let out = build_outline(
                 &source,
@@ -589,7 +697,7 @@ fn main() {
                     show_imports,
                     full_skeleton: flags.has("full"),
                     filter: filter_pat,
-                    around: around_pat,
+                    around: target_around,
                     around_before,
                     around_after,
                     full_under,
@@ -673,12 +781,43 @@ fn main() {
                     .collect();
 
                 if !prio_idxs.is_empty() && !other_idxs.is_empty() {
-                    // Reserve a modest floor for `:ALL` targets while prioritizing explicit slices first
-                    let floor_other = (usable / n).min(1_500) * other_idxs.len();
+                    // Reserve a modest floor for `:ALL` / skeleton targets (capped by each target's
+                    // actual rendered size so short targets never waste budget!) while prioritizing
+                    // explicit slices first.
+                    let per_other_cap = (usable / n).min(1_500);
+                    let floor_other: usize = other_idxs
+                        .iter()
+                        .map(|&i| rendered[i].text.len().min(per_other_cap))
+                        .sum();
                     let prio_pool = usable.saturating_sub(floor_other);
                     let leftover = water_fill(&prio_idxs, prio_pool, &rendered, &mut alloc, &mut assigned);
                     let other_pool = floor_other + leftover;
-                    let _ = water_fill(&other_idxs, other_pool, &rendered, &mut alloc, &mut assigned);
+                    let rem_after_other = water_fill(&other_idxs, other_pool, &rendered, &mut alloc, &mut assigned);
+                    // Redistribute any remaining pool bytes back to still-truncated targets!
+                    if rem_after_other > 0 {
+                        let mut rem = rem_after_other;
+                        let truncated: Vec<usize> = (0..n)
+                            .filter(|&i| alloc[i] < rendered[i].text.len())
+                            .collect();
+                        if !truncated.is_empty() {
+                            let bump = rem / truncated.len();
+                            for &i in &truncated {
+                                let need = rendered[i].text.len().saturating_sub(alloc[i]);
+                                let give = need.min(bump);
+                                alloc[i] += give;
+                                rem = rem.saturating_sub(give);
+                            }
+                            for &i in &truncated {
+                                if rem == 0 {
+                                    break;
+                                }
+                                let need = rendered[i].text.len().saturating_sub(alloc[i]);
+                                let give = need.min(rem);
+                                alloc[i] += give;
+                                rem = rem.saturating_sub(give);
+                            }
+                        }
+                    }
                 } else {
                     let all_idxs: Vec<usize> = (0..n).collect();
                     let _ = water_fill(&all_idxs, usable, &rendered, &mut alloc, &mut assigned);
@@ -851,6 +990,7 @@ fn main() {
             code_only: flags.has("code"),
             include_tests,
             include_data: flags.has("include-data") || all_scopes,
+            all_scopes,
             no_tests_explicit,
             no_imports: flags.has("no-imports"),
             no_comments: flags.has("no-comments"),
@@ -1374,33 +1514,63 @@ fn main() {
             cmd_diff(&idx, g, git_ref);
         }
         "deps" => {
-            let Some(raw_f) = flags.positional.first() else {
-                eprintln!("Usage: betterrank deps <file>");
+            if flags.positional.is_empty() {
+                eprintln!("Usage: betterrank deps <file1 [file2 ...]>");
                 process::exit(1);
-            };
-            let f = normalize_graph_file_arg(&idx, raw_f);
-            cmd_deps(g, &f, count_only, offset, limit, user_limit.is_some());
+            }
+            let files: Vec<&str> = flags
+                .positional
+                .iter()
+                .flat_map(|arg| arg.split(','))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for (i, raw_f) in files.iter().enumerate() {
+                let f = normalize_graph_file_arg(&idx, raw_f);
+                if files.len() > 1 {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("=== deps: {f} ===");
+                }
+                cmd_deps(g, &f, count_only, offset, limit, user_limit.is_some());
+            }
         }
         "dependents" => {
-            let Some(raw_f) = flags.positional.first() else {
-                eprintln!("Usage: betterrank dependents <file> [--include-tests|--no-tests]");
+            if flags.positional.is_empty() {
+                eprintln!("Usage: betterrank dependents <file1 [file2 ...]> [--include-tests|--no-tests]");
                 process::exit(1);
-            };
-            let f = normalize_graph_file_arg(&idx, raw_f);
+            }
             let no_tests_explicit = flags.has("no-tests");
             let include_tests = flags.has("include-tests") && !no_tests_explicit;
-            cmd_dependents(
-                &idx,
-                g,
-                &f,
-                include_tests,
-                no_tests_explicit,
-                count_only,
-                offset,
-                limit,
-                user_limit.is_some(),
-                include_noncode,
-            );
+            let files: Vec<&str> = flags
+                .positional
+                .iter()
+                .flat_map(|arg| arg.split(','))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for (i, raw_f) in files.iter().enumerate() {
+                let f = normalize_graph_file_arg(&idx, raw_f);
+                if files.len() > 1 {
+                    if i > 0 {
+                        println!();
+                    }
+                    println!("=== dependents: {f} ===");
+                }
+                cmd_dependents(
+                    &idx,
+                    g,
+                    &f,
+                    include_tests,
+                    no_tests_explicit,
+                    count_only,
+                    offset,
+                    limit,
+                    user_limit.is_some(),
+                    include_noncode,
+                );
+            }
         }
         "neighborhood" => {
             let Some(raw_f) = flags.positional.first() else {

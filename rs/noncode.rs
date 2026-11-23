@@ -754,6 +754,7 @@ pub struct GrepOpts {
     pub code_only: bool,
     pub include_tests: bool,
     pub include_data: bool,
+    pub all_scopes: bool,
     pub no_tests_explicit: bool,
     pub no_imports: bool,
     pub no_comments: bool,
@@ -1256,11 +1257,13 @@ pub fn ranked_grep(
         });
     }
 
-    // Auto-raise `--max-per-file` to `--limit` when `--path` targets a single file!
+    // Auto-uncap `--max-per-file` when `--path` targets a single file (still bounded by `--max-chars`)!
+    let single_candidate_path =
+        !opts.user_max_per_file && candidates.len() == 1 && !path_filters.is_empty();
     let effective_max_per_file = if opts.files_only {
         0
-    } else if !opts.user_max_per_file && candidates.len() == 1 && !path_filters.is_empty() {
-        opts.limit_files.max(opts.max_per_file).max(30)
+    } else if single_candidate_path {
+        500
     } else {
         opts.max_per_file.max(1)
     };
@@ -1277,6 +1280,8 @@ pub fn ranked_grep(
 
     struct ScoredMatch {
         file_hits: TextFileHits,
+        raw_hits: Vec<TextMatchLine>,
+        raw_records: Vec<MatchRecord>,
         is_test_or_fix: bool,
         is_code_file: bool,
         repo_idx: usize,
@@ -1288,7 +1293,13 @@ pub fn ranked_grep(
     let no_comments = opts.no_comments;
     let collect_inventory_syms = opts.files_only;
     let num_branches = branch_regexes.len();
-    let buffer_cap = (effective_max_per_file * 8).clamp(32, 64);
+    let buffer_cap = if single_candidate_path {
+        500
+    } else if !opts.user_max_per_file && candidates.len() <= 10 && !path_filters.is_empty() {
+        128
+    } else {
+        (effective_max_per_file * 8).clamp(32, 64)
+    };
 
     let mut all_scored: Vec<ScoredMatch> = candidates
         .into_par_iter()
@@ -1389,14 +1400,25 @@ pub fn ranked_grep(
                 }
             }
 
-            let final_hits = finalize_file_hits(
-                sink.hits,
-                &sink.records,
-                effective_max_per_file,
-                num_branches,
-                before_ctx,
-                after_ctx,
-            );
+            // Even without `--no-comments`, mark Python docstring lines as comment-like so
+            // docstring-only `.py` files never drown out real code or infra files (`Dockerfile`/CI)!
+            if !no_comments && graph_path.to_ascii_lowercase().ends_with(".py") {
+                let py_docs = detect_python_docstring_lines(&abs);
+                if !py_docs.is_empty() {
+                    let mut noncomment_recount = 0usize;
+                    for rec in &mut sink.records {
+                        if py_docs.contains(&rec.line) {
+                            rec.is_comment = true;
+                        }
+                        if !rec.is_comment {
+                            noncomment_recount += 1;
+                        }
+                    }
+                    if sink.records.len() == sink.total_matches || noncomment_recount == 0 {
+                        sink.total_noncomment = noncomment_recount;
+                    }
+                }
+            }
 
             let is_tf = is_test_or_fixture_path(&graph_path);
             let is_code_file =
@@ -1404,8 +1426,9 @@ pub fn ranked_grep(
             let is_dts = graph_path.to_ascii_lowercase().ends_with(".d.ts");
             let comment_only_file = sink.total_noncomment == 0;
 
-            // Rank runtime source code ahead of `.json`/`.md`/`.yaml` unless `--non-code` or `--type` is requested
-            let mut score = if prefer_code && is_code_file {
+            // Rank runtime source code ahead of `.json`/`.md`/`.yaml` unless `--non-code` or `--type` is requested,
+            // but NEVER boost comment-only/docstring-only files above real infra/config files!
+            let mut score = if prefer_code && is_code_file && !comment_only_file {
                 base_score.max(0.0002) + 0.05
             } else {
                 base_score
@@ -1432,12 +1455,14 @@ pub fn ranked_grep(
             Some(ScoredMatch {
                 file_hits: TextFileHits {
                     file: graph_path,
-                    hits: final_hits,
+                    hits: Vec::new(),
                     total_hits_in_file: sink.total_matches,
                     rank_score: score,
                     matched_branches: matched_branch_names,
                     enclosing_syms: sink.inventory_syms,
                 },
+                raw_hits: sink.hits,
+                raw_records: sink.records,
                 is_test_or_fix: is_tf,
                 is_code_file,
                 repo_idx,
@@ -1445,6 +1470,28 @@ pub fn ranked_grep(
             })
         })
         .collect();
+
+    // Finalize per-file match lines: if `--path` narrowed to a single matching file (and user did not
+    // explicitly pass `--max-per-file`), show all buffered matches instead of capping at 5/25!
+    let single_matched_file =
+        !opts.user_max_per_file && !path_filters.is_empty() && all_scored.len() == 1;
+    let final_max_per_file = if single_matched_file && !opts.files_only {
+        effective_max_per_file.max(buffer_cap)
+    } else {
+        effective_max_per_file
+    };
+    for item in &mut all_scored {
+        let raw_hits = std::mem::take(&mut item.raw_hits);
+        item.file_hits.hits = finalize_file_hits(
+            raw_hits,
+            &item.raw_records,
+            final_max_per_file,
+            num_branches,
+            before_ctx,
+            after_ctx,
+        );
+        item.raw_records.clear();
+    }
 
     all_scored.sort_by(|a, b| {
         b.file_hits
@@ -1545,10 +1592,52 @@ pub fn ranked_grep(
     };
     let multi_repo = roots.len() > 1;
     let multi_branch = num_branches >= 2;
+    let balance_scopes = opts.all_scopes && !noncode_only && !opts.code_only;
 
-    let selected: Vec<TextFileHits> = if (multi_branch || multi_repo) && !prod.is_empty() && cap > 0 {
+    let selected: Vec<TextFileHits> = if (multi_branch || multi_repo || balance_scopes)
+        && !prod.is_empty()
+        && cap > 0
+    {
         let mut chosen_set = vec![false; prod.len()];
         let mut chosen_indices: Vec<usize> = Vec::with_capacity(cap);
+
+        // Phase 0: when `--all-scopes` is active, reserve round-robin slots across all active
+        // scopes (code / non-code infra / tests) so Dockerfiles & CI workflows are never starved!
+        if balance_scopes {
+            let mut scope_buckets: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            for (idx, item) in prod.iter().enumerate() {
+                if item.is_test_or_fix {
+                    scope_buckets[2].push(idx);
+                } else if item.is_code_file {
+                    scope_buckets[0].push(idx);
+                } else {
+                    scope_buckets[1].push(idx);
+                }
+            }
+            let active_scopes: Vec<usize> = (0..3)
+                .filter(|&si| !scope_buckets[si].is_empty())
+                .collect();
+            if active_scopes.len() > 1 {
+                let reserve_rounds = (cap / active_scopes.len()).clamp(2, 6);
+                let mut s_cursors = [0usize; 3];
+                for _ in 0..reserve_rounds {
+                    for &si in &active_scopes {
+                        if chosen_indices.len() >= cap {
+                            break;
+                        }
+                        while s_cursors[si] < scope_buckets[si].len() {
+                            let cand = scope_buckets[si][s_cursors[si]];
+                            s_cursors[si] += 1;
+                            if !chosen_set[cand] {
+                                chosen_set[cand] = true;
+                                chosen_indices.push(cand);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Build per-branch buckets (rarest non-empty branch first)
         let mut per_branch: Vec<Vec<usize>> = vec![Vec::new(); num_branches];
