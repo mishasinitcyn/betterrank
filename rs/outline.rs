@@ -30,27 +30,71 @@ pub struct OutlineOpts<'a> {
     pub show_imports: bool,
     pub full_skeleton: bool,
     pub filter: Option<&'a str>,
+    pub around: Option<&'a str>,
+    pub around_context: usize,
+    pub full_under: Option<usize>,
     pub max_chars: Option<usize>,
 }
 
-fn apply_max_chars(s: String, max_chars: Option<usize>) -> String {
+fn parse_header_end_line(line: &str) -> Option<(String, u32)> {
+    // Matches `── file.ts:10-900 ──` or `── sym (file.ts:10-900) ──`
+    let inner = line.strip_prefix("── ")?.strip_suffix(" ──")?;
+    let loc = if let Some(paren_start) = inner.rfind('(') {
+        inner[paren_start + 1..].trim_end_matches(')')
+    } else {
+        inner
+    };
+    let (file, range) = loc.rsplit_once(':')?;
+    let (_, end_s) = range.split_once('-')?;
+    let end_num: u32 = end_s.parse().ok()?;
+    Some((file.to_string(), end_num))
+}
+
+fn parse_numbered_line(line: &str) -> Option<u32> {
+    let prefix = line.split('│').next()?;
+    prefix.trim().parse::<u32>().ok()
+}
+
+fn apply_max_chars(s: String, file_path: &str, max_chars: Option<usize>) -> String {
     let Some(limit) = max_chars else {
         return s;
     };
     if limit == 0 || s.len() <= limit {
         return s;
     }
-    let mut kept = String::with_capacity(limit + 80);
+    let mut kept = String::with_capacity(limit + 140);
     let mut emitted_lines = 0usize;
     let total_lines = s.lines().count();
+    let mut active_header: Option<(String, u32)> = None;
+    let mut last_line_num: Option<u32> = None;
+
     for line in s.lines() {
         let add_len = line.len() + if kept.is_empty() { 0 } else { 1 };
         if !kept.is_empty() && kept.len() + add_len > limit {
             let omitted = total_lines.saturating_sub(emitted_lines);
+            let resume = match (active_header, last_line_num) {
+                (Some((f, end_ln)), Some(cur)) if cur < end_ln => {
+                    format!(" — next: betterrank outline {f}:L{}-{end_ln}", cur + 1)
+                }
+                (None, Some(cur)) => {
+                    format!(
+                        " — next: betterrank outline {file_path}:L{}-{} (or --max-chars 0)",
+                        cur + 1,
+                        cur + 300
+                    )
+                }
+                _ => " — pass --max-chars 0 to uncap".to_string(),
+            };
             kept.push_str(&format!(
-                "\n... (truncated at --max-chars {limit}; {omitted} more lines omitted)"
+                "\n... (truncated at --max-chars {limit}; {omitted} more lines omitted{resume})"
             ));
             return kept;
+        }
+        if let Some(hdr) = parse_header_end_line(line) {
+            active_header = Some(hdr);
+            last_line_num = None;
+        } else if let Some(ln) = parse_numbered_line(line) {
+            last_line_num = Some(ln);
         }
         if !kept.is_empty() {
             kept.push('\n');
@@ -61,6 +105,230 @@ fn apply_max_chars(s: String, max_chars: Option<usize>) -> String {
     kept
 }
 
+fn around_mode(
+    lines: &[&str],
+    file_path: &str,
+    pat: &str,
+    ctx: usize,
+    bounds: Option<(u32, u32)>,
+    pad: usize,
+    no_comments: bool,
+    ext: &str,
+) -> String {
+    let re = regex::RegexBuilder::new(pat)
+        .case_insensitive(true)
+        .build()
+        .ok();
+    let sub = pat.to_ascii_lowercase();
+    let comment_lines = if no_comments {
+        detect_comment_lines(lines, ext)
+    } else {
+        FxHashSet::default()
+    };
+
+    let lo = bounds.map_or(1, |(s, _)| s.max(1)) as usize;
+    let hi = bounds
+        .map_or(lines.len(), |(_, e)| (e as usize).min(lines.len()))
+        .min(lines.len());
+    if lo > hi || lines.is_empty() {
+        return format!("(no matches for --around \"{pat}\" in {file_path})");
+    }
+
+    let mut matched: Vec<usize> = Vec::new();
+    for i in lo..=hi {
+        if no_comments && comment_lines.contains(&(i as u32)) {
+            continue;
+        }
+        let line = lines[i - 1];
+        let hit = match &re {
+            Some(r) => r.is_match(line),
+            None => line.to_ascii_lowercase().contains(&sub),
+        };
+        if hit {
+            matched.push(i);
+        }
+    }
+    if matched.is_empty() {
+        return format!("(no matches for --around \"{pat}\" in {file_path})");
+    }
+
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    for &m in &matched {
+        let s = m.saturating_sub(ctx).max(lo);
+        let e = (m + ctx).min(hi);
+        if let Some(last) = hunks.last_mut() {
+            if s <= last.1 + 1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        hunks.push((s, e));
+    }
+
+    let mut out = Vec::new();
+    for (idx, (s, e)) in hunks.iter().enumerate() {
+        if idx > 0 {
+            out.push(String::new());
+        }
+        out.push(format!("── {file_path}:{s}-{e} ──"));
+        for i in *s..=*e {
+            if no_comments && comment_lines.contains(&(i as u32)) {
+                continue;
+            }
+            out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
+        }
+    }
+    out.join("\n")
+}
+
+fn structured_config_outline(
+    lines: &[&str],
+    file_path: &str,
+    ext: &str,
+    filter: Option<&str>,
+) -> Option<String> {
+    let lower_ext = ext.to_ascii_lowercase();
+    if !matches!(lower_ext.as_str(), ".json" | ".yml" | ".yaml" | ".toml") {
+        return None;
+    }
+
+    let filter_re = filter.and_then(|pat| {
+        regex::RegexBuilder::new(pat)
+            .case_insensitive(true)
+            .build()
+            .ok()
+    });
+    let filter_sub = filter.map(|p| p.to_ascii_lowercase());
+    let matches_filter = |label: &str| -> bool {
+        if let Some(ref re) = filter_re {
+            re.is_match(label)
+        } else if let Some(ref sub) = filter_sub {
+            label.to_ascii_lowercase().contains(sub)
+        } else {
+            true
+        }
+    };
+
+    let mut entries: Vec<(u32, usize, String)> = Vec::new();
+    if lower_ext == ".toml" {
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                entries.push((i as u32 + 1, 0, trimmed.to_string()));
+            } else if !line.starts_with(' ') && !line.starts_with('\t') {
+                if let Some((k, _)) = trimmed.split_once('=') {
+                    let key = k.trim();
+                    if !key.is_empty() {
+                        entries.push((i as u32 + 1, 1, key.to_string()));
+                    }
+                }
+            }
+        }
+    } else if lower_ext == ".yml" || lower_ext == ".yaml" {
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" {
+                continue;
+            }
+            let indent = line.bytes().take_while(|&b| b == b' ').count();
+            if indent > 2 {
+                continue;
+            }
+            let body = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+            if let Some((k, _)) = body.split_once(':') {
+                let key = k.trim().trim_matches(|c| c == '"' || c == '\'');
+                if !key.is_empty() && !key.contains(' ') {
+                    let level = if indent == 0 { 0 } else { 1 };
+                    entries.push((i as u32 + 1, level, key.to_string()));
+                }
+            }
+        }
+    } else {
+        // JSON: track brace depth / shallow indentation (2 or 4 spaces)
+        let mut depth: i32 = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if depth >= 1 && depth <= 2 && trimmed.starts_with('"') {
+                if let Some(end_q) = trimmed[1..].find('"') {
+                    let key = &trimmed[1..1 + end_q];
+                    let after = trimmed[2 + end_q..].trim_start();
+                    if after.starts_with(':') {
+                        let level = (depth - 1) as usize;
+                        entries.push((i as u32 + 1, level, key.to_string()));
+                    }
+                }
+            }
+            let mut in_str = false;
+            let mut esc = false;
+            for b in trimmed.bytes() {
+                if esc {
+                    esc = false;
+                    continue;
+                }
+                if b == b'\\' && in_str {
+                    esc = true;
+                    continue;
+                }
+                if b == b'"' {
+                    in_str = !in_str;
+                    continue;
+                }
+                if !in_str {
+                    if b == b'{' {
+                        depth += 1;
+                    } else if b == b'}' {
+                        depth = (depth - 1).max(0);
+                    }
+                }
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    let total_lines = lines.len() as u32;
+    let mut rows: Vec<String> = Vec::new();
+    for idx in 0..entries.len() {
+        let (start, level, ref label) = entries[idx];
+        if !matches_filter(label) {
+            continue;
+        }
+        // Estimate end line as next entry at same or shallower level - 1
+        let mut end = total_lines;
+        for next in &entries[idx + 1..] {
+            if next.1 <= level {
+                end = next.0.saturating_sub(1).max(start);
+                break;
+            }
+        }
+        let indent = if level == 0 { "  " } else { "    " };
+        let range = if end > start {
+            format!("L{start}-{end}")
+        } else {
+            format!("L{start}")
+        };
+        rows.push(format!("{indent}{range:<12} {label}"));
+    }
+
+    let mut out = Vec::with_capacity(rows.len() + 2);
+    out.push(format!(
+        "{file_path} ({} lines, {} keys — pass :ALL or Lstart-end to expand):",
+        lines.len(),
+        entries.len()
+    ));
+    if rows.is_empty() {
+        out.push("  (no keys matched --filter)".to_string());
+    } else {
+        out.extend(rows);
+    }
+    Some(out.join("\n"))
+}
+
 pub fn build_outline(
     source: &str,
     file_path: &str,
@@ -69,7 +337,7 @@ pub fn build_outline(
 ) -> String {
     let max_chars = opts.max_chars;
     let res = build_outline_inner(source, file_path, expand_symbols, opts);
-    apply_max_chars(res, max_chars)
+    apply_max_chars(res, file_path, max_chars)
 }
 
 fn build_outline_inner(
@@ -83,9 +351,30 @@ fn build_outline_inner(
     let depth = if opts.depth == 0 { 1 } else { opts.depth };
     let ext = file_path.rfind('.').map(|i| &file_path[i..]).unwrap_or("");
 
+    // Support `file:ALL` to explicitly expand the entire file cleanly on any file type
+    if expand_symbols.len() == 1 && expand_symbols[0].eq_ignore_ascii_case("ALL") {
+        if let Some(pat) = opts.around {
+            return around_mode(
+                &lines,
+                file_path,
+                pat,
+                opts.around_context,
+                None,
+                pad,
+                opts.no_comments,
+                ext,
+            );
+        }
+        return raw_view(&lines, file_path, pad, opts.line_range);
+    }
+
     // Fast path: if all expand targets are explicit line ranges (e.g. `outline schema.prisma 100-140,800-830`),
     // work cleanly on ANY file (including Prisma, YAML, JSON, Dockerfiles) without AST parsing!
-    if !expand_symbols.is_empty() && expand_symbols.iter().all(|s| parse_line_range(s).is_some()) {
+    if !expand_symbols.is_empty()
+        && expand_symbols
+            .iter()
+            .all(|s| parse_line_range(s).is_some() || s.eq_ignore_ascii_case("ALL"))
+    {
         return expand_mode(
             &lines,
             &[],
@@ -96,6 +385,29 @@ fn build_outline_inner(
             opts.no_comments,
             ext,
         );
+    }
+
+    // `--around <regex>` with no symbol targets searches the whole file (or `--lines` bounds) directly!
+    if let Some(pat) = opts.around {
+        if expand_symbols.is_empty() {
+            return around_mode(
+                &lines,
+                file_path,
+                pat,
+                opts.around_context,
+                opts.line_range,
+                pad,
+                opts.no_comments,
+                ext,
+            );
+        }
+    }
+
+    // `--full-under N`: return full file when line count <= N and no symbols/ranges requested
+    if let Some(n) = opts.full_under {
+        if expand_symbols.is_empty() && opts.filter.is_none() && lines.len() <= n {
+            return raw_view(&lines, file_path, pad, opts.line_range);
+        }
     }
 
     // Plain `--lines A-B` without folding flags returns a fast raw slice.
@@ -112,6 +424,15 @@ fn build_outline_inner(
     }
 
     if !is_supported_extension(file_path) {
+        if expand_symbols.is_empty()
+            && !opts.full_skeleton
+            && opts.line_range.is_none()
+            && lines.len() > 60
+        {
+            if let Some(cfg_out) = structured_config_outline(&lines, file_path, ext, opts.filter) {
+                return cfg_out;
+            }
+        }
         return raw_view(&lines, file_path, pad, opts.line_range);
     }
 
@@ -151,6 +472,46 @@ fn build_outline_inner(
     let mut defs: Vec<ParsedDef> = by_line.into_values().collect();
     defs.sort_by_key(|d| d.line_start);
 
+    // Symbol-scoped `--around <regex>` (e.g. `outline router.ts:processOrder --around "status" -C 15`)
+    if let Some(pat) = opts.around {
+        if !expand_symbols.is_empty() {
+            let mut chunks = Vec::new();
+            for target in expand_symbols {
+                if let Some((rs, re)) = parse_line_range(target) {
+                    chunks.push(around_mode(
+                        &lines,
+                        file_path,
+                        pat,
+                        opts.around_context,
+                        Some((rs, re)),
+                        pad,
+                        opts.no_comments,
+                        ext,
+                    ));
+                    continue;
+                }
+                let matches: Vec<&ParsedDef> = defs.iter().filter(|d| d.name == *target).collect();
+                if matches.is_empty() {
+                    chunks.push(format!("Symbol \"{target}\" not found in {file_path}"));
+                } else {
+                    for d in matches {
+                        chunks.push(around_mode(
+                            &lines,
+                            file_path,
+                            pat,
+                            opts.around_context,
+                            Some((d.line_start, d.line_end)),
+                            pad,
+                            opts.no_comments,
+                            ext,
+                        ));
+                    }
+                }
+            }
+            return chunks.join("\n\n");
+        }
+    }
+
     if !expand_symbols.is_empty() {
         return expand_mode(
             &lines,
@@ -165,7 +526,7 @@ fn build_outline_inner(
     }
 
     // Default to 1-line-per-symbol compact skeleton (collapsing imports) so large files
-    // never blow past the 20 KB shell buffer; `--depth 1` also stays in compact mode
+    // never blow past the output budget; `--depth 1` also stays in compact mode
     // restricted to top-level symbols (`d == 0`). Use folded `outline_mode` when
     // `--depth >= 2`, `--lines`, or `--full` is explicitly requested.
     let use_compact = !opts.full_skeleton
@@ -396,6 +757,21 @@ fn expand_mode(
 
     let mut out = Vec::new();
     for target in expand_symbols {
+        if target.eq_ignore_ascii_case("ALL") {
+            let start = 1usize;
+            let end = lines.len();
+            out.push(format!("── {file_path}:{start}-{end} ──"));
+            for i in start..=end {
+                if no_comments && comment_lines.contains(&(i as u32)) {
+                    continue;
+                }
+                out.push(format!("{:>pad$}│ {}", i, lines[i - 1], pad = pad));
+            }
+            if batch_mode {
+                out.push(String::new());
+            }
+            continue;
+        }
         // Support direct line-range slices like `3150-3220` or `L3150-3220`
         if let Some((rs, re)) = parse_line_range(target) {
             let start = rs.max(1) as usize;

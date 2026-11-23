@@ -10,11 +10,27 @@ use betterrank::walk::{find_default_root, normalize_slashes};
 use rustc_hash::FxHashMap;
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 
 const DEFAULT_LIMIT: usize = 50;
 const DEFAULT_DEPTH: usize = 3;
+const DEFAULT_NON_TTY_MAX_CHARS: usize = 16_000;
+
+fn effective_max_chars(flags: &Flags) -> Option<usize> {
+    if let Some(n) = flags.get_usize("max-chars") {
+        if n == 0 {
+            None
+        } else {
+            Some(n)
+        }
+    } else if std::io::stdout().is_terminal() {
+        None
+    } else {
+        Some(DEFAULT_NON_TTY_MAX_CHARS)
+    }
+}
 
 const USAGE: &str = "\
 betterrank <command> [options]
@@ -96,6 +112,10 @@ fn parse_flags(args: &[String]) -> Flags {
             }
             "-F" => {
                 f.bools.insert("fixed-strings".to_string());
+                i += 1;
+            }
+            "-w" => {
+                f.bools.insert("word-regexp".to_string());
                 i += 1;
             }
             "-l" => {
@@ -185,6 +205,7 @@ fn parse_flags(args: &[String]) -> Flags {
                         | "all"
                         | "case-insensitive"
                         | "fixed-strings"
+                        | "word-regexp"
                         | "patch"
                 );
                 if !is_bool_flag && i + 1 < args.len() && !args[i + 1].starts_with('-') {
@@ -319,9 +340,9 @@ fn print_command_help(cmd: &str) {
     match cmd {
         "map" => println!("betterrank map [--focus file1,file2] [--include-tests] [--limit N] [--root <path>]\n\nOptions:\n  --focus <files>   Comma-separated files to bias ranking\n  --include-tests   Include test/spec files (excluded by default)\n  --count           Return total symbol count only\n  --offset N        Skip first N symbols\n  --limit N         Max symbols to return (default: 50)"),
         "callers" => println!("betterrank callers <sym1[,sym2,...]> [--file path] [--path sub] [--context [N]] [--include-tests|--no-tests] [--no-noncode] [--root <path>]\n\nOptions:\n  --file <path>    Disambiguate duplicate symbol names (or pass file.ts:sym)\n  --path <substr>  Filter caller paths (repeatable OR-union)\n  --context [N]    Show N lines of merged context around call sites (default: 2)\n  --include-tests  Include test/fixture callers with full context\n  --no-tests       Suppress even the compact Tests (N) footer\n  --no-noncode     Skip automatic non-code/config mention scan\n  --count          Return count only"),
-        "grep" => println!("betterrank grep <pattern> [-C N] [--compact] [--code|--non-code] [--path sub ...] [--exclude-path sub ...] [--no-imports] [--include-tests] [--include-data] [-l] [-i] [-F] [--limit N] [--root <path>]\n\nCode-first, PageRank-ranked ripgrep across all files, annotated with enclosing symbol names when warm.\n\nOptions:\n  --code             Search only supported source code files\n  --non-code         Search only non-code/config/infra/schema files\n  --path <substr>    Restrict to matching paths (repeatable OR-union; auto-includes tests if path targets tests)\n  --exclude-path <s> Exclude files whose path contains <s> (repeatable)\n  --no-imports       Filter out import/export-from/require lines\n  --include-tests    Include test/spec/fixture files in main output\n  --no-tests         Force-exclude tests even when --path targets tests\n  --include-data     Include bulk data/locale/dictionary files (*.dic, locales/*, >128KB JSON)\n  --compact          Dense 1-line-per-file matrix: path [matched_terms] L12, L45\n  -C N, --context N  Show N lines of surrounding context (max: 5)\n  -l, --files-only   List matching file paths only\n  -i                 Case-insensitive search\n  -F                 Fixed-string literal search (no regex)\n  --limit N          Max matching files (default: 30)\n  --max-per-file N   Max matching lines per file (default: 5; uncapped on single-file --path)"),
-        "files" => println!("betterrank files [dir-or-glob] [--dirs] [--depth N] [--all] [--code|--non-code] [--no-tests] [--limit N] [--root <path>]\n\nLists indexed files. Automatically rolls up by directory when matches exceed --limit (default: 200).\n\nOptions:\n  --dirs      Force directory rollup view (`dir/ (N files)`)\n  --depth N   Directory rollup depth below prefix (default: 1)\n  --all       Disable auto-rollup and list all matching files\n  --code      Code files only\n  --non-code  Non-code/config files only\n  --no-tests  Exclude test/spec files"),
-        "outline" => println!("betterrank outline <file[:sym1,L10-50]> [...] [--filter <regex>] [--depth N] [--max-chars N] [--annotate] [--no-comments] [--full] [--root <path>]\n\nExamples:\n  betterrank outline src/api.ts --filter \"review|score\"\n  betterrank outline src/a.ts:10-40 src/b.ts:handler,90-120\n  betterrank outline src/api.ts 3150-3220 --no-comments"),
+        "grep" => println!("betterrank grep <pattern> [-C N] [-w] [--compact] [--code|--non-code] [--path sub ...] [--exclude-path sub ...] [--no-imports] [--no-comments] [--include-tests] [--include-data] [--max-chars N] [-l] [-i] [-F] [--limit N] [--root <path>]\n\nCode-first, PageRank-ranked ripgrep across all files with rarest-branch-first alternation quotas and enclosing symbol labels.\n\nOptions:\n  --code             Search only supported source code files\n  --non-code         Search only non-code/config/infra/schema files\n  --path <substr>    Restrict to matching paths (repeatable OR-union; auto-includes tests if path targets tests)\n  --exclude-path <s> Exclude files whose path contains <s> (repeatable)\n  --no-imports       Filter out import/export-from/require lines\n  --no-comments      Filter out comment-only lines (comments are already demoted below code by default)\n  --include-tests    Include test/spec/fixture files in main output\n  --no-tests         Force-exclude tests even when --path targets tests\n  --include-data     Include bulk data/locale/dictionary files (*.dic, locales/*, >128KB JSON)\n  --compact          Dense 1-line-per-file matrix: path [matched_terms] L12, L45\n  --max-chars N      Output char budget (default: 16000 when non-TTY, 0 = unlimited)\n  -C N, --context N  Show N lines of surrounding context (max: 15)\n  -w, --word-regexp  Match whole words only\n  -l, --files-only   List matching file paths only\n  -i                 Case-insensitive search\n  -F                 Fixed-string literal search (no regex)\n  --limit N          Max matching files (default: 30)\n  --max-per-file N   Max matching lines per file (default: 5; uncapped on single-file --path)"),
+        "files" => println!("betterrank files [dir-or-glob ...] [--filter <regex>] [--dirs] [--depth N] [--all] [--code|--non-code] [--no-tests] [--limit N] [--root <path>]\n\nLists indexed files across one or more dir/glob patterns. Automatically rolls up by directory when matches exceed --limit (default: 200).\n\nOptions:\n  --filter <regex>  Case-insensitive regex filter on file paths (applied before rollup)\n  --dirs            Force directory rollup view (`dir/ (N files)`)\n  --depth N         Directory rollup depth below prefix when rolling up (default: 1)\n  --all             Disable auto-rollup and list all matching files\n  --code            Code files only\n  --non-code        Non-code/config files only\n  --no-tests        Exclude test/spec files"),
+        "outline" => println!("betterrank outline <file[:sym1,L10-50|ALL]> [...] [--filter <regex>] [--around <regex> [-C N]] [--full-under N] [--depth N] [--max-chars N] [--annotate] [--no-comments] [--full] [--root <path>]\n\nExamples:\n  betterrank outline src/api.ts --filter \"review|score\"\n  betterrank outline src/a.ts:10-40 src/b.ts:handler,90-120\n  betterrank outline src/api.ts:handler --around \"status\" -C 15\n  betterrank outline package.json:ALL --full-under 200"),
         _ => println!("{USAGE}"),
     }
 }
@@ -362,7 +383,7 @@ fn main() {
 
     if command == "outline" {
         if flags.positional.is_empty() {
-            eprintln!("Usage: betterrank outline <file[:sym1,L10-50]> [...] [--filter <regex>] [--annotate] [--no-comments] [--depth N] [--max-chars N] [--root <path>]");
+            eprintln!("Usage: betterrank outline <file[:sym1,L10-50|ALL]> [...] [--filter <regex>] [--around <regex> [-C N]] [--full-under N] [--annotate] [--no-comments] [--depth N] [--max-chars N] [--root <path>]");
             process::exit(1);
         }
         let annotate = flags.has("annotate");
@@ -371,7 +392,10 @@ fn main() {
         let explicit_depth = flags.get("depth").is_some();
         let depth = flags.get_usize("depth").unwrap_or(1) as u32;
         let filter_pat = flags.get("filter");
-        let max_chars = flags.get_usize("max-chars");
+        let around_pat = flags.get("around");
+        let around_ctx = flags.get_usize("context").unwrap_or(15);
+        let full_under = flags.get_usize("full-under");
+        let max_chars = effective_max_chars(&flags);
         let line_range = match flags.get("lines") {
             Some(spec) => match parse_line_range(spec) {
                 Some(r) => Some(r),
@@ -454,8 +478,21 @@ fn main() {
 
         let mut remaining_chars = max_chars;
         let mut sections: Vec<String> = Vec::with_capacity(targets.len());
+        let mut skipped_targets: Vec<String> = Vec::new();
 
         for (file_arg, expand_syms) in &targets {
+            if let Some(rem) = remaining_chars {
+                if rem < 120 && !sections.is_empty() {
+                    let spec = if expand_syms.is_empty() {
+                        file_arg.clone()
+                    } else {
+                        format!("{file_arg}:{}", expand_syms.join(","))
+                    };
+                    skipped_targets.push(spec);
+                    continue;
+                }
+            }
+
             let Some(abs_path) = try_resolve_outline_file(file_arg, &roots, &cwd) else {
                 eprintln!("Cannot read file: {file_arg}");
                 if targets.len() == 1 {
@@ -497,11 +534,6 @@ fn main() {
                 get_caller_counts_for_file(mmap.archived(), &gpath)
             });
 
-            if let Some(0) = remaining_chars {
-                sections.push(format!("... (skipped {rel_path}: --max-chars budget reached)"));
-                continue;
-            }
-
             let out = build_outline(
                 &source,
                 &rel_path,
@@ -516,6 +548,9 @@ fn main() {
                     show_imports: flags.has("show-imports"),
                     full_skeleton: flags.has("full"),
                     filter: filter_pat,
+                    around: around_pat,
+                    around_context: around_ctx,
+                    full_under,
                     max_chars: remaining_chars,
                 },
             );
@@ -523,6 +558,14 @@ fn main() {
                 remaining_chars = Some(rem.saturating_sub(out.len() + 2));
             }
             sections.push(out);
+        }
+
+        if !skipped_targets.is_empty() {
+            let cap_label = max_chars.unwrap_or(DEFAULT_NON_TTY_MAX_CHARS);
+            sections.push(format!(
+                "... (stopped at --max-chars {cap_label} — next: betterrank outline {})",
+                skipped_targets.join(" ")
+            ));
         }
 
         if !sections.is_empty() {
@@ -612,15 +655,18 @@ fn main() {
             .collect();
         let no_tests_explicit = flags.has("no-tests");
         let include_tests = flags.has("include-tests") && !no_tests_explicit;
+        let max_chars = effective_max_chars(&flags);
         let opts = GrepOpts {
             case_insensitive: flags.has("case-insensitive"),
             fixed_strings: flags.has("fixed-strings"),
+            word_regexp: flags.has("word-regexp"),
             noncode_only: flags.has("non-code"),
             code_only: flags.has("code"),
             include_tests,
             include_data: flags.has("include-data"),
             no_tests_explicit,
             no_imports: flags.has("no-imports"),
+            no_comments: flags.has("no-comments"),
             files_only: flags.has("files-only"),
             compact: flags.has("compact"),
             limit_files: user_limit.unwrap_or(30),
@@ -644,6 +690,14 @@ fn main() {
                 if count_only {
                     println!("files: {}", res.total_files);
                     println!("matches: {}", res.total_hits);
+                    if !res.repo_counts.is_empty() {
+                        let summary: Vec<String> = res
+                            .repo_counts
+                            .iter()
+                            .map(|(r, c)| format!("{r}: {c}"))
+                            .collect();
+                        println!("repos: {}", summary.join(" | "));
+                    }
                     if res.hidden_test_files > 0 {
                         println!(
                             "hidden_test_files: {} (matches: {})",
@@ -652,22 +706,39 @@ fn main() {
                     }
                     return;
                 }
+                let mut emitted_chars = 0usize;
                 if !res.branch_counts.is_empty() {
                     let summary: Vec<String> = res
                         .branch_counts
                         .iter()
                         .map(|(b, c)| format!("{b}: {c}"))
                         .collect();
-                    println!("Pattern matches (files): {}", summary.join(" | "));
+                    let line = format!("Pattern matches (files): {}", summary.join(" | "));
+                    emitted_chars += line.len() + 1;
+                    println!("{line}");
+                }
+                if !res.repo_counts.is_empty() {
+                    let summary: Vec<String> = res
+                        .repo_counts
+                        .iter()
+                        .map(|(r, c)| format!("{r}: {c}"))
+                        .collect();
+                    let line = format!("Repos (files): {}", summary.join(" | "));
+                    emitted_chars += line.len() + 1;
+                    println!("{line}");
                 }
                 if res.hits.is_empty() && res.hidden_test_files == 0 {
                     println!("(no matches for \"{pattern}\")");
                     return;
                 }
                 let has_ctx = opts.before_context > 0 || opts.after_context > 0;
+                let mut shown_files = 0usize;
+                let mut stopped_at_cap = false;
+
                 for fh in &res.hits {
+                    let mut block = String::new();
                     if opts.files_only {
-                        println!("{}  ({} matches)", fh.file, fh.total_hits_in_file);
+                        block.push_str(&format!("{}  ({} matches)\n", fh.file, fh.total_hits_in_file));
                     } else if opts.compact {
                         let line_nums: Vec<String> = fh
                             .hits
@@ -682,47 +753,67 @@ fn main() {
                             String::new()
                         };
                         if !fh.matched_branches.is_empty() {
-                            println!(
-                                "{}  [{}]  {}{}",
+                            block.push_str(&format!(
+                                "{}  [{}]  {}{}\n",
                                 fh.file,
                                 fh.matched_branches.join(", "),
                                 line_nums.join(", "),
                                 more
-                            );
+                            ));
                         } else {
-                            println!("{}  {}{}", fh.file, line_nums.join(", "), more);
+                            block.push_str(&format!("{}  {}{}\n", fh.file, line_nums.join(", "), more));
                         }
                     } else {
-                        println!("{}:", fh.file);
+                        block.push_str(&format!("{}:\n", fh.file));
                         let mut prev_line: Option<u64> = None;
                         let mut shown_matches = 0usize;
                         for h in &fh.hits {
                             if let Some(pl) = prev_line {
                                 if has_ctx && h.line > pl + 1 {
-                                    println!("  --");
+                                    block.push_str("  --\n");
                                 }
                             }
                             if h.is_context {
-                                println!("  {:>5}- {}", h.line, h.content);
+                                block.push_str(&format!("  {:>5}- {}\n", h.line, h.content));
                             } else {
                                 shown_matches += 1;
                                 if let Some(ref sym) = h.enclosing_sym {
-                                    println!("  {:>5} [{sym}]│ {}", h.line, h.content);
+                                    block.push_str(&format!(
+                                        "  {:>5} [{sym}]│ {}\n",
+                                        h.line, h.content
+                                    ));
                                 } else {
-                                    println!("  {:>5}│ {}", h.line, h.content);
+                                    block.push_str(&format!("  {:>5}│ {}\n", h.line, h.content));
                                 }
                             }
                             prev_line = Some(h.line);
                         }
                         if fh.total_hits_in_file > shown_matches {
-                            println!(
-                                "        ... (+{} more in file)",
+                            block.push_str(&format!(
+                                "        ... (+{} more in file)\n",
                                 fh.total_hits_in_file - shown_matches
-                            );
+                            ));
                         }
                     }
+
+                    if let Some(cap) = max_chars {
+                        if !opts.files_only && shown_files > 0 && emitted_chars + block.len() > cap {
+                            stopped_at_cap = true;
+                            break;
+                        }
+                    }
+                    print!("{block}");
+                    emitted_chars += block.len();
+                    shown_files += 1;
                 }
-                if res.total_files > res.hits.len() {
+
+                if stopped_at_cap {
+                    let cap_val = max_chars.unwrap_or(DEFAULT_NON_TTY_MAX_CHARS);
+                    println!(
+                        "\n... (stopped at --max-chars {cap_val} after {shown_files} of {} files; {} total matches — narrow with --path / --compact or pass --max-chars 0)",
+                        res.total_files, res.total_hits
+                    );
+                } else if res.total_files > res.hits.len() {
                     println!(
                         "\nShowing {} of {} files ({} total matches; ranked by PageRank). Use --limit N or --path <subpath> to narrow.",
                         res.hits.len(),
@@ -810,11 +901,11 @@ fn main() {
             cmd_structure(g, depth, explicit);
         }
         "files" => {
-            let pat = flags.positional.first().map(|s| s.as_str());
             let files_limit = user_limit.unwrap_or(200);
             cmd_files(
                 g,
-                pat,
+                &flags.positional,
+                flags.get("filter"),
                 flags.has("code"),
                 flags.has("non-code"),
                 flags.has("no-tests"),
@@ -828,19 +919,22 @@ fn main() {
         }
         "search" => {
             if flags.positional.is_empty() {
-                eprintln!("Usage: betterrank search <query> [--kind type] [--max-per-file N] [--include-tests]");
+                eprintln!("Usage: betterrank search <query> [--kind type] [--path sub ...] [--max-per-file N] [--include-tests]");
                 process::exit(1);
             }
             let q = flags.positional.join(" ");
             let max_per_file = flags.get_usize("max-per-file").unwrap_or(5);
-            let include_tests = flags.has("include-tests") && !flags.has("no-tests");
+            let no_tests_explicit = flags.has("no-tests");
+            let include_tests = flags.has("include-tests") && !no_tests_explicit;
             cmd_search(
                 &idx,
                 g,
                 &q,
                 flags.get("kind"),
+                &flags.paths,
                 max_per_file,
                 include_tests,
+                no_tests_explicit,
                 count_only,
                 offset,
                 limit,

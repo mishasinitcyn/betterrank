@@ -397,24 +397,36 @@ fn split_query_tokens(query: &str) -> Vec<String> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_search(
     idx: &CodeIndex,
     g: &ArchivedGraphCacheData,
     query: &str,
     kind: Option<&str>,
+    path_filters: &[String],
     max_per_file: usize,
     include_tests: bool,
+    no_tests_explicit: bool,
     count_only: bool,
     offset: usize,
     limit: usize,
     user_limit: bool,
     include_noncode: bool,
 ) {
+    let eff_include_tests =
+        include_tests || (!no_tests_explicit && path_filters_target_tests(path_filters));
+    let matches_path = |p: &str| -> bool {
+        path_filters.is_empty()
+            || path_filters
+                .iter()
+                .any(|pf| p.contains(pf.trim_start_matches("./")))
+    };
+
     let q_lower = query.to_ascii_lowercase();
     let tokens = split_query_tokens(query);
     let multi_token = tokens.len() > 1;
 
-    // Also match files by path (critical for Next.js routes like `user-management/page.tsx`)
+    // Also match files by path (critical for route files like `account-settings/page.tsx`)
     let mut matching_files: Vec<&str> = Vec::new();
     if kind.is_none() && offset == 0 && !count_only {
         for &fi_r in g.file_order.iter() {
@@ -423,7 +435,10 @@ pub fn cmd_search(
                 continue;
             }
             let p = f.path.as_str();
-            if !include_tests && is_test_file(p) {
+            if !matches_path(p) {
+                continue;
+            }
+            if !eff_include_tests && is_test_file(p) {
                 continue;
             }
             let pl = p.to_ascii_lowercase();
@@ -438,7 +453,10 @@ pub fn cmd_search(
         }
         for p_r in g.noncode_files.iter() {
             let p = p_r.as_str();
-            if !include_tests && is_test_file(p) {
+            if !matches_path(p) {
+                continue;
+            }
+            if !eff_include_tests && is_test_file(p) {
                 continue;
             }
             let pl = p.to_ascii_lowercase();
@@ -469,6 +487,9 @@ pub fn cmd_search(
         }
         let fi = sym.file_idx.to_native() as usize;
         let file_path = g.files[fi].path.as_str();
+        if !matches_path(file_path) {
+            continue;
+        }
         let is_test = is_test_file(file_path);
 
         let name_l = sym.name.as_str().to_ascii_lowercase();
@@ -517,7 +538,7 @@ pub fn cmd_search(
         };
 
         if let Some(tier) = matched_tier {
-            if is_test && !include_tests {
+            if is_test && !eff_include_tests {
                 test_sym_count += 1;
                 continue;
             }
@@ -607,7 +628,11 @@ pub fn cmd_search(
     }
 
     if include_noncode && offset == 0 && kind.is_none() {
-        let (nc_hits, nc_total) = find_noncode_mentions(&idx.roots, Some(g), query, 10, 2);
+        let (mut nc_hits, mut nc_total) = find_noncode_mentions(&idx.roots, Some(g), query, 10, 2);
+        if !path_filters.is_empty() {
+            nc_hits.retain(|fh| matches_path(&fh.file));
+            nc_total = nc_hits.len();
+        }
         print_noncode_section(&nc_hits, nc_total);
     }
 }
@@ -652,10 +677,31 @@ fn rollup_directories(
     counts.into_iter().collect()
 }
 
+fn compile_file_pattern(raw: &str) -> (String, Option<Regex>) {
+    let pat_lower = raw.trim_start_matches("./").to_ascii_lowercase();
+    let has_glob = pat_lower.contains('*') || pat_lower.contains('?');
+    let glob_re = if has_glob {
+        let mut re_s = String::from("^.*");
+        for ch in pat_lower.chars() {
+            match ch {
+                '*' => re_s.push_str(".*"),
+                '?' => re_s.push('.'),
+                other => re_s.push_str(&regex::escape(&other.to_string())),
+            }
+        }
+        re_s.push_str(".*$");
+        Regex::new(&re_s).ok()
+    } else {
+        None
+    };
+    (pat_lower, glob_re)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_files(
     g: &ArchivedGraphCacheData,
-    pattern: Option<&str>,
+    patterns: &[String],
+    filter: Option<&str>,
     code_only: bool,
     noncode_only: bool,
     no_tests: bool,
@@ -684,25 +730,17 @@ pub fn cmd_files(
     paths.sort_unstable();
     paths.dedup();
 
-    let pat_lower = pattern.map(|p| p.trim_start_matches("./").to_ascii_lowercase());
-    let has_glob = pat_lower
-        .as_ref()
-        .map_or(false, |p| p.contains('*') || p.contains('?'));
-    let glob_re = if has_glob {
-        let p = pat_lower.as_deref().unwrap_or("");
-        let mut re_s = String::from("^.*");
-        for ch in p.chars() {
-            match ch {
-                '*' => re_s.push_str(".*"),
-                '?' => re_s.push('.'),
-                other => re_s.push_str(&regex::escape(&other.to_string())),
-            }
-        }
-        re_s.push_str(".*$");
-        regex::Regex::new(&re_s).ok()
-    } else {
-        None
-    };
+    let compiled_pats: Vec<(String, Option<Regex>)> = patterns
+        .iter()
+        .map(|p| compile_file_pattern(p))
+        .collect();
+    let filter_re = filter.and_then(|pat| {
+        regex::RegexBuilder::new(pat)
+            .case_insensitive(true)
+            .build()
+            .ok()
+    });
+    let filter_sub = filter.map(|p| p.to_ascii_lowercase());
 
     let filtered: Vec<&str> = paths
         .into_iter()
@@ -710,16 +748,29 @@ pub fn cmd_files(
             if no_tests && is_test_file(p) {
                 return false;
             }
-            if let Some(ref pl) = pat_lower {
-                let p_low = p.to_ascii_lowercase();
-                if let Some(ref re) = glob_re {
-                    re.is_match(&p_low)
-                } else {
-                    p_low.contains(pl.as_str())
+            let p_low = p.to_ascii_lowercase();
+            if !compiled_pats.is_empty() {
+                let any_pat = compiled_pats.iter().any(|(pl, re_opt)| {
+                    if let Some(ref re) = re_opt {
+                        re.is_match(&p_low)
+                    } else {
+                        p_low.contains(pl.as_str())
+                    }
+                });
+                if !any_pat {
+                    return false;
                 }
-            } else {
-                true
             }
+            if let Some(ref re) = filter_re {
+                if !re.is_match(p) {
+                    return false;
+                }
+            } else if let Some(ref sub) = filter_sub {
+                if !p_low.contains(sub.as_str()) {
+                    return false;
+                }
+            }
+            true
         })
         .collect();
 
@@ -733,13 +784,18 @@ pub fn cmd_files(
         return;
     }
 
-    // Directory rollup: triggered explicitly via `--dirs` / `--depth N`, or automatically when
-    // unfiltered results exceed `--limit` (default 200) and neither `--all` nor `--offset` was passed,
-    // so large directories show their full A-Z folder map instead of truncating alphabetically at `g*`.
+    // Directory rollup: triggered explicitly via `--dirs`, or automatically ONLY when
+    // filtered results exceed `--limit` (default 200) and neither `--all` nor `--offset` was passed.
+    // Passing `--depth N` controls rollup depth when rolling up, without hiding tiny dirs (<= limit)!
     let auto_rollup = !show_all && offset == 0 && filtered.len() > limit;
-    if dirs_only || depth.is_some() || auto_rollup {
+    if dirs_only || auto_rollup {
         let rollup_depth = depth.unwrap_or(1);
-        let dirs = rollup_directories(&filtered, pattern, rollup_depth);
+        let single_pat = if patterns.len() == 1 {
+            Some(patterns[0].as_str())
+        } else {
+            None
+        };
+        let dirs = rollup_directories(&filtered, single_pat, rollup_depth);
         let show_dirs = dirs.len().min(limit.max(200));
         for (dir, cnt) in &dirs[..show_dirs] {
             println!(
@@ -751,7 +807,7 @@ pub fn cmd_files(
             println!("... (+{} more directories)", dirs.len() - show_dirs);
         }
         println!(
-            "\n{} files across {} {} (use a subdirectory, --depth N, --all, or --limit N to list individual files).",
+            "\n{} files across {} {} (use a subdirectory, --filter <regex>, --depth N, --all, or --limit N to list individual files).",
             filtered.len(),
             dirs.len(),
             if dirs.len() == 1 { "directory" } else { "directories" }
@@ -771,7 +827,7 @@ pub fn cmd_files(
     }
     if slice.len() < filtered.len() {
         println!(
-            "\nShowing {} of {} files. Use --dirs, --all, --offset N, or a narrower prefix/glob.",
+            "\nShowing {} of {} files. Use --dirs, --filter <regex>, --all, --offset N, or a narrower prefix/glob.",
             slice.len(),
             filtered.len()
         );

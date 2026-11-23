@@ -711,7 +711,8 @@ fn collect_index_definitions(root: Node, lang: Lang, src: &[u8]) -> Vec<ParsedDe
 
 fn collect_python_top_level_constants(root: Node, src: &[u8]) -> Vec<ParsedDef> {
     static PY_CONST_RE: OnceLock<Regex> = OnceLock::new();
-    let py_const_re = PY_CONST_RE.get_or_init(|| Regex::new(r"^[A-Z][A-Z0-9_]+$").unwrap());
+    // Match both UPPER_CASE and leading-underscore _UPPER_CASE module constants (e.g. _LAZY_EXPORTS)
+    let py_const_re = PY_CONST_RE.get_or_init(|| Regex::new(r"^_?[A-Z][A-Z0-9_]+$").unwrap());
 
     let mut all_exports: FxHashSet<String> = FxHashSet::default();
     let mut top_assigns: Vec<(String, Node)> = Vec::new();
@@ -752,6 +753,7 @@ fn collect_python_top_level_constants(root: Node, src: &[u8]) -> Vec<ParsedDef> 
                     }
                 }
             }
+            top_assigns.push((name.to_string(), assign));
             continue;
         }
         top_assigns.push((name.to_string(), assign));
@@ -759,16 +761,17 @@ fn collect_python_top_level_constants(root: Node, src: &[u8]) -> Vec<ParsedDef> 
 
     let mut defs = Vec::new();
     for (name, node) in top_assigns {
-        if !py_const_re.is_match(&name) && !all_exports.contains(&name) {
+        if name != "__all__" && !py_const_re.is_match(&name) && !all_exports.contains(&name) {
             continue;
         }
+        let is_exported = !name.starts_with('_') || name == "__all__";
         defs.push(create_definition(
             name,
             node,
             Lang::Python,
             src,
             Some(SymbolKind::Variable),
-            Some(true),
+            Some(is_exported),
             None,
         ));
     }

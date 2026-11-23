@@ -800,3 +800,274 @@ fn v051_bugs_and_ergonomics() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn v052_quotas_budget_files_and_outlines() {
+    let base = temp_dir("v052-suite");
+    let cache_dir = base.join("cache");
+    let repo_a = base.join("repo-a");
+    let repo_b = base.join("repo-b");
+
+    fs::create_dir_all(repo_a.join("apps/web")).unwrap();
+    fs::create_dir_all(repo_a.join("apps/api")).unwrap();
+    fs::create_dir_all(repo_a.join("pkg")).unwrap();
+    fs::create_dir_all(repo_b.join("src")).unwrap();
+
+    // 1. Huge file (> 20 KB) to test default 16 KB non-TTY cap + exact resume hint + `--max-chars 0`
+    let mut huge_ts = String::from("export function bigProcessor() {\n");
+    for i in 1..=450 {
+        huge_ts.push_str(&format!(
+            "  const step_{i:03} = 'padding_payload_value_for_line_{i:03}_testing';\n"
+        ));
+    }
+    huge_ts.push_str("  const needle = 'SPECIAL_AROUND_TARGET';\n");
+    huge_ts.push_str("  return needle;\n}\n");
+    fs::write(repo_a.join("apps/api/huge.ts"), &huge_ts).unwrap();
+
+    // 2. Same-file alternation starvation + comment demotion + `-w`
+    let mut mixed_ts = String::new();
+    for i in 1..=25 {
+        mixed_ts.push_str(&format!("const noisy_{i} = 'NOISY_TERM';\n"));
+    }
+    mixed_ts.push_str("const rare = 'RARE_TERM';\n");
+    mixed_ts.push_str("const cls = 'boxShadow shadowMode';\n");
+    mixed_ts.push_str("const exact = shadow;\n");
+    fs::write(repo_a.join("apps/api/mixed.ts"), &mixed_ts).unwrap();
+
+    // Multiple files with NOISY_TERM so NOISY_TERM outnumbers RARE_TERM across files too
+    for i in 1..=6 {
+        fs::write(
+            repo_a.join(format!("apps/web/noisy_{i}.ts")),
+            format!("export const n{i} = 'NOISY_TERM';\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        repo_a.join("apps/web/rare_only.ts"),
+        "export const onlyRare = 'RARE_TERM';\n",
+    )
+    .unwrap();
+
+    // Dockerfile with 8 `# comment` lines mentioning `pip install` before real `RUN pip install`
+    let mut df = String::from("FROM python:3.11\n");
+    for i in 1..=8 {
+        df.push_str(&format!("# comment {i}: remember pip install order\n"));
+    }
+    df.push_str("RUN pip install --no-cache-dir demo-pkg\n");
+    fs::write(repo_a.join("worker.Dockerfile"), &df).unwrap();
+
+    // Python __init__.py with __all__ and _LAZY_EXPORTS
+    fs::write(
+        repo_a.join("pkg/__init__.py"),
+        "__all__ = ['alpha', 'beta']\n\n_LAZY_EXPORTS = {\n    'alpha': 'pkg.alpha',\n    'beta': 'pkg.beta',\n}\n",
+    )
+    .unwrap();
+
+    // Large JSON config (> 60 lines) to test structured key outline
+    let mut big_json = String::from("{\n  \"name\": \"demo-app\",\n  \"scripts\": {\n");
+    for i in 1..=65 {
+        let comma = if i < 65 { "," } else { "" };
+        big_json.push_str(&format!("    \"task_{i}\": \"echo {i}\"{comma}\n"));
+    }
+    big_json.push_str("  },\n  \"dependencies\": {\n    \"foo\": \"1.0.0\"\n  }\n}\n");
+    fs::write(repo_a.join("package.json"), &big_json).unwrap();
+
+    // Sibling repo with 0 hits for `RARE_TERM`
+    fs::write(repo_b.join("src/hello.ts"), "export const hello = 1;\n").unwrap();
+
+    // Warm index for repo-a
+    let warm = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args(["stats", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(warm.status.success());
+
+    // A. Default non-TTY `outline` caps at <= 16 KB with exact resume command; `--max-chars 0` uncaps
+    let capped = Command::new(bin_path())
+        .args(["outline", "apps/api/huge.ts:1-453", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let cap_s = String::from_utf8_lossy(&capped.stdout);
+    assert!(cap_s.len() < 17_000, "non-TTY outline must cap near 16KB, got {} bytes", cap_s.len());
+    assert!(
+        cap_s.contains("next: betterrank outline apps/api/huge.ts:L"),
+        "expected exact resume hint, got tail:\n{}",
+        &cap_s[cap_s.len().saturating_sub(300)..]
+    );
+
+    let uncapped = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/api/huge.ts:1-453",
+            "--max-chars",
+            "0",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let uncap_s = String::from_utf8_lossy(&uncapped.stdout);
+    assert!(uncap_s.contains("SPECIAL_AROUND_TARGET"), "--max-chars 0 must uncap:\n{}", uncap_s.len());
+
+    // B. `outline file:sym --around <regex> -C 2`, `:ALL`, and structured JSON key outline
+    let around = Command::new(bin_path())
+        .args([
+            "outline",
+            "apps/api/huge.ts:bigProcessor",
+            "--around",
+            "SPECIAL_AROUND_TARGET",
+            "-C",
+            "2",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let ar_s = String::from_utf8_lossy(&around.stdout);
+    assert!(ar_s.contains("SPECIAL_AROUND_TARGET") && ar_s.contains("step_450"), "got:\n{ar_s}");
+    assert!(!ar_s.contains("step_001"), "--around should only show context window:\n{ar_s}");
+
+    let json_out = Command::new(bin_path())
+        .args(["outline", "package.json", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let jo_s = String::from_utf8_lossy(&json_out.stdout);
+    assert!(jo_s.contains("dependencies") && jo_s.contains("scripts") && !jo_s.contains("\"echo 30\""), "expected JSON key outline, got:\n{jo_s}");
+
+    // C. Python `__init__.py` includes `__all__` and `_LAZY_EXPORTS`
+    let py_out = Command::new(bin_path())
+        .args(["outline", "pkg/__init__.py", "--root", repo_a.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let py_s = String::from_utf8_lossy(&py_out.stdout);
+    assert!(py_s.contains("__all__") && py_s.contains("_LAZY_EXPORTS"), "expected Python module constants in outline, got:\n{py_s}");
+
+    // D. Rarest-branch-first `grep` quotas (both file-level --limit AND same-file --max-per-file) + multi-root `Repos (files):`
+    let g_bal = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "NOISY_TERM|RARE_TERM",
+            "--limit",
+            "3",
+            "--max-per-file",
+            "3",
+            "--root",
+            repo_a.to_str().unwrap(),
+            "--root",
+            repo_b.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gb_s = String::from_utf8_lossy(&g_bal.stdout);
+    assert!(gb_s.contains("Repos (files): repo-a:") && gb_s.contains("repo-b: 0"), "expected per-repo header, got:\n{gb_s}");
+    assert!(gb_s.contains("RARE_TERM"), "rare branch must NOT starve behind noisy branch:\n{gb_s}");
+
+    let g_same = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "NOISY_TERM|RARE_TERM",
+            "--path",
+            "apps/api/mixed.ts",
+            "--max-per-file",
+            "3",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gs_s = String::from_utf8_lossy(&g_same.stdout);
+    assert!(gs_s.contains("const rare = 'RARE_TERM'"), "same-file rare branch must not starve behind 25 noisy lines:\n{gs_s}");
+
+    // E. Comment demotion in Dockerfile + `-w` word boundary
+    let g_df = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "pip install",
+            "--path",
+            "worker.Dockerfile",
+            "--max-per-file",
+            "3",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gdf_s = String::from_utf8_lossy(&g_df.stdout);
+    assert!(gdf_s.contains("RUN pip install"), "comments must be demoted below RUN pip install:\n{gdf_s}");
+
+    let g_word = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "grep",
+            "shadow",
+            "-w",
+            "--path",
+            "apps/api/mixed.ts",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let gw_s = String::from_utf8_lossy(&g_word.stdout);
+    assert!(gw_s.contains("const exact = shadow;") && !gw_s.contains("boxShadow"), "-w must match whole word only:\n{gw_s}");
+
+    // F. All 3 `files` fixes: multiple positional dirs, `--depth 2` doesn't hide tiny dirs, `--filter <regex>`
+    let f_multi = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "files",
+            "apps/api",
+            "pkg",
+            "--depth",
+            "2",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let fm_s = String::from_utf8_lossy(&f_multi.stdout);
+    assert!(
+        fm_s.contains("apps/api/huge.ts") && fm_s.contains("pkg/__init__.py"),
+        "files must accept multiple positional dirs and not roll up small dirs on --depth:\n{fm_s}"
+    );
+
+    let f_filt = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "files",
+            "apps",
+            "--filter",
+            "rare_only",
+            "--limit",
+            "2",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let ff_s = String::from_utf8_lossy(&f_filt.stdout);
+    assert!(ff_s.contains("apps/web/rare_only.ts") && !ff_s.contains("directories"), "--filter must run before rollup:\n{ff_s}");
+
+    // G. `search --path` filters symbol results
+    let s_path = Command::new(bin_path())
+        .env("CODE_INDEX_CACHE_DIR", &cache_dir)
+        .args([
+            "search",
+            "bigProcessor",
+            "--path",
+            "apps/web",
+            "--no-noncode",
+            "--root",
+            repo_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let sp_s = String::from_utf8_lossy(&s_path.stdout);
+    assert!(sp_s.contains("(no matches"), "search --path apps/web must exclude apps/api symbol:\n{sp_s}");
+
+    let _ = fs::remove_dir_all(&base);
+}

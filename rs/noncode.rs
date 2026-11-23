@@ -245,6 +245,18 @@ fn is_import_only_line(line: &str) -> bool {
         || t.contains("= require(")
 }
 
+fn is_comment_only_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("//")
+        || t.starts_with('#')
+        || t.starts_with("/*")
+        || t.starts_with("* ")
+        || t == "*"
+        || t.starts_with("*/")
+        || t.starts_with("-- ")
+        || t.starts_with("<!--")
+}
+
 #[derive(Debug, Clone)]
 pub struct TextFileHits {
     pub file: String,
@@ -596,12 +608,14 @@ fn split_top_level_alternation(pattern: &str) -> Vec<String> {
 pub struct GrepOpts {
     pub case_insensitive: bool,
     pub fixed_strings: bool,
+    pub word_regexp: bool,
     pub noncode_only: bool,
     pub code_only: bool,
     pub include_tests: bool,
     pub include_data: bool,
     pub no_tests_explicit: bool,
     pub no_imports: bool,
+    pub no_comments: bool,
     pub files_only: bool,
     pub compact: bool,
     pub limit_files: usize,
@@ -625,16 +639,32 @@ pub struct GrepResult {
     pub hidden_test_hits: usize,
     pub path_matched_zero: bool,
     pub branch_counts: Vec<(String, usize)>,
+    pub repo_counts: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone)]
+struct MatchRecord {
+    line: u64,
+    is_comment: bool,
+    branches: Vec<usize>,
 }
 
 struct GrepSink<'a> {
     max_matches: usize,
+    buffer_cap: usize,
     total_matches: usize,
     captured_matches: usize,
+    captured_noncomment: usize,
     no_imports: bool,
+    no_comments: bool,
+    branch_regexes: &'a [(String, regex::Regex)],
+    seen_branches: Vec<bool>,
+    captured_branches: Vec<bool>,
+    records: Vec<MatchRecord>,
     hits: Vec<TextMatchLine>,
     graph: Option<&'a ArchivedGraphCacheData>,
     file_idx: Option<u32>,
+    last_matched_captured: bool,
 }
 
 impl<'a> Sink for GrepSink<'a> {
@@ -643,34 +673,77 @@ impl<'a> Sink for GrepSink<'a> {
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         let text = String::from_utf8_lossy(mat.bytes());
         if self.no_imports && is_import_only_line(&text) {
+            self.last_matched_captured = false;
+            return Ok(true);
+        }
+        let is_comment = is_comment_only_line(&text);
+        if self.no_comments && is_comment {
+            self.last_matched_captured = false;
             return Ok(true);
         }
         self.total_matches += 1;
-        if self.captured_matches < self.max_matches {
+
+        let mut line_branches = Vec::new();
+        let mut introduces_uncaptured_branch = false;
+        if !self.branch_regexes.is_empty() {
+            for (bi, (_, re)) in self.branch_regexes.iter().enumerate() {
+                if re.is_match(&text) {
+                    self.seen_branches[bi] = true;
+                    line_branches.push(bi);
+                    if !self.captured_branches[bi] {
+                        introduces_uncaptured_branch = true;
+                    }
+                }
+            }
+        }
+
+        let want_capture = self.max_matches > 0
+            && (self.captured_matches < self.buffer_cap
+                || (!is_comment && self.captured_noncomment < self.max_matches)
+                || introduces_uncaptured_branch);
+
+        if want_capture {
             self.captured_matches += 1;
+            if !is_comment {
+                self.captured_noncomment += 1;
+            }
+            for &bi in &line_branches {
+                self.captured_branches[bi] = true;
+            }
             let lnum = mat.line_number().unwrap_or(0);
             let enclosing = match (self.graph, self.file_idx) {
                 (Some(g), Some(fi)) => enclosing_symbol_for_line(g, fi, lnum as u32),
                 _ => None,
             };
+            self.records.push(MatchRecord {
+                line: lnum,
+                is_comment,
+                branches: line_branches,
+            });
             self.hits.push(TextMatchLine {
                 line: lnum,
                 content: truncate_line(&text, 180),
                 is_context: false,
                 enclosing_sym: enclosing,
             });
+            self.last_matched_captured = true;
+        } else {
+            self.last_matched_captured = false;
         }
         Ok(true)
     }
 
     fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, Self::Error> {
-        let keep = match ctx.kind() {
-            SinkContextKind::Before => self.captured_matches < self.max_matches,
-            SinkContextKind::After => {
-                self.captured_matches <= self.max_matches && self.total_matches <= self.max_matches
-            }
-            _ => false,
-        };
+        let keep = self.max_matches > 0
+            && match ctx.kind() {
+                SinkContextKind::Before => {
+                    self.captured_matches < self.buffer_cap
+                        || self.captured_noncomment < self.max_matches
+                        || self.captured_branches.iter().any(|&c| !c)
+                }
+                SinkContextKind::After => self.last_matched_captured,
+                _ => false,
+            };
         if keep {
             let lnum = ctx.line_number().unwrap_or(0);
             if self.hits.last().map_or(true, |prev| prev.line != lnum) {
@@ -685,6 +758,93 @@ impl<'a> Sink for GrepSink<'a> {
         }
         Ok(true)
     }
+}
+
+/// Select up to `max_matches` match lines from a file's buffered records:
+/// 1) Demote comment-only lines below real code lines so `# comments` never hide actual code.
+/// 2) When multi-branch alternation is active, ensure rarest branches in the file get slots first
+///    (round-robin across branches) so a noisy branch can't starve a rare branch in the same file!
+fn finalize_file_hits(
+    hits: Vec<TextMatchLine>,
+    records: &[MatchRecord],
+    max_matches: usize,
+    num_branches: usize,
+    before_ctx: usize,
+    after_ctx: usize,
+) -> Vec<TextMatchLine> {
+    if max_matches == 0 {
+        return Vec::new();
+    }
+    if records.len() <= max_matches {
+        return hits;
+    }
+
+    let mut chosen_lines: FxHashSet<u64> = FxHashSet::default();
+    let pick_pool = |pool: &[&MatchRecord], chosen: &mut FxHashSet<u64>| {
+        if pool.is_empty() || chosen.len() >= max_matches {
+            return;
+        }
+        if num_branches >= 2 {
+            // Count occurrences per branch inside this pool and pick rarest branches first!
+            let mut per_b: Vec<Vec<u64>> = vec![Vec::new(); num_branches];
+            for r in pool {
+                for &bi in &r.branches {
+                    if bi < num_branches {
+                        per_b[bi].push(r.line);
+                    }
+                }
+            }
+            let mut b_order: Vec<usize> = (0..num_branches)
+                .filter(|&bi| !per_b[bi].is_empty())
+                .collect();
+            b_order.sort_by_key(|&bi| per_b[bi].len());
+            let mut cursors = vec![0usize; num_branches];
+            loop {
+                let mut progressed = false;
+                for &bi in &b_order {
+                    if chosen.len() >= max_matches {
+                        break;
+                    }
+                    while cursors[bi] < per_b[bi].len() {
+                        let ln = per_b[bi][cursors[bi]];
+                        cursors[bi] += 1;
+                        if chosen.insert(ln) {
+                            progressed = true;
+                            break;
+                        }
+                    }
+                }
+                if !progressed || chosen.len() >= max_matches {
+                    break;
+                }
+            }
+        }
+        for r in pool {
+            if chosen.len() >= max_matches {
+                break;
+            }
+            chosen.insert(r.line);
+        }
+    };
+
+    let code_recs: Vec<&MatchRecord> = records.iter().filter(|r| !r.is_comment).collect();
+    let comment_recs: Vec<&MatchRecord> = records.iter().filter(|r| r.is_comment).collect();
+    pick_pool(&code_recs, &mut chosen_lines);
+    pick_pool(&comment_recs, &mut chosen_lines);
+
+    let mut chosen_sorted: Vec<u64> = chosen_lines.iter().copied().collect();
+    chosen_sorted.sort_unstable();
+
+    hits.into_iter()
+        .filter(|h| {
+            if !h.is_context {
+                return chosen_lines.contains(&h.line);
+            }
+            chosen_sorted.iter().any(|&m| {
+                h.line >= m.saturating_sub(before_ctx as u64) && h.line <= m + after_ctx as u64
+            })
+        })
+        .collect()
 }
 
 fn path_explicitly_targets_tests(path_filters: &[String]) -> bool {
@@ -744,18 +904,30 @@ pub fn ranked_grep(
     let mut builder = RegexMatcherBuilder::new();
     builder.case_insensitive(opts.case_insensitive);
     builder.fixed_strings(use_fixed);
+    builder.word(opts.word_regexp);
     let matcher = builder
         .build(&combined_pattern)
         .map_err(|e| format!("Invalid grep pattern: {e}"))?;
 
-    // Compile per-branch matchers for multi-term alternation reporting & balanced budgeting
-    let branch_matchers: Vec<(String, grep_regex::RegexMatcher)> = branches
+    // Compile per-branch line regexes for single-pass branch tagging & rarest-branch-first quotas
+    let branch_regexes: Vec<(String, regex::Regex)> = branches
         .iter()
         .filter_map(|b| {
-            let mut bb = RegexMatcherBuilder::new();
-            bb.case_insensitive(opts.case_insensitive);
-            bb.fixed_strings(opts.fixed_strings);
-            bb.build(b).ok().map(|m| (b.clone(), m))
+            let core = if opts.fixed_strings {
+                regex::escape(b)
+            } else {
+                b.clone()
+            };
+            let pat = if opts.word_regexp {
+                format!(r"\b(?:{core})\b")
+            } else {
+                core
+            };
+            regex::RegexBuilder::new(&pat)
+                .case_insensitive(opts.case_insensitive)
+                .build()
+                .ok()
+                .map(|re| (b.clone(), re))
         })
         .collect();
 
@@ -884,6 +1056,9 @@ pub fn ranked_grep(
 
     let prefer_code = !noncode_only && types.is_empty();
     let no_imports = opts.no_imports;
+    let no_comments = opts.no_comments;
+    let num_branches = branch_regexes.len();
+    let buffer_cap = (effective_max_per_file * 8).clamp(32, 64);
 
     let mut all_scored: Vec<ScoredMatch> = candidates
         .into_par_iter()
@@ -913,44 +1088,45 @@ pub fn ranked_grep(
 
             let mut sink = GrepSink {
                 max_matches: effective_max_per_file,
+                buffer_cap,
                 total_matches: 0,
                 captured_matches: 0,
+                captured_noncomment: 0,
                 no_imports,
+                no_comments,
+                branch_regexes: &branch_regexes,
+                seen_branches: vec![false; num_branches],
+                captured_branches: vec![false; num_branches],
+                records: Vec::new(),
                 hits: Vec::new(),
                 graph,
                 file_idx,
+                last_matched_captured: false,
             };
             let _ = searcher.search_path(&matcher, &abs, &mut sink);
             if sink.total_matches == 0 {
                 return None;
             }
 
-            // Determine which alternation branches hit this file (fast single-file scan only on matched files!)
             let mut matched_branches = Vec::new();
             let mut matched_branch_names = Vec::new();
-            if branch_matchers.len() >= 2 {
-                let mut b_searcher = SearcherBuilder::new()
-                    .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
-                    .build();
-                for (bi, (bname, bm)) in branch_matchers.iter().enumerate() {
-                    let mut found = false;
-                    let _ = b_searcher.search_path(
-                        bm,
-                        &abs,
-                        UTF8(|_, line| {
-                            if no_imports && is_import_only_line(line) {
-                                return Ok(true);
-                            }
-                            found = true;
-                            Ok(false)
-                        }),
-                    );
-                    if found {
+            if num_branches >= 2 {
+                for (bi, &seen) in sink.seen_branches.iter().enumerate() {
+                    if seen {
                         matched_branches.push(bi);
-                        matched_branch_names.push(bname.clone());
+                        matched_branch_names.push(branch_regexes[bi].0.clone());
                     }
                 }
             }
+
+            let final_hits = finalize_file_hits(
+                sink.hits,
+                &sink.records,
+                effective_max_per_file,
+                num_branches,
+                before_ctx,
+                after_ctx,
+            );
 
             let is_tf = is_test_or_fixture_path(&graph_path);
             // Rank runtime source code ahead of `.json`/`.md`/`.yaml` unless `--non-code` or `--type` is requested
@@ -965,7 +1141,7 @@ pub fn ranked_grep(
             Some(ScoredMatch {
                 file_hits: TextFileHits {
                     file: graph_path,
-                    hits: sink.hits,
+                    hits: final_hits,
                     total_hits_in_file: sink.total_matches,
                     rank_score: score,
                     matched_branches: matched_branch_names,
@@ -999,81 +1175,109 @@ pub fn ranked_grep(
 
     // Compute per-branch file counts over the displayed pool (prod, or all if --include-tests)
     let mut branch_counts: Vec<(String, usize)> = Vec::new();
-    if branch_matchers.len() >= 2 {
-        let mut counts = vec![0usize; branch_matchers.len()];
+    if num_branches >= 2 {
+        let mut counts = vec![0usize; num_branches];
         for item in &prod {
             for &bi in &item.matched_branches {
                 counts[bi] += 1;
             }
         }
-        for (i, (label, _)) in branch_matchers.iter().enumerate() {
+        for (i, (label, _)) in branch_regexes.iter().enumerate() {
             branch_counts.push((label.clone(), counts[i]));
+        }
+    }
+
+    // Compute per-repo file counts when multiple `--root`s are active (so agents immediately see
+    // which sibling repos had 0 hits without extra follow-up greps!)
+    let mut repo_counts: Vec<(String, usize)> = Vec::new();
+    if roots.len() > 1 {
+        let mut rcounts = vec![0usize; roots.len()];
+        for item in &prod {
+            for (ri, r) in roots.iter().enumerate() {
+                if item.file_hits.file.starts_with(&format!("{}/", r.prefix)) {
+                    rcounts[ri] += 1;
+                    break;
+                }
+            }
+        }
+        for (ri, r) in roots.iter().enumerate() {
+            repo_counts.push((r.prefix.clone(), rcounts[ri]));
         }
     }
 
     let total_files = prod.len();
     let total_hits: usize = prod.iter().map(|m| m.file_hits.total_hits_in_file).sum();
 
-    // Balanced budgeting across alternation branches so one noisy branch cannot starve others!
-    let selected: Vec<TextFileHits> =
-        if opts.limit_files > 0 && prod.len() > opts.limit_files && branch_matchers.len() >= 2 {
-            let mut per_branch: Vec<Vec<usize>> = vec![Vec::new(); branch_matchers.len()];
-            for (idx, item) in prod.iter().enumerate() {
-                for &bi in &item.matched_branches {
-                    per_branch[bi].push(idx);
-                }
+    // Rarest-branch-first round-robin selection so a 164-hit noisy term can NEVER starve
+    // a 2-hit rare term inside `--limit` (or even if output stops early under `--max-chars`)!
+    let selected: Vec<TextFileHits> = if num_branches >= 2 && !prod.is_empty() {
+        let cap = if opts.limit_files > 0 {
+            opts.limit_files.min(prod.len())
+        } else {
+            prod.len()
+        };
+        let mut per_branch: Vec<Vec<usize>> = vec![Vec::new(); num_branches];
+        for (idx, item) in prod.iter().enumerate() {
+            for &bi in &item.matched_branches {
+                per_branch[bi].push(idx);
             }
-            let mut chosen_set = vec![false; prod.len()];
-            let mut chosen_indices: Vec<usize> = Vec::with_capacity(opts.limit_files);
-            let mut cursors = vec![0usize; branch_matchers.len()];
+        }
+        // Order non-empty branches from rarest to most common
+        let mut branch_order: Vec<usize> = (0..num_branches)
+            .filter(|&bi| !per_branch[bi].is_empty())
+            .collect();
+        branch_order.sort_by_key(|&bi| per_branch[bi].len());
 
-            loop {
-                let mut progressed = false;
-                for bi in 0..branch_matchers.len() {
-                    if chosen_indices.len() >= opts.limit_files {
-                        break;
-                    }
-                    while cursors[bi] < per_branch[bi].len() {
-                        let cand = per_branch[bi][cursors[bi]];
-                        cursors[bi] += 1;
-                        if !chosen_set[cand] {
-                            chosen_set[cand] = true;
-                            chosen_indices.push(cand);
-                            progressed = true;
-                            break;
-                        }
-                    }
-                }
-                if !progressed || chosen_indices.len() >= opts.limit_files {
+        let mut chosen_set = vec![false; prod.len()];
+        let mut chosen_indices: Vec<usize> = Vec::with_capacity(cap);
+        let mut cursors = vec![0usize; num_branches];
+
+        loop {
+            let mut progressed = false;
+            for &bi in &branch_order {
+                if chosen_indices.len() >= cap {
                     break;
                 }
-            }
-            // Fill any remaining slots in rank order
-            if chosen_indices.len() < opts.limit_files {
-                for idx in 0..prod.len() {
-                    if chosen_indices.len() >= opts.limit_files {
+                while cursors[bi] < per_branch[bi].len() {
+                    let cand = per_branch[bi][cursors[bi]];
+                    cursors[bi] += 1;
+                    if !chosen_set[cand] {
+                        chosen_set[cand] = true;
+                        chosen_indices.push(cand);
+                        progressed = true;
                         break;
-                    }
-                    if !chosen_set[idx] {
-                        chosen_set[idx] = true;
-                        chosen_indices.push(idx);
                     }
                 }
             }
-            // Keep selected files sorted by rank score
-            chosen_indices.sort_unstable();
-            let mut prod_opt: Vec<Option<ScoredMatch>> = prod.into_iter().map(Some).collect();
-            chosen_indices
-                .into_iter()
-                .filter_map(|i| prod_opt[i].take().map(|s| s.file_hits))
-                .collect()
-        } else {
-            let mut v: Vec<TextFileHits> = prod.into_iter().map(|s| s.file_hits).collect();
-            if opts.limit_files > 0 && v.len() > opts.limit_files {
-                v.truncate(opts.limit_files);
+            if !progressed || chosen_indices.len() >= cap {
+                break;
             }
-            v
-        };
+        }
+        // Fill any remaining slots in PageRank order
+        if chosen_indices.len() < cap {
+            for idx in 0..prod.len() {
+                if chosen_indices.len() >= cap {
+                    break;
+                }
+                if !chosen_set[idx] {
+                    chosen_set[idx] = true;
+                    chosen_indices.push(idx);
+                }
+            }
+        }
+        // Preserve rarest-first round-robin ordering (each branch's own list is already PageRank-sorted!)
+        let mut prod_opt: Vec<Option<ScoredMatch>> = prod.into_iter().map(Some).collect();
+        chosen_indices
+            .into_iter()
+            .filter_map(|i| prod_opt[i].take().map(|s| s.file_hits))
+            .collect()
+    } else {
+        let mut v: Vec<TextFileHits> = prod.into_iter().map(|s| s.file_hits).collect();
+        if opts.limit_files > 0 && v.len() > opts.limit_files {
+            v.truncate(opts.limit_files);
+        }
+        v
+    };
 
     Ok(GrepResult {
         hits: selected,
@@ -1083,5 +1287,6 @@ pub fn ranked_grep(
         hidden_test_hits,
         path_matched_zero: false,
         branch_counts,
+        repo_counts,
     })
 }
