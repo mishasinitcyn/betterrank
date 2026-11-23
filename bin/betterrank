@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+# Resolve symlinks portably (macOS BSD + Linux GNU) so npm global bin symlinks work
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+  DIR="$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd)"
+  TARGET="$(readlink "$SOURCE")"
+  case "$TARGET" in
+    /*) SOURCE="$TARGET" ;;
+    *)  SOURCE="$DIR/$TARGET" ;;
+  esac
+done
+BIN_DIR="$(CDPATH= cd -- "$(dirname -- "$SOURCE")" && pwd)"
+
+if [ -x "$BIN_DIR/betterrank-native" ]; then
+  exec "$BIN_DIR/betterrank-native" "$@"
+fi
+
+# Fallback: fetch binary if postinstall was skipped (e.g. --ignore-scripts)
+node "$BIN_DIR/../scripts/postinstall.js"
+if [ -x "$BIN_DIR/betterrank-native" ]; then
+  exec "$BIN_DIR/betterrank-native" "$@"
+fi
+
+echo "betterrank: native binary not found at $BIN_DIR/betterrank-native" >&2
+exit 1

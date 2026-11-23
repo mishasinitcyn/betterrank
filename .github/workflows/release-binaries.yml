@@ -1,0 +1,81 @@
+name: Release Native Binaries
+
+on:
+  push:
+    tags:
+      - 'v0.5*'
+      - 'v[1-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: betterrank-linux-x64
+            musl: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: betterrank-darwin-arm64
+            musl: false
+          - os: macos-14
+            target: x86_64-apple-darwin
+            asset: betterrank-darwin-x64
+            musl: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (Linux static binary)
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/betterrank dist/${{ matrix.asset }}
+          chmod +x dist/${{ matrix.asset }}
+          ls -lh dist/${{ matrix.asset }}
+          if [ "${{ matrix.target }}" != "x86_64-apple-darwin" ]; then
+            ./dist/${{ matrix.asset }} --version
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: dist/betterrank-*
